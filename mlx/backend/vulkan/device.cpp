@@ -167,7 +167,7 @@ bool barrier_between_deferred_ops() {
       return std::string(env) != "0";
     }
 
-    return true;
+    return false;
   }();
   return enabled;
 }
@@ -179,7 +179,7 @@ bool submit_on_hazard_boundary() {
       return std::string(env) != "0";
     }
 
-    return true;
+    return false;
   }();
   return enabled;
 }

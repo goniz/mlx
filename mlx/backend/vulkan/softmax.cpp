@@ -222,10 +222,10 @@ bool try_eval_logsumexp_vulkan(
   }
 
   try {
-    const auto shader_id = out.dtype() == bfloat16
+    const auto shader_id = out_work.dtype() == bfloat16
         ? vulkan::StaticShaderId::logsumexp_bf16
-        : (out.dtype() == float16 ? vulkan::StaticShaderId::logsumexp_f16
-                                  : vulkan::StaticShaderId::logsumexp_f32);
+        : (out_work.dtype() == float16 ? vulkan::StaticShaderId::logsumexp_f16
+                                       : vulkan::StaticShaderId::logsumexp_f32);
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_sum_rows_op(in, out_work, shader_id, command_buffer, s);
     vulkan::end_command_recording(s.index);

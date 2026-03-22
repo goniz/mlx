@@ -147,6 +147,7 @@ void VulkanContext::init() {
   bool has_separate_transfer_queue = false;
   bool is_unified_memory = false;
   bool shader_float16_supported = false;
+  bool shader_bfloat16_supported = false;
   bool subgroup_size_control_supported = false;
   bool subgroup_require_full_support = false;
   uint32_t subgroup_min_size = 0;
@@ -215,6 +216,8 @@ void VulkanContext::init() {
         extensions, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     const bool has_cooperative_matrix_ext = has_device_extension(
         extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    const bool has_shader_bfloat16_ext =
+        has_device_extension(extensions, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
 
     auto device_properties = physical_device.getProperties();
 
@@ -272,6 +275,7 @@ void VulkanContext::init() {
         supported_pipeline_robustness{};
     vk::PhysicalDeviceCooperativeMatrixFeaturesKHR
         supported_cooperative_matrix{};
+    vk::PhysicalDeviceShaderBfloat16FeaturesKHR supported_shader_bfloat16{};
 
     if (has_subgroup_size_control_ext) {
       supported_shader_float16_int8.pNext = &supported_subgroup_size_control;
@@ -279,17 +283,37 @@ void VulkanContext::init() {
         supported_subgroup_size_control.pNext = &supported_pipeline_robustness;
         if (has_cooperative_matrix_ext) {
           supported_pipeline_robustness.pNext = &supported_cooperative_matrix;
+          if (has_shader_bfloat16_ext) {
+            supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
+          }
+        } else if (has_shader_bfloat16_ext) {
+          supported_pipeline_robustness.pNext = &supported_shader_bfloat16;
         }
       } else if (has_cooperative_matrix_ext) {
         supported_subgroup_size_control.pNext = &supported_cooperative_matrix;
+        if (has_shader_bfloat16_ext) {
+          supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
+        }
+      } else if (has_shader_bfloat16_ext) {
+        supported_shader_float16_int8.pNext = &supported_shader_bfloat16;
       }
     } else if (has_pipeline_robustness_ext) {
       supported_shader_float16_int8.pNext = &supported_pipeline_robustness;
       if (has_cooperative_matrix_ext) {
         supported_pipeline_robustness.pNext = &supported_cooperative_matrix;
+        if (has_shader_bfloat16_ext) {
+          supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
+        }
+      } else if (has_shader_bfloat16_ext) {
+        supported_pipeline_robustness.pNext = &supported_shader_bfloat16;
       }
     } else if (has_cooperative_matrix_ext) {
       supported_shader_float16_int8.pNext = &supported_cooperative_matrix;
+      if (has_shader_bfloat16_ext) {
+        supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
+      }
+    } else if (has_shader_bfloat16_ext) {
+      supported_shader_float16_int8.pNext = &supported_shader_bfloat16;
     }
 
     physical_device.getFeatures2(&supported_features);
@@ -312,6 +336,7 @@ void VulkanContext::init() {
     vk::PhysicalDevicePipelineRobustnessFeaturesEXT
         enabled_pipeline_robustness{};
     vk::PhysicalDeviceCooperativeMatrixFeaturesKHR enabled_cooperative_matrix{};
+    vk::PhysicalDeviceShaderBfloat16FeaturesKHR enabled_shader_bfloat16{};
 
     // Link enabled feature chain (same pattern as supported features)
     if (has_subgroup_size_control_ext) {
@@ -320,17 +345,37 @@ void VulkanContext::init() {
         enabled_subgroup_size_control.pNext = &enabled_pipeline_robustness;
         if (has_cooperative_matrix_ext) {
           enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
+          if (has_shader_bfloat16_ext) {
+            enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
+          }
+        } else if (has_shader_bfloat16_ext) {
+          enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
         }
       } else if (has_cooperative_matrix_ext) {
         enabled_subgroup_size_control.pNext = &enabled_cooperative_matrix;
+        if (has_shader_bfloat16_ext) {
+          enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
+        }
+      } else if (has_shader_bfloat16_ext) {
+        enabled_shader_float16_int8.pNext = &enabled_shader_bfloat16;
       }
     } else if (has_pipeline_robustness_ext) {
       enabled_shader_float16_int8.pNext = &enabled_pipeline_robustness;
       if (has_cooperative_matrix_ext) {
         enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
+        if (has_shader_bfloat16_ext) {
+          enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
+        }
+      } else if (has_shader_bfloat16_ext) {
+        enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
       }
     } else if (has_cooperative_matrix_ext) {
       enabled_shader_float16_int8.pNext = &enabled_cooperative_matrix;
+      if (has_shader_bfloat16_ext) {
+        enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
+      }
+    } else if (has_shader_bfloat16_ext) {
+      enabled_shader_float16_int8.pNext = &enabled_shader_bfloat16;
     }
 
     if (supported_vulkan11_features.storageBuffer16BitAccess) {
@@ -342,6 +387,11 @@ void VulkanContext::init() {
     if (supported_shader_float16_int8.shaderFloat16) {
       enabled_shader_float16_int8.shaderFloat16 = VK_TRUE;
       shader_float16_supported = true;
+    }
+    if (has_shader_bfloat16_ext &&
+        supported_shader_bfloat16.shaderBFloat16Type) {
+      enabled_shader_bfloat16.shaderBFloat16Type = VK_TRUE;
+      shader_bfloat16_supported = true;
     }
     if (has_subgroup_size_control_ext &&
         supported_subgroup_size_control.subgroupSizeControl &&
@@ -460,6 +510,7 @@ void VulkanContext::init() {
     mem_properties_ = mem_properties;
     is_unified_memory_ = is_unified_memory;
     this->shader_float16_supported_ = shader_float16_supported;
+    this->shader_bfloat16_supported_ = shader_bfloat16_supported;
     this->subgroup_size_control_supported_ = subgroup_size_control_supported;
     this->subgroup_require_full_support_ = subgroup_require_full_support;
     this->subgroup_min_size_ = subgroup_min_size;
@@ -514,6 +565,7 @@ void VulkanContext::cleanup() {
   timeline_value_ = 0;
   is_unified_memory_ = false;
   shader_float16_supported_ = false;
+  shader_bfloat16_supported_ = false;
   subgroup_size_control_supported_ = false;
   subgroup_require_full_support_ = false;
   subgroup_min_size_ = 0;

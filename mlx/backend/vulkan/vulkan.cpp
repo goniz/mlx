@@ -2,8 +2,16 @@
 
 #include "mlx/backend/vulkan/vulkan.h"
 
+#include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/vulkan/allocator.h"
+#include "mlx/backend/vulkan/device.h"
+#include "mlx/backend/vulkan/kernels.h"
+
 #include <algorithm>
+#include <cmath>
+#include <iostream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -98,7 +106,63 @@ bool has_device_extension(
       });
 }
 
+bool bf16_capability_debug_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_DEBUG_CAPS");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
+std::optional<bool> forced_bf16_capability() {
+  static const std::optional<bool> enabled = []() -> std::optional<bool> {
+    const char* env = std::getenv("MLX_VULKAN_FORCE_BF16_CAPABILITY");
+    if (env == nullptr) {
+      return std::nullopt;
+    }
+
+    const std::string value(env);
+    if (value == "0") {
+      return false;
+    }
+    if (value == "1") {
+      return true;
+    }
+    return std::nullopt;
+  }();
+  return enabled;
+}
+
+bool nearly_equal(float a, float b, float atol = 1e-3f) {
+  return std::fabs(a - b) <= atol;
+}
+
 } // namespace
+
+bool VulkanContext::shader_bfloat16_supported() const {
+  std::call_once(shader_bfloat16_probe_once_, [this]() {
+    if (auto forced = forced_bf16_capability(); forced.has_value()) {
+      shader_bfloat16_supported_ = *forced;
+    } else {
+      shader_bfloat16_supported_ = probe_shader_bfloat16_support();
+    }
+
+    if (bf16_capability_debug_enabled() ||
+        shader_bfloat16_supported_ != shader_bfloat16_reported_supported_) {
+      std::cerr << "[vulkan::caps] shader_bfloat16 extension_present="
+                << shader_bfloat16_extension_present_
+                << " reported_supported=" << shader_bfloat16_reported_supported_
+                << " forced_override="
+                << (forced_bf16_capability().has_value()
+                        ? (*forced_bf16_capability() ? 1 : 0)
+                        : -1)
+                << " runtime_probe_supported=" << shader_bfloat16_supported_
+                << "\n";
+    }
+  });
+
+  return shader_bfloat16_supported_;
+}
 
 bool is_available() {
   try {
@@ -129,6 +193,95 @@ VulkanContext::VulkanContext() = default;
 
 VulkanContext::~VulkanContext() {
   cleanup();
+}
+
+bool VulkanContext::probe_shader_bfloat16_support() const {
+  try {
+    const Stream s{0, Device{Device::gpu, 0}};
+
+    auto make_array = [](Shape shape, Dtype dtype) {
+      array out(std::move(shape), dtype, nullptr, {});
+      out.set_data(allocator::malloc(out.nbytes()));
+      return out;
+    };
+
+    array a = make_array({2, 3}, bfloat16);
+    array b_t = make_array({2, 3}, bfloat16);
+    array out_t = make_array({2, 2}, float32);
+    array out = make_array({2, 2}, float32);
+
+    auto* a_ptr = a.data<bfloat16_t>();
+    a_ptr[0] = 1.0f;
+    a_ptr[1] = 2.0f;
+    a_ptr[2] = 3.0f;
+    a_ptr[3] = 4.0f;
+    a_ptr[4] = 5.0f;
+    a_ptr[5] = 6.0f;
+
+    auto* b_ptr = b_t.data<bfloat16_t>();
+    b_ptr[0] = 1.0f;
+    b_ptr[1] = 0.0f;
+    b_ptr[2] = 1.0f;
+    b_ptr[3] = 0.0f;
+    b_ptr[4] = 1.0f;
+    b_ptr[5] = -1.0f;
+
+    MatmulPushConstants push_constants{};
+    push_constants.M = 2;
+    push_constants.N = 2;
+    push_constants.K = 3;
+    push_constants.stride_a = static_cast<uint32_t>(a.strides(-2));
+    push_constants.stride_b = static_cast<uint32_t>(b_t.strides(-2));
+    push_constants.stride_d = static_cast<uint32_t>(out_t.strides(-2));
+    push_constants.batch_stride_a = 6;
+    push_constants.batch_stride_b = 6;
+    push_constants.batch_stride_d = 4;
+    push_constants.num_batches = 1;
+    push_constants.k_split = 3;
+    push_constants.ne02 = 1;
+    push_constants.ne12 = 1;
+    push_constants.broadcast2 = 1;
+    push_constants.broadcast3 = 1;
+    push_constants.padded_N = 2;
+    push_constants.base_work_group_z = 0;
+
+    bool dispatched = false;
+    for (auto shader_id : {
+             StaticShaderId::matmul_bf16,
+             StaticShaderId::matmul_bf16_fp32,
+         }) {
+      try {
+        auto command_buffer = begin_command_recording(s.index);
+        dispatch_mul_mm_op(
+            a,
+            b_t,
+            out_t,
+            shader_id,
+            command_buffer,
+            s,
+            push_constants,
+            {1u, 1u, 1u});
+        end_command_recording(s.index);
+        dispatched = true;
+        break;
+      } catch (const std::runtime_error&) {
+      }
+    }
+
+    if (!dispatched) {
+      synchronize_stream(s);
+      return false;
+    }
+
+    copy_gpu(swapaxes_in_eval(out_t, -1, -2), out, CopyType::General, s);
+    synchronize_stream(s);
+
+    const auto* out_ptr = out.data<float>();
+    return nearly_equal(out_ptr[0], 4.0f) && nearly_equal(out_ptr[1], -1.0f) &&
+        nearly_equal(out_ptr[2], 10.0f) && nearly_equal(out_ptr[3], -1.0f);
+  } catch (const std::runtime_error&) {
+    return false;
+  }
 }
 
 void VulkanContext::init() {
@@ -510,7 +663,9 @@ void VulkanContext::init() {
     mem_properties_ = mem_properties;
     is_unified_memory_ = is_unified_memory;
     this->shader_float16_supported_ = shader_float16_supported;
-    this->shader_bfloat16_supported_ = shader_bfloat16_supported;
+    this->shader_bfloat16_extension_present_ = has_shader_bfloat16_ext;
+    this->shader_bfloat16_reported_supported_ = shader_bfloat16_supported;
+    this->shader_bfloat16_supported_ = false;
     this->subgroup_size_control_supported_ = subgroup_size_control_supported;
     this->subgroup_require_full_support_ = subgroup_require_full_support;
     this->subgroup_min_size_ = subgroup_min_size;
@@ -565,6 +720,8 @@ void VulkanContext::cleanup() {
   timeline_value_ = 0;
   is_unified_memory_ = false;
   shader_float16_supported_ = false;
+  shader_bfloat16_extension_present_ = false;
+  shader_bfloat16_reported_supported_ = false;
   shader_bfloat16_supported_ = false;
   subgroup_size_control_supported_ = false;
   subgroup_require_full_support_ = false;

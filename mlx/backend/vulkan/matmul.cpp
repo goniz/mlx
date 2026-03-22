@@ -24,8 +24,11 @@ namespace {
 constexpr uint32_t kMulMmTileM = 32;
 constexpr uint32_t kMulMmTileN = 32;
 constexpr uint32_t kMaxGridZ = 65535;
+constexpr char kMatvecMatrixCastScratchLane[] = "matvec.matrix_f16";
 constexpr char kMatvecVectorCastScratchLane[] = "matvec.vec_f16";
 constexpr char kMatvecOutScratchLane[] = "matvec.out_work";
+constexpr char kMulMmACastScratchLane[] = "mul_mm.a_f16";
+constexpr char kMulMmBCastScratchLane[] = "mul_mm.b_f16";
 constexpr char kMulMmOutScratchLane[] = "mul_mm.out_t";
 
 bool is_supported_matmul_dtype(Dtype dtype) {
@@ -119,6 +122,9 @@ std::optional<vulkan::StaticShaderId> matvec_shader_name(
     return vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32;
   }
   if (matrix_dtype == bfloat16 && vec_dtype == float32) {
+    if (!vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+      return std::nullopt;
+    }
     return vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32;
   }
   if (matrix_dtype == float32 && vec_dtype == float16) {
@@ -128,6 +134,9 @@ std::optional<vulkan::StaticShaderId> matvec_shader_name(
     return vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32;
   }
   if (matrix_dtype == bfloat16 && vec_dtype == float16) {
+    if (!vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+      return std::nullopt;
+    }
     return vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32;
   }
   return std::nullopt;
@@ -191,6 +200,9 @@ std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(Dtype dtype) {
           vulkan::StaticShaderId::matmul_f16_fp32,
       };
     case bfloat16:
+      if (!vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+        return {};
+      }
       return {
           vulkan::StaticShaderId::matmul_bf16,
           vulkan::StaticShaderId::matmul_bf16_fp32,
@@ -213,6 +225,13 @@ bool is_row_contiguous_zero_offset(const array& arr) {
 bool has_vulkan_buffer(const array& arr) {
   auto data = arr.data_shared_ptr();
   return data != nullptr && data->buffer.ptr() != nullptr;
+}
+
+array cast_to_float16_scratch(const array& arr, Stream s, const char* lane) {
+  array out = vulkan::acquire_scratch_array(s, lane, arr.shape(), float16);
+  copy_gpu(arr, out, CopyType::General, s);
+  vulkan::mark_scratch_array_written(s, lane);
+  return out;
 }
 
 bool ensure_vulkan_buffer(array& arr, Stream s) {
@@ -321,13 +340,14 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
+  if (matrix.dtype() == bfloat16 &&
+      !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+    matrix = cast_to_float16_scratch(matrix, s, kMatvecMatrixCastScratchLane);
+  }
+
   Dtype vec_shader_dtype = vec.dtype();
   if (vec_shader_dtype == bfloat16) {
-    array vec_f16 = vulkan::acquire_scratch_array(
-        s, kMatvecVectorCastScratchLane, vec.shape(), float16);
-    copy_gpu(vec, vec_f16, CopyType::General, s);
-    vulkan::mark_scratch_array_written(s, kMatvecVectorCastScratchLane);
-    vec = vec_f16;
+    vec = cast_to_float16_scratch(vec, s, kMatvecVectorCastScratchLane);
     vec_shader_dtype = float16;
   }
 
@@ -410,6 +430,12 @@ bool try_eval_mul_mm_vulkan(
   if (a.shape(-1) == 0) {
     zero_initialize_output(out, s);
     return true;
+  }
+
+  if (a.dtype() == bfloat16 &&
+      !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+    a = cast_to_float16_scratch(a, s, kMulMmACastScratchLane);
+    b = cast_to_float16_scratch(b, s, kMulMmBCastScratchLane);
   }
 
   // Keep BF16 inputs in BF16 and dispatch matmul_bf16* directly.

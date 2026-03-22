@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 // Use C++ Vulkan API instead of C API
@@ -66,9 +67,7 @@ class VulkanContext {
   bool shader_float16_supported() const {
     return shader_float16_supported_;
   }
-  bool shader_bfloat16_supported() const {
-    return shader_bfloat16_supported_;
-  }
+  bool shader_bfloat16_supported() const;
   bool subgroup_size_control_supported() const {
     return subgroup_size_control_supported_;
   }
@@ -102,6 +101,7 @@ class VulkanContext {
 
   void init();
   void cleanup();
+  bool probe_shader_bfloat16_support() const;
 
   // C++ Vulkan API objects (RAII)
   vk::Instance instance_;
@@ -120,7 +120,10 @@ class VulkanContext {
   bool initialized_{false};
   bool is_unified_memory_{false};
   bool shader_float16_supported_{false};
-  bool shader_bfloat16_supported_{false};
+  bool shader_bfloat16_extension_present_{false};
+  bool shader_bfloat16_reported_supported_{false};
+  mutable std::once_flag shader_bfloat16_probe_once_;
+  mutable bool shader_bfloat16_supported_{false};
   bool subgroup_size_control_supported_{false};
   bool subgroup_require_full_support_{false};
   uint32_t subgroup_min_size_{0};

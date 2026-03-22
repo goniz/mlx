@@ -836,7 +836,7 @@ bool try_eval_flash_attention_vulkan(
       float32);
 
   try {
-    const bool use_causal_shader = do_causal && q_len > 1 && q_len != kv_len;
+    const bool use_causal_shader = do_causal && q_len > 1;
 
     if (!try_dispatch_flash_attention_native_vulkan(
             q,

@@ -87,10 +87,9 @@ QueueFamilyIndices find_queue_families(vk::PhysicalDevice physical_device) {
   QueueFamilyIndices indices;
   indices.compute_family = compute_family;
   indices.transfer_family = transfer_family;
-  indices.has_separate_transfer = (compute_family != transfer_family) ||
-      (queue_families[compute_family].queueCount == 1 &&
-       (queue_families[transfer_family].queueFlags &
-        vk::QueueFlagBits::eTransfer) != vk::QueueFlagBits{});
+  indices.has_separate_transfer = (compute_family != transfer_family) &&
+      (queue_families[transfer_family].queueFlags &
+       vk::QueueFlagBits::eTransfer) != vk::QueueFlagBits{};
 
   return indices;
 }

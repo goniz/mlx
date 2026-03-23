@@ -151,17 +151,19 @@ void main() {
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
-    const uint32_t n_past = KV - N;
+    const int n_past = int(KV) - int(N);
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+
         if (CAUSAL_ONLY) {
             const uint32_t block_first_col = j * Bc;
             const uint32_t block_last_row = min(i * Br + Br - 1, N - 1);
-            if (block_first_col > n_past + block_last_row) {
+            if (int(block_first_col) > n_past + int(block_last_row)) {
                 continue;
             }
         }
+
         if (MASK_ENABLE) {
             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                 mask_opt_idx = j / 16;
@@ -326,8 +328,8 @@ void main() {
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                 const uint32_t global_col = j * Bc + c * cols_per_iter + col_tid;
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                    const uint32_t global_row = tile_row(r);
-                    if (global_col > n_past + global_row) {
+                    const uint32_t global_row = i * Br + tile_row(r);
+                    if (int(global_col) > n_past + int(global_row)) {
                         Sf[r][c] = ACC_TYPE(NEG_FLT_MAX_OVER_2);
                     }
                 }

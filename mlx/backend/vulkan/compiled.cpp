@@ -628,10 +628,12 @@ layout(push_constant) uniform PushConstants {
       } else if (prim_name == "LogAddExp" && x.inputs().size() == 2) {
         auto lhs = get_input_expr(x.inputs()[0]);
         auto rhs = get_input_expr(x.inputs()[1]);
+        std::string type_str = dtype_to_glsl_compute(x.dtype());
         os += fmt::format(
-            "((min({0}, {1}) == -1.0 / 0.0 || max({0}, {1}) == 1.0 / 0.0) ? max({0}, {1}) : (max({0}, {1}) + log(1.0 + exp(min({0}, {1}) - max({0}, {1})))));\n",
+            "((min({0}, {1}) == {2}(-1.0 / 0.0) || max({0}, {1}) == {2}(1.0 / 0.0)) ? max({0}, {1}) : (max({0}, {1}) + log({2}(1.0) + exp(min({0}, {1}) - max({0}, {1})))));\n",
             lhs,
-            rhs);
+            rhs,
+            type_str);
       } else if (is_binary_op && x.inputs().size() == 2) {
         if (is_complex && op == "*") {
           os += fmt::format(
@@ -695,7 +697,8 @@ layout(push_constant) uniform PushConstants {
             x.inputs()[0].dtype() == complex64) {
           fn = "complex_conjugate";
         } else if (op == "sigmoid") {
-          fn = "(1.0 / (1.0 + exp(-";
+          std::string type_str = dtype_to_glsl_compute(x.dtype());
+          fn = fmt::format("({0}(1.0) / ({0}(1.0) + exp(-", type_str);
         }
 
         if ((prim_name == "Real" || prim_name == "Imag") &&

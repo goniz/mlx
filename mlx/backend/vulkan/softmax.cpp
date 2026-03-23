@@ -1,11 +1,18 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/dtype_utils.h"
 
 namespace mlx::core {
 
 namespace {
+
+array cast_to_float16_staging(const array& in, Stream s) {
+  array out(in.shape(), float16, nullptr, {});
+  copy_gpu(in, out, CopyType::General, s);
+  return out;
+}
 
 bool is_supported_softmax_layout(const array& arr) {
   return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
@@ -182,16 +189,24 @@ bool try_eval_logsumexp_vulkan(
     return false;
   }
 
+  array out_target = out;
+  if (in.dtype() == bfloat16 &&
+      !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+    in = cast_to_float16_staging(in, s);
+    out_target = array(out.shape(), float16, nullptr, {});
+  }
+
   if (!in.flags().contiguous || in.offset() != 0 || in.strides().back() != 1 ||
       !is_supported_unary_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
 
-  array out_work = out;
-  const bool staged_output = !out.flags().contiguous || out.offset() != 0 ||
-      out.strides().back() != 1 || !is_supported_unary_layout(out);
+  array out_work = out_target;
+  const bool staged_output = !out_target.flags().contiguous ||
+      out_target.offset() != 0 || out_target.strides().back() != 1 ||
+      !is_supported_unary_layout(out_target);
   if (staged_output) {
-    out_work = array(out.shape(), out.dtype(), nullptr, {});
+    out_work = array(out_target.shape(), out_target.dtype(), nullptr, {});
   }
 
   set_unary_output_data(in, out_work);
@@ -207,15 +222,18 @@ bool try_eval_logsumexp_vulkan(
   }
 
   try {
-    const auto shader_id = out.dtype() == bfloat16
+    const auto shader_id = out_work.dtype() == bfloat16
         ? vulkan::StaticShaderId::logsumexp_bf16
-        : (out.dtype() == float16 ? vulkan::StaticShaderId::logsumexp_f16
-                                  : vulkan::StaticShaderId::logsumexp_f32);
+        : (out_work.dtype() == float16 ? vulkan::StaticShaderId::logsumexp_f16
+                                       : vulkan::StaticShaderId::logsumexp_f32);
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_sum_rows_op(in, out_work, shader_id, command_buffer, s);
     vulkan::end_command_recording(s.index);
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      copy_gpu(out_work, out_target, CopyType::GeneralGeneral, s);
+    }
+    if (out_target.id() != out.id()) {
+      copy_gpu(out_target, out, CopyType::GeneralGeneral, s);
     }
     return true;
   } catch (const std::runtime_error& e) {

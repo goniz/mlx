@@ -784,8 +784,10 @@ bool try_eval_flash_attention_vulkan(
   const uint32_t kv_heads = checked_u32_size(k.shape(1), "flash_attn kv_heads");
   const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
   const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
-  const bool use_native_bf16_kv = do_causal && q_len > 1 && q_len == kv_len &&
-      k.dtype() == bfloat16 && v.dtype() == bfloat16;
+  const bool use_native_bf16_kv =
+      vulkan::VulkanContext::get().shader_bfloat16_supported() && do_causal &&
+      q_len > 1 && q_len == kv_len && k.dtype() == bfloat16 &&
+      v.dtype() == bfloat16;
 
   if (batch == 0 || q_heads == 0 || q_len == 0 || hsk == 0 || kv_heads == 0 ||
       kv_len == 0 || hsv == 0 || hsk % 4 != 0 || hsv % 4 != 0 ||
@@ -834,7 +836,7 @@ bool try_eval_flash_attention_vulkan(
       float32);
 
   try {
-    const bool use_causal_shader = do_causal && q_len > 1 && q_len != kv_len;
+    const bool use_causal_shader = do_causal && q_len > 1;
 
     if (!try_dispatch_flash_attention_native_vulkan(
             q,
@@ -860,10 +862,12 @@ bool try_eval_flash_attention_vulkan(
 
     array out_final = astype(out_transposed, out.dtype(), s);
     trace_flash_attention_array("out_final", out_final);
+    eval(out_final);
     if (out.shape() == out_final.shape()) {
       auto data = out_final.data_shared_ptr();
       if (data != nullptr && data->buffer.ptr() != nullptr) {
         out.copy_shared_buffer(out_final);
+        out.set_status(array::Status::evaluated);
       } else {
         copy_gpu(out_final, out, CopyType::General, s);
         out.set_status(array::Status::evaluated);

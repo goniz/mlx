@@ -14,6 +14,12 @@ namespace fast {
 
 namespace {
 
+array cast_to_float16_staging(const array& in, Stream s) {
+  array out(in.shape(), float16, nullptr, {});
+  copy_gpu(in, out, CopyType::General, s);
+  return out;
+}
+
 std::optional<vulkan::StaticShaderId> rope_shader_id(
     Dtype dtype,
     bool traditional) {
@@ -183,9 +189,17 @@ bool try_eval_rope_vulkan(
     x = contiguous_copy_gpu(x, s);
   }
 
+  const bool fallback_to_f16 = x.dtype() == bfloat16 &&
+      !vulkan::VulkanContext::get().shader_bfloat16_supported();
+  if (fallback_to_f16) {
+    x = cast_to_float16_staging(x, s);
+  }
+
   const auto shader_id = rope_shader_id(x.dtype(), traditional);
-  if (!shader_id.has_value() || x.dtype() != out.dtype() || dims <= 0 ||
-      (dims % 2) != 0 || dims > x.shape(-1) || x.offset() != 0) {
+  if (!shader_id.has_value() ||
+      (x.dtype() != out.dtype() &&
+       !(fallback_to_f16 && out.dtype() == bfloat16)) ||
+      dims <= 0 || (dims % 2) != 0 || dims > x.shape(-1) || x.offset() != 0) {
     return false;
   }
 
@@ -211,13 +225,18 @@ bool try_eval_rope_vulkan(
     return false;
   }
 
-  if (out.size() == 0) {
+  array out_target = out;
+  if (fallback_to_f16) {
+    out_target = array(out.shape(), float16, nullptr, {});
+  }
+
+  if (out_target.size() == 0) {
     out.set_data(allocator::malloc(0));
     return true;
   }
 
-  out.set_data(allocator::malloc(out.nbytes()));
-  array out_norm = normalize_rope_output(out, normalized_shape, s);
+  out_target.set_data(allocator::malloc(out_target.nbytes()));
+  array out_norm = normalize_rope_output(out_target, normalized_shape, s);
 
   array x_kernel = swapaxes_in_eval(x_norm, 1, 2);
   array out_kernel = swapaxes_in_eval(out_norm, 1, 2);
@@ -253,6 +272,10 @@ bool try_eval_rope_vulkan(
         pc,
         grid);
     vulkan::end_command_recording(s.index);
+    if (out_target.id() != out.id()) {
+      out.set_data(allocator::malloc(out.nbytes()));
+      copy_gpu(out_target, out, CopyType::General, s);
+    }
     return true;
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {

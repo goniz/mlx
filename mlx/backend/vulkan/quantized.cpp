@@ -64,6 +64,19 @@ array ensure_float32_row_contiguous(const array& arr, Stream s) {
   return out;
 }
 
+array ensure_float16_row_contiguous(const array& arr, Stream s) {
+  if (arr.dtype() == float16 && is_row_contiguous_zero_offset(arr)) {
+    return arr;
+  }
+  array out(arr.shape(), float16, nullptr, {});
+  out.set_data(allocator::malloc(out.nbytes()));
+  copy_gpu(arr, out, CopyType::General, s);
+  if (!is_row_contiguous_zero_offset(out)) {
+    out = contiguous_copy_gpu(out, s);
+  }
+  return out;
+}
+
 Shape expanded_quantized_shape(const array& w, int bits) {
   auto out_shape = w.shape();
   out_shape.back() = w.shape(-1) * 32 / bits;
@@ -295,6 +308,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     x_mat = array(flat_shape, x.dtype(), nullptr, {});
     x_mat.copy_shared_buffer(
         x, make_contiguous_strides(flat_shape), x.flags(), x.size());
+  }
+
+  if (x_mat.dtype() == bfloat16 &&
+      !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+    x_mat = ensure_float16_row_contiguous(x_mat, s);
   }
 
   auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype());

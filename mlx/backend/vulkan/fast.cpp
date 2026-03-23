@@ -89,6 +89,22 @@ void trace_flash_attention_array(const char* label, const array& arr) {
   trace_flash_attention_debug(oss.str());
 }
 
+void begin_tracked_manual_op(
+    Stream s,
+    const char* name,
+    const std::vector<array>& inputs,
+    const std::vector<array>& outputs) {
+  vulkan::record_primitive_for_stream(s, name);
+  vulkan::begin_primitive_tracking(s, inputs, outputs);
+}
+
+void end_tracked_manual_op(
+    Stream s,
+    const std::vector<array>& inputs,
+    const std::vector<array>& outputs) {
+  vulkan::end_primitive_tracking(s, inputs, outputs);
+}
+
 array cast_flash_attention_kv_to_f16(
     const array& x,
     const char* scratch_lane,
@@ -975,6 +991,10 @@ array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
   masked.set_status(array::Status::available);
   masked.set_data(allocator::malloc(masked.nbytes()));
 
+  const std::vector<array> tracked_inputs = {scores};
+  const std::vector<array> tracked_outputs = {masked};
+  begin_tracked_manual_op(s, "diag_mask_inf", tracked_inputs, tracked_outputs);
+
   auto command_buffer = vulkan::begin_command_recording(s.index);
   vulkan::dispatch_diag_mask_inf_op(
       scores,
@@ -985,6 +1005,7 @@ array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
       checked_u32_size(scores.shape(scores.ndim() - 2), "rows_per_channel"),
       checked_u32_size(n_past, "n_past"));
   vulkan::end_command_recording(s.index);
+  end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
 
   return masked;
 }

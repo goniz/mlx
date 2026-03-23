@@ -862,10 +862,12 @@ bool try_eval_flash_attention_vulkan(
 
     array out_final = astype(out_transposed, out.dtype(), s);
     trace_flash_attention_array("out_final", out_final);
+    eval(out_final);
     if (out.shape() == out_final.shape()) {
       auto data = out_final.data_shared_ptr();
       if (data != nullptr && data->buffer.ptr() != nullptr) {
         out.copy_shared_buffer(out_final);
+        out.set_status(array::Status::evaluated);
       } else {
         copy_gpu(out_final, out, CopyType::General, s);
         out.set_status(array::Status::evaluated);

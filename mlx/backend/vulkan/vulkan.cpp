@@ -614,6 +614,9 @@ void VulkanContext::init() {
     if (coopmat_flash_attention_f32acc_supported) {
       device_extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     }
+    if (shader_bfloat16_supported) {
+      device_extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+    }
 
     vk::DeviceCreateInfo device_create_info;
     device_create_info.flags = vk::DeviceCreateFlags();

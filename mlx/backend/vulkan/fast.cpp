@@ -756,6 +756,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       vulkan::mark_scratch_array_written(s, kFlashAttnSplitKScratchLane);
     }
 
+    vulkan::set_force_immediate_submit(s);
     vulkan::end_command_recording(s.index);
     return true;
   } catch (const std::runtime_error& e) {

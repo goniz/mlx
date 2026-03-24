@@ -589,7 +589,7 @@ void matmul_shaders(
 
     // If bfloat16 is not supported, then only compile the scalar (promote to
     // fp32) shader
-#if !defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+#if !defined(MLX_VULKAN_BFLOAT16_GLSLC_SUPPORT)
     if (!(coopmat || coopmat2))
 #endif
     {
@@ -728,7 +728,7 @@ void matmul_shaders(
           f16acc);
     }
 
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#if defined(MLX_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     // Integer dot mmq performs better with f32 accumulators
     if (!f16acc && !coopmat && !coopmat2 &&
         (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4")) {
@@ -763,13 +763,13 @@ void process_shaders() {
     matmul_shaders(true, matmul_id_type, false, false, true);
 
     if (matmul_id_type != MatMulIdType::DEFAULT) {
-#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+#if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
       // Coopmat, fp32acc and fp16acc
       matmul_shaders(true, matmul_id_type, true, false, false);
       matmul_shaders(true, matmul_id_type, true, false, true);
 #endif
 
-#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+#if defined(MLX_VULKAN_COOPMAT2_GLSLC_SUPPORT)
       // Coopmat2, fp32acc and fp16acc
       matmul_shaders(true, matmul_id_type, false, true, false);
       matmul_shaders(true, matmul_id_type, false, true, true);
@@ -800,7 +800,7 @@ void process_shaders() {
 
       for (const auto& tname : type_names) {
         if (fp16 && tname != "bf16") {
-#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+#if defined(MLX_VULKAN_COOPMAT2_GLSLC_SUPPORT)
           if (tname == "f16") {
             string_to_spv(
                 "flash_attn_f32_f16_" + tname,
@@ -833,7 +833,7 @@ void process_shaders() {
                 f16acc);
           }
 #endif
-#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+#if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
           if (tname == "f16") {
             string_to_spv(
                 "flash_attn_f32_f16_" + tname,
@@ -1034,7 +1034,7 @@ void process_shaders() {
              {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
     // mul mat vec with integer dot product
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#if defined(MLX_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) ||
         tname == "iq1_s" || tname == "iq1_m") {
       string_to_spv(
@@ -2660,7 +2660,7 @@ void process_shaders() {
             (a_f16 ? "_f16" : "") + "_f32";
         string_to_spv(
             name + (unroll ? "_unroll" : ""), "conv2d_mm.comp", defines);
-#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+#if defined(MLX_VULKAN_COOPMAT2_GLSLC_SUPPORT)
         if (unroll) {
           defines["COOPMAT2"] = "1";
           string_to_spv(name, "conv2d_mm.comp", defines, true, false, true);
@@ -2906,7 +2906,7 @@ void write_output_files() {
 
   std::vector<std::string> btypes = {"f16", "f32"};
 
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#if defined(MLX_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
   btypes.push_back("q8_1");
 #endif
 

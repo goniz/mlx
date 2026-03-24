@@ -1095,6 +1095,11 @@ bool try_eval_rms_norm_vulkan(
     return false;
   }
 
+  const std::vector<array> tracked_inputs =
+      has_weight ? std::vector<array>{x, w} : std::vector<array>{x};
+  const std::vector<array> tracked_outputs = {out_work};
+  begin_tracked_manual_op(s, "rms_norm", tracked_inputs, tracked_outputs);
+
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_binary_op(
@@ -1108,11 +1113,13 @@ bool try_eval_rms_norm_vulkan(
         std::array<uint32_t, 3>{nrows, nchannels, nsamples},
         {0u, has_weight ? 1u : 0u});
     vulkan::end_command_recording(s.index);
+    end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::General, s);
     }
     return true;
   } catch (const std::runtime_error& e) {
+    end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
     if (trace_fallback_enabled()) {
       std::ostringstream oss;
       oss << "rms_norm_dispatch_failed reason=" << e.what();

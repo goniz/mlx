@@ -179,7 +179,7 @@ bool submit_on_hazard_boundary() {
       return std::string(env) != "0";
     }
 
-    return true;
+    return false;
   }();
   return enabled;
 }
@@ -446,6 +446,7 @@ struct StreamData {
   uint64_t deferred_compiled_bytes{0};
   uint32_t deferred_heavy_ops{0};
   uint32_t submission_count{0};
+  bool force_immediate_submit_{false};
 };
 
 class VulkanDevice {
@@ -501,6 +502,11 @@ class VulkanDevice {
       oss << "sync(stream=" << s.index << ") done inflight=0";
       trace_sync(oss.str());
     }
+  }
+
+  void set_force_immediate_submit(int stream_index) {
+    auto* stream = get_stream(stream_index);
+    stream->force_immediate_submit_ = true;
   }
 
   void finalize(Stream s) {
@@ -992,6 +998,7 @@ class VulkanDevice {
     }
 
     if (transfer || !deferred_submission_enabled()) {
+      stream->force_immediate_submit_ = false;
       trace_sync("end_recording action=submit immediate");
       submit_commands(
           stream,
@@ -1002,9 +1009,19 @@ class VulkanDevice {
       return;
     }
 
+    if (stream->force_immediate_submit_) {
+      stream->force_immediate_submit_ = false;
+      trace_sync("end_recording action=submit force_immediate");
+      insert_memory_barrier(
+          stream->recording_resources->compute_command_buffer);
+      submit_commands(stream, "force immediate");
+      return;
+    }
+
     stream->recorded_ops += 1;
     std::string submit_reason;
     if (should_submit_recording(stream, &submit_reason)) {
+      stream->force_immediate_submit_ = false;
       if (trace_sync_enabled()) {
         std::ostringstream oss;
         oss << "end_recording action=submit adaptive stream=" << stream_index
@@ -1890,6 +1907,10 @@ void end_primitive_tracking(
 
 void synchronize_stream(Stream s) {
   VulkanDevice::get().synchronize(s);
+}
+
+void set_force_immediate_submit(Stream s) {
+  VulkanDevice::get().set_force_immediate_submit(s.index);
 }
 
 void synchronize_all() {

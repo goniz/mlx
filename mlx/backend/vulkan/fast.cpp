@@ -89,6 +89,22 @@ void trace_flash_attention_array(const char* label, const array& arr) {
   trace_flash_attention_debug(oss.str());
 }
 
+void begin_tracked_manual_op(
+    Stream s,
+    const char* name,
+    const std::vector<array>& inputs,
+    const std::vector<array>& outputs) {
+  vulkan::record_primitive_for_stream(s, name);
+  vulkan::begin_primitive_tracking(s, inputs, outputs);
+}
+
+void end_tracked_manual_op(
+    Stream s,
+    const std::vector<array>& inputs,
+    const std::vector<array>& outputs) {
+  vulkan::end_primitive_tracking(s, inputs, outputs);
+}
+
 array cast_flash_attention_kv_to_f16(
     const array& x,
     const char* scratch_lane,
@@ -740,6 +756,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       vulkan::mark_scratch_array_written(s, kFlashAttnSplitKScratchLane);
     }
 
+    vulkan::set_force_immediate_submit(s);
     vulkan::end_command_recording(s.index);
     return true;
   } catch (const std::runtime_error& e) {
@@ -975,6 +992,10 @@ array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
   masked.set_status(array::Status::available);
   masked.set_data(allocator::malloc(masked.nbytes()));
 
+  const std::vector<array> tracked_inputs = {scores};
+  const std::vector<array> tracked_outputs = {masked};
+  begin_tracked_manual_op(s, "diag_mask_inf", tracked_inputs, tracked_outputs);
+
   auto command_buffer = vulkan::begin_command_recording(s.index);
   vulkan::dispatch_diag_mask_inf_op(
       scores,
@@ -985,6 +1006,7 @@ array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
       checked_u32_size(scores.shape(scores.ndim() - 2), "rows_per_channel"),
       checked_u32_size(n_past, "n_past"));
   vulkan::end_command_recording(s.index);
+  end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
 
   return masked;
 }
@@ -1073,6 +1095,11 @@ bool try_eval_rms_norm_vulkan(
     return false;
   }
 
+  const std::vector<array> tracked_inputs =
+      has_weight ? std::vector<array>{x, w} : std::vector<array>{x};
+  const std::vector<array> tracked_outputs = {out_work};
+  begin_tracked_manual_op(s, "rms_norm", tracked_inputs, tracked_outputs);
+
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_binary_op(
@@ -1086,11 +1113,13 @@ bool try_eval_rms_norm_vulkan(
         std::array<uint32_t, 3>{nrows, nchannels, nsamples},
         {0u, has_weight ? 1u : 0u});
     vulkan::end_command_recording(s.index);
+    end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::General, s);
     }
     return true;
   } catch (const std::runtime_error& e) {
+    end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
     if (trace_fallback_enabled()) {
       std::ostringstream oss;
       oss << "rms_norm_dispatch_failed reason=" << e.what();

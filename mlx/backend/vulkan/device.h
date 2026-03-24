@@ -69,6 +69,7 @@ void end_primitive_tracking(
 // Stream synchronization
 void finalize_stream(Stream s);
 void synchronize_stream(Stream s);
+void set_force_immediate_submit(Stream s);
 void synchronize_all();
 
 } // namespace mlx::core::vulkan

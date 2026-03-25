@@ -204,11 +204,9 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             (mx.bfloat16, 3e-3, 3e-3),
         ):
             with self.subTest(dtype=str(dtype)):
+
                 def fn(dtype=dtype):
-                    x = (
-                        mx.arange(1, 1 + 3 * 128, dtype=dtype).reshape(3, 128)
-                        / 64.0
-                    )
+                    x = mx.arange(1, 1 + 3 * 128, dtype=dtype).reshape(3, 128) / 64.0
                     w = (
                         mx.arange(1, 1 + 96 * 128, dtype=mx.float32).reshape(96, 128)
                         / 80.0
@@ -226,10 +224,12 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             (mx.bfloat16, 3e-3, 3e-3),
         ):
             with self.subTest(dtype=str(dtype)):
+
                 def fn(dtype=dtype):
                     x = (
-                        mx.arange(1, 1 + 2 * 1 * 4 * 128, dtype=dtype)
-                        .reshape(2, 1, 4, 128)
+                        mx.arange(1, 1 + 2 * 1 * 4 * 128, dtype=dtype).reshape(
+                            2, 1, 4, 128
+                        )
                         / 96.0
                     )
                     w = (
@@ -242,6 +242,56 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
                     ).astype(mx.float32)
 
                 self._assert_cpu_gpu_same(fn, atol=atol, rtol=rtol)
+
+    def test_fast_rope_bf16_vulkan_gpu(self):
+        """Regression test: bf16 RoPE should run on Vulkan GPU, not fall back to CPU."""
+
+        def run_rope():
+            x = mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.bfloat16).reshape(2, 4, 8) / 32.0
+            return mx.fast.rope(
+                x,
+                dims=8,
+                traditional=False,
+                base=10000.0,
+                scale=1.0,
+                offset=0,
+            )
+
+        cpu_out = self._run_on_device(mx.cpu, run_rope)
+        gpu_out = self._run_on_device(mx.gpu, run_rope)
+        cpu_out_f32 = cpu_out.astype(mx.float32)
+        gpu_out_f32 = gpu_out.astype(mx.float32)
+        self._assert_outputs_close(gpu_out_f32, cpu_out_f32, atol=1e-2, rtol=1e-2)
+
+    def test_bf16_copy_with_large_destination_offset_vulkan_gpu(self):
+        """Regression test: bf16 general copy should accept large byte offsets."""
+
+        def run_copy():
+            src = (
+                mx.arange(1, 1 + 8 * 256 * 128, dtype=mx.float32)
+                .reshape(1, 8, 256, 128)
+                .astype(mx.bfloat16)
+            )
+            dst = mx.zeros((2, 8, 256, 128), dtype=mx.bfloat16)
+            updated = mx.concatenate([dst[:1], src], axis=0)
+            return updated[1]
+
+        cpu_out = self._run_on_device(mx.cpu, run_copy).astype(mx.float32)
+        gpu_out = self._run_on_device(mx.gpu, run_copy).astype(mx.float32)
+        self._assert_outputs_close(gpu_out, cpu_out, atol=1e-2, rtol=1e-2)
+
+    def test_host_source_slice_cast_copy_vulkan_gpu(self):
+        host_src = self._run_on_device(
+            mx.cpu,
+            lambda: mx.arange(0, 10, dtype=mx.float32),
+        )
+
+        def run_copy():
+            return host_src[2:8].astype(mx.float16)
+
+        cpu_out = self._run_on_device(mx.cpu, run_copy).astype(mx.float32)
+        gpu_out = self._run_on_device(mx.gpu, run_copy).astype(mx.float32)
+        self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
 
 
 def _cases():
@@ -1032,80 +1082,6 @@ def _make_test(name, fn, atol, rtol):
 
 for _name, _fn, _atol, _rtol in _cases():
     setattr(TestVulkanOpsParity, f"test_{_name}", _make_test(_name, _fn, _atol, _rtol))
-
-
-def test_fast_rope_bf16_vulkan_gpu(self):
-    """Regression test: bf16 RoPE should run on Vulkan GPU, not fall back to CPU."""
-    # This test ensures bf16 RoPE uses the Vulkan kernel and produces correct results
-    def run_rope():
-        x = mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.bfloat16).reshape(2, 4, 8) / 32.0
-        return mx.fast.rope(
-            x,
-            dims=8,
-            traditional=False,
-            base=10000.0,
-            scale=1.0,
-            offset=0,
-        )
-
-    # Run on CPU as reference
-    cpu_out = self._run_on_device(mx.cpu, run_rope)
-    # Run on GPU - should NOT fall back to CPU
-    gpu_out = self._run_on_device(mx.gpu, run_rope)
-    # Convert to float32 for comparison since numpy doesn't support bfloat16
-    cpu_out_f32 = cpu_out.astype(mx.float32)
-    gpu_out_f32 = gpu_out.astype(mx.float32)
-    # Verify results match
-    self._assert_outputs_close(gpu_out_f32, cpu_out_f32, atol=1e-2, rtol=1e-2)
-
-
-setattr(TestVulkanOpsParity, "test_fast_rope_bf16_vulkan_gpu", test_fast_rope_bf16_vulkan_gpu)
-
-
-def test_bf16_copy_with_large_destination_offset_vulkan_gpu(self):
-    """Regression test: bf16 general copy should accept large byte offsets."""
-
-    def run_copy():
-        src = (
-            mx.arange(1, 1 + 8 * 256 * 128, dtype=mx.float32)
-            .reshape(1, 8, 256, 128)
-            .astype(mx.bfloat16)
-        )
-        dst = mx.zeros((2, 8, 256, 128), dtype=mx.bfloat16)
-        updated = mx.concatenate([dst[:1], src], axis=0)
-        return updated[1]
-
-    cpu_out = self._run_on_device(mx.cpu, run_copy).astype(mx.float32)
-    gpu_out = self._run_on_device(mx.gpu, run_copy).astype(mx.float32)
-    self._assert_outputs_close(gpu_out, cpu_out, atol=1e-2, rtol=1e-2)
-
-
-setattr(
-    TestVulkanOpsParity,
-    "test_bf16_copy_with_large_destination_offset_vulkan_gpu",
-    test_bf16_copy_with_large_destination_offset_vulkan_gpu,
-)
-
-
-def test_host_source_slice_cast_copy_vulkan_gpu(self):
-    host_src = self._run_on_device(
-        mx.cpu,
-        lambda: mx.arange(0, 10, dtype=mx.float32),
-    )
-
-    def run_copy():
-        return host_src[2:8].astype(mx.float16)
-
-    cpu_out = self._run_on_device(mx.cpu, run_copy).astype(mx.float32)
-    gpu_out = self._run_on_device(mx.gpu, run_copy).astype(mx.float32)
-    self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
-
-
-setattr(
-    TestVulkanOpsParity,
-    "test_host_source_slice_cast_copy_vulkan_gpu",
-    test_host_source_slice_cast_copy_vulkan_gpu,
-)
 
 
 TestVulkanOpsParity = unittest.skipIf(

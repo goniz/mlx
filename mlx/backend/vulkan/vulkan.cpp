@@ -146,8 +146,7 @@ bool VulkanContext::shader_bfloat16_supported() const {
       shader_bfloat16_supported_ = probe_shader_bfloat16_support();
     }
 
-    if (bf16_capability_debug_enabled() ||
-        shader_bfloat16_supported_ != shader_bfloat16_reported_supported_) {
+    if (bf16_capability_debug_enabled()) {
       std::cerr << "[vulkan::caps] shader_bfloat16 extension_present="
                 << shader_bfloat16_extension_present_
                 << " reported_supported=" << shader_bfloat16_reported_supported_

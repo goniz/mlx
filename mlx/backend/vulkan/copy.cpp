@@ -998,6 +998,7 @@ std::optional<vulkan::StaticShaderId> get_copy_shader_id(
       (in.dtype() == mlx::core::uint64 && out.dtype() == mlx::core::uint64) ||
       (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::float32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int64) ||
+      (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::int64) ||
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::complex64);
 
   if (!supported_pair) {
@@ -1093,6 +1094,9 @@ std::optional<vulkan::StaticShaderId> get_copy_shader_id(
   }
   if (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int64) {
     return vulkan::StaticShaderId::cpy_i32_i64;
+  }
+  if (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::int64) {
+    return vulkan::StaticShaderId::cpy_u32_i64;
   }
   if (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::complex64) {
     return vulkan::StaticShaderId::cpy_f32_c64;
@@ -1315,6 +1319,24 @@ void copy_gpu_inplace(
             element_offset(out_view),
             s)) {
       return;
+    }
+  }
+
+  // Fallback for Vector copies with dtype conversion when no shader exists.
+  // try_host_vector_cast_copy handles GPU readback -> CPU conversion -> upload.
+  if (ctype == CopyType::Vector && !same_dtype && !shader_copy) {
+    try {
+      if (try_host_vector_cast_copy(
+              in_view,
+              out_view,
+              dispatch_elements,
+              element_offset(in_view),
+              element_offset(out_view),
+              s)) {
+        return;
+      }
+    } catch (const std::exception& e) {
+      // Fall through to error message
     }
   }
 

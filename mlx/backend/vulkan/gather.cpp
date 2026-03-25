@@ -62,7 +62,9 @@ bool try_eval_gather_vulkan(
         transposed.strides().back() != 1) {
       transposed = contiguous_copy_gpu(transposed, s);
     }
-    eval(transposed);
+    if (transposed.has_primitive()) {
+      eval(transposed);
+    }
 
     const uint32_t dim1 =
         checked_u32_size(src_input.shape(axis1), "gather paired axis size");
@@ -93,7 +95,9 @@ bool try_eval_gather_vulkan(
         linear_idx.strides().back() != 1) {
       linear_idx = contiguous_copy_gpu(linear_idx, s);
     }
-    eval(linear_idx);
+    if (linear_idx.has_primitive()) {
+      eval(linear_idx);
+    }
     array idx_1d =
         reshape_in_eval(linear_idx, Shape{static_cast<int>(index_count)}, s);
     array out_work = out;

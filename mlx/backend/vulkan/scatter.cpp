@@ -101,7 +101,9 @@ bool try_eval_scatter_vulkan(
       transposed.strides().back() != 1) {
     transposed = contiguous_copy_gpu(transposed, s);
   }
-  eval(transposed);
+  if (transposed.has_primitive()) {
+    eval(transposed);
+  }
 
   array out_flat = reshape_in_eval(
       transposed,
@@ -113,7 +115,9 @@ bool try_eval_scatter_vulkan(
       linear_idx.strides().back() != 1) {
     linear_idx = contiguous_copy_gpu(linear_idx, s);
   }
-  eval(linear_idx);
+  if (linear_idx.has_primitive()) {
+    eval(linear_idx);
+  }
   array idx_flat = reshape_in_eval(
       linear_idx, Shape{1, static_cast<int>(index_count), 1}, s);
   array upd_flat = reshape_in_eval(
@@ -142,7 +146,9 @@ bool try_eval_scatter_vulkan(
     vulkan::end_command_recording(s.index);
 
     array restored = transpose(transposed, invert_perm(perm), s);
-    eval(restored);
+    if (restored.has_primitive()) {
+      eval(restored);
+    }
     copy_gpu(restored, out_work, CopyType::GeneralGeneral, s);
     copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
     out.set_status(array::Status::available);

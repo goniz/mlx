@@ -90,7 +90,9 @@ bool try_eval_gather_vulkan(
         s);
     array linear_idx =
         add(multiply(idx0, array(dim1, idx0.dtype()), s), idx1, s);
-    eval(linear_idx);
+    if (linear_idx.has_primitive()) {
+      eval(linear_idx);
+    }
     if (!linear_idx.flags().contiguous || linear_idx.offset() != 0 ||
         linear_idx.strides().back() != 1) {
       linear_idx = contiguous_copy_gpu(linear_idx, s);
@@ -218,7 +220,9 @@ bool try_eval_gather_vulkan(
       }
     }
     auto transposed = transpose(src_input, perm, s);
-    eval(transposed);
+    if (transposed.has_primitive()) {
+      eval(transposed);
+    }
     copy_gpu(transposed, src_2d, CopyType::General, s);
   }
   array idx_1d = reshape_in_eval(idx, Shape{static_cast<int>(index_count)}, s);

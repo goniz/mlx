@@ -110,13 +110,12 @@ bool try_eval_scatter_vulkan(
       Shape{1, static_cast<int>(flat_axis_size), static_cast<int>(slice_size)},
       s);
   array linear_idx = add(multiply(idx0, array(dim1, idx0.dtype()), s), idx1, s);
-  eval(linear_idx);
+  if (linear_idx.has_primitive()) {
+    eval(linear_idx);
+  }
   if (!linear_idx.flags().contiguous || linear_idx.offset() != 0 ||
       linear_idx.strides().back() != 1) {
     linear_idx = contiguous_copy_gpu(linear_idx, s);
-  }
-  if (linear_idx.has_primitive()) {
-    eval(linear_idx);
   }
   array idx_flat = reshape_in_eval(
       linear_idx, Shape{1, static_cast<int>(index_count), 1}, s);

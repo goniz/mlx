@@ -462,6 +462,18 @@ struct GatherAxisPushConstants {
   uint32_t idx_axis_size;
 };
 
+struct GatherPairPushConstants {
+  uint32_t ne;
+  uint32_t outer_size;
+  uint32_t axis0_size;
+  uint32_t slice0_size;
+  uint32_t middle_size;
+  uint32_t axis1_size;
+  uint32_t slice1_size;
+  uint32_t inner_size;
+  uint32_t index_count;
+};
+
 struct RopePushConstants {
   uint32_t rope_mode;
   uint32_t nrows;
@@ -721,6 +733,35 @@ void dispatch_gather_axis_op(
     uint32_t size_post,
     uint32_t idx_axis_size);
 
+void dispatch_gather_take_op(
+    const array& src,
+    const array& indices,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t size_pre,
+    uint32_t size_axis,
+    uint32_t size_post,
+    uint32_t index_count);
+
+void dispatch_gather_pair_op(
+    const array& src,
+    const array& idx0,
+    const array& idx1,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t outer_size,
+    uint32_t axis0_size,
+    uint32_t slice0_size,
+    uint32_t middle_size,
+    uint32_t axis1_size,
+    uint32_t slice1_size,
+    uint32_t inner_size,
+    uint32_t index_count);
+
 void dispatch_scatter_axis_op(
     const array& updates,
     const array& indices,
@@ -732,6 +773,35 @@ void dispatch_scatter_axis_op(
     uint32_t size_axis,
     uint32_t size_post,
     uint32_t idx_axis_size);
+
+void dispatch_scatter_take_op(
+    const array& updates,
+    const array& indices,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t size_pre,
+    uint32_t size_axis,
+    uint32_t size_post,
+    uint32_t index_count);
+
+void dispatch_scatter_pair_op(
+    const array& updates,
+    const array& idx0,
+    const array& idx1,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t outer_size,
+    uint32_t axis0_size,
+    uint32_t slice0_size,
+    uint32_t middle_size,
+    uint32_t axis1_size,
+    uint32_t slice1_size,
+    uint32_t inner_size,
+    uint32_t index_count);
 
 void dispatch_rope_op(
     const array& in,

@@ -128,6 +128,24 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             rtol=5e-2,
         )
 
+    def test_list_getitem_regression(self):
+        def fn():
+            a = mx.arange(16, dtype=mx.float32).reshape(4, 4)
+            idx = mx.array([0, 2], dtype=mx.uint32)
+            return (a[0, idx], a[:, idx])
+
+        self._assert_cpu_gpu_same(fn, atol=0.0, rtol=0.0)
+
+    def test_list_setitem_regression(self):
+        def fn():
+            a = mx.arange(16, dtype=mx.float32).reshape(4, 4)
+            idx = mx.array([0, 2], dtype=mx.uint32)
+            a[0, idx] = 3.0
+            a[:, idx] = 4.0
+            return a
+
+        self._assert_cpu_gpu_same(fn, atol=0.0, rtol=0.0)
+
     def test_scaled_dot_product_attention_qwen_shape_regression(self):
         self._assert_cpu_gpu_same(
             lambda: mx.fast.scaled_dot_product_attention(

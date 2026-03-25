@@ -289,26 +289,52 @@ std::optional<vulkan::StaticShaderId> unary_shader_id(
 std::optional<vulkan::StaticShaderId> gather_shader_id(
     Dtype value_dtype,
     Dtype index_dtype) {
-  MLX_VK_GATHER_CASE(float32, int32, gather_f32_i32);
-  MLX_VK_GATHER_CASE(float16, int32, gather_f16_i32);
-  MLX_VK_GATHER_CASE(bfloat16, int32, gather_bf16_i32);
-  MLX_VK_GATHER_CASE(int32, int32, gather_i32_i32);
-  MLX_VK_GATHER_CASE(uint32, int32, gather_u32_i32);
-  MLX_VK_GATHER_CASE(float32, int64, gather_f32_i64);
-  MLX_VK_GATHER_CASE(float16, int64, gather_f16_i64);
-  MLX_VK_GATHER_CASE(bfloat16, int64, gather_bf16_i64);
-  MLX_VK_GATHER_CASE(int32, int64, gather_i32_i64);
-  MLX_VK_GATHER_CASE(uint32, int64, gather_u32_i64);
-  MLX_VK_GATHER_CASE(float32, uint32, gather_f32_u32);
-  MLX_VK_GATHER_CASE(float16, uint32, gather_f16_u32);
-  MLX_VK_GATHER_CASE(bfloat16, uint32, gather_bf16_u32);
-  MLX_VK_GATHER_CASE(int32, uint32, gather_i32_u32);
-  MLX_VK_GATHER_CASE(uint32, uint32, gather_u32_u32);
-  MLX_VK_GATHER_CASE(float32, uint64, gather_f32_u64);
-  MLX_VK_GATHER_CASE(float16, uint64, gather_f16_u64);
-  MLX_VK_GATHER_CASE(bfloat16, uint64, gather_bf16_u64);
-  MLX_VK_GATHER_CASE(int32, uint64, gather_i32_u64);
-  MLX_VK_GATHER_CASE(uint32, uint64, gather_u32_u64);
+  MLX_VK_GATHER_CASE(float32, int32, gather_take_f32_i32);
+  MLX_VK_GATHER_CASE(float16, int32, gather_take_f16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int32, gather_take_bf16_i32);
+  MLX_VK_GATHER_CASE(int32, int32, gather_take_i32_i32);
+  MLX_VK_GATHER_CASE(uint32, int32, gather_take_u32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, gather_take_f32_i64);
+  MLX_VK_GATHER_CASE(float16, int64, gather_take_f16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, int64, gather_take_bf16_i64);
+  MLX_VK_GATHER_CASE(int32, int64, gather_take_i32_i64);
+  MLX_VK_GATHER_CASE(uint32, int64, gather_take_u32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, gather_take_f32_u32);
+  MLX_VK_GATHER_CASE(float16, uint32, gather_take_f16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, gather_take_bf16_u32);
+  MLX_VK_GATHER_CASE(int32, uint32, gather_take_i32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint32, gather_take_u32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, gather_take_f32_u64);
+  MLX_VK_GATHER_CASE(float16, uint64, gather_take_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, gather_take_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, uint64, gather_take_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, uint64, gather_take_u32_u64);
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> gather_pair_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, gather_pair_f32_i32);
+  MLX_VK_GATHER_CASE(float16, int32, gather_pair_f16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int32, gather_pair_bf16_i32);
+  MLX_VK_GATHER_CASE(int32, int32, gather_pair_i32_i32);
+  MLX_VK_GATHER_CASE(uint32, int32, gather_pair_u32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, gather_pair_f32_i64);
+  MLX_VK_GATHER_CASE(float16, int64, gather_pair_f16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, int64, gather_pair_bf16_i64);
+  MLX_VK_GATHER_CASE(int32, int64, gather_pair_i32_i64);
+  MLX_VK_GATHER_CASE(uint32, int64, gather_pair_u32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, gather_pair_f32_u32);
+  MLX_VK_GATHER_CASE(float16, uint32, gather_pair_f16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, gather_pair_bf16_u32);
+  MLX_VK_GATHER_CASE(int32, uint32, gather_pair_i32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint32, gather_pair_u32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, gather_pair_f32_u64);
+  MLX_VK_GATHER_CASE(float16, uint64, gather_pair_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, gather_pair_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, uint64, gather_pair_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, uint64, gather_pair_u32_u64);
   return std::nullopt;
 }
 
@@ -335,6 +361,58 @@ std::optional<vulkan::StaticShaderId> gather_axis_shader_id(
   MLX_VK_GATHER_CASE(bfloat16, uint64, gather_axis_bf16_u64);
   MLX_VK_GATHER_CASE(int32, uint64, gather_axis_i32_u64);
   MLX_VK_GATHER_CASE(uint32, uint64, gather_axis_u32_u64);
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> scatter_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, scatter_take_f32_i32);
+  MLX_VK_GATHER_CASE(float16, int32, scatter_take_f16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int32, scatter_take_bf16_i32);
+  MLX_VK_GATHER_CASE(int32, int32, scatter_take_i32_i32);
+  MLX_VK_GATHER_CASE(uint32, int32, scatter_take_u32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, scatter_take_f32_i64);
+  MLX_VK_GATHER_CASE(float16, int64, scatter_take_f16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, int64, scatter_take_bf16_i64);
+  MLX_VK_GATHER_CASE(int32, int64, scatter_take_i32_i64);
+  MLX_VK_GATHER_CASE(uint32, int64, scatter_take_u32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, scatter_take_f32_u32);
+  MLX_VK_GATHER_CASE(float16, uint32, scatter_take_f16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, scatter_take_bf16_u32);
+  MLX_VK_GATHER_CASE(int32, uint32, scatter_take_i32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint32, scatter_take_u32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, scatter_take_f32_u64);
+  MLX_VK_GATHER_CASE(float16, uint64, scatter_take_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, scatter_take_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, uint64, scatter_take_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, uint64, scatter_take_u32_u64);
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> scatter_pair_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, scatter_pair_f32_i32);
+  MLX_VK_GATHER_CASE(float16, int32, scatter_pair_f16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int32, scatter_pair_bf16_i32);
+  MLX_VK_GATHER_CASE(int32, int32, scatter_pair_i32_i32);
+  MLX_VK_GATHER_CASE(uint32, int32, scatter_pair_u32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, scatter_pair_f32_i64);
+  MLX_VK_GATHER_CASE(float16, int64, scatter_pair_f16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, int64, scatter_pair_bf16_i64);
+  MLX_VK_GATHER_CASE(int32, int64, scatter_pair_i32_i64);
+  MLX_VK_GATHER_CASE(uint32, int64, scatter_pair_u32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, scatter_pair_f32_u32);
+  MLX_VK_GATHER_CASE(float16, uint32, scatter_pair_f16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, scatter_pair_bf16_u32);
+  MLX_VK_GATHER_CASE(int32, uint32, scatter_pair_i32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint32, scatter_pair_u32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, scatter_pair_f32_u64);
+  MLX_VK_GATHER_CASE(float16, uint64, scatter_pair_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, scatter_pair_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, uint64, scatter_pair_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, uint64, scatter_pair_u32_u64);
   return std::nullopt;
 }
 

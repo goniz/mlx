@@ -311,6 +311,7 @@ enum class KernelSpecId {
   RandomBits,
   Gather,
   GatherAxis,
+  GatherPair,
   Rope,
   FlashAttention,
   FlashAttentionSplitKReduce,
@@ -344,7 +345,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 25> kKernelSpecs = {
+const std::array<KernelSpec, 26> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -412,6 +413,10 @@ const std::array<KernelSpec, 25> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(GatherAxisPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(GatherPairPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
         {0, 1, 2, 3, 4},
@@ -2680,6 +2685,97 @@ void dispatch_gather_axis_op(
       s);
 }
 
+void dispatch_gather_take_op(
+    const array& src,
+    const array& indices,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t size_pre,
+    uint32_t size_axis,
+    uint32_t size_post,
+    uint32_t index_count) {
+  GatherAxisPushConstants push_constants{};
+  const uint32_t elems_per_prefix =
+      checked_mul_u32(index_count, size_post, "gather_take elems_per_prefix");
+  push_constants.ne =
+      checked_mul_u32(size_pre, elems_per_prefix, "gather_take elements");
+  push_constants.size_pre = size_pre;
+  push_constants.size_axis = size_axis;
+  push_constants.size_post = size_post;
+  push_constants.idx_axis_size = index_count;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&src, "src"},
+      {&indices, "indices"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GatherAxis,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_gather_pair_op(
+    const array& src,
+    const array& idx0,
+    const array& idx1,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t outer_size,
+    uint32_t axis0_size,
+    uint32_t slice0_size,
+    uint32_t middle_size,
+    uint32_t axis1_size,
+    uint32_t slice1_size,
+    uint32_t inner_size,
+    uint32_t index_count) {
+  GatherPairPushConstants push_constants{};
+  const uint32_t slice_size = checked_mul_u32(
+      checked_mul_u32(
+          checked_mul_u32(
+              checked_mul_u32(
+                  outer_size, slice0_size, "gather_pair outer_slice0"),
+              middle_size,
+              "gather_pair outer_middle"),
+          slice1_size,
+          "gather_pair middle_slice1"),
+      inner_size,
+      "gather_pair slice_size");
+  push_constants.ne =
+      checked_mul_u32(index_count, slice_size, "gather_pair elements");
+  push_constants.outer_size = outer_size;
+  push_constants.axis0_size = axis0_size;
+  push_constants.slice0_size = slice0_size;
+  push_constants.middle_size = middle_size;
+  push_constants.axis1_size = axis1_size;
+  push_constants.slice1_size = slice1_size;
+  push_constants.inner_size = inner_size;
+  push_constants.index_count = index_count;
+
+  const std::array<BoundArray, 4> bound_arrays = {{
+      {&src, "src"},
+      {&idx0, "idx0"},
+      {&idx1, "idx1"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GatherPair,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
+}
+
 void dispatch_scatter_axis_op(
     const array& updates,
     const array& indices,
@@ -2709,6 +2805,97 @@ void dispatch_scatter_axis_op(
   dispatch_with_spec(
       shader_id,
       KernelSpecId::GatherAxis,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_scatter_take_op(
+    const array& updates,
+    const array& indices,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t size_pre,
+    uint32_t size_axis,
+    uint32_t size_post,
+    uint32_t index_count) {
+  GatherAxisPushConstants push_constants{};
+  const uint32_t elems_per_prefix =
+      checked_mul_u32(index_count, size_post, "scatter_take elems_per_prefix");
+  push_constants.ne =
+      checked_mul_u32(size_pre, elems_per_prefix, "scatter_take elements");
+  push_constants.size_pre = size_pre;
+  push_constants.size_axis = size_axis;
+  push_constants.size_post = size_post;
+  push_constants.idx_axis_size = index_count;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&updates, "updates"},
+      {&indices, "indices"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GatherAxis,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_scatter_pair_op(
+    const array& updates,
+    const array& idx0,
+    const array& idx1,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t outer_size,
+    uint32_t axis0_size,
+    uint32_t slice0_size,
+    uint32_t middle_size,
+    uint32_t axis1_size,
+    uint32_t slice1_size,
+    uint32_t inner_size,
+    uint32_t index_count) {
+  GatherPairPushConstants push_constants{};
+  const uint32_t slice_size = checked_mul_u32(
+      checked_mul_u32(
+          checked_mul_u32(
+              checked_mul_u32(
+                  outer_size, slice0_size, "scatter_pair outer_slice0"),
+              middle_size,
+              "scatter_pair outer_middle"),
+          slice1_size,
+          "scatter_pair middle_slice1"),
+      inner_size,
+      "scatter_pair slice_size");
+  push_constants.ne =
+      checked_mul_u32(index_count, slice_size, "scatter_pair elements");
+  push_constants.outer_size = outer_size;
+  push_constants.axis0_size = axis0_size;
+  push_constants.slice0_size = slice0_size;
+  push_constants.middle_size = middle_size;
+  push_constants.axis1_size = axis1_size;
+  push_constants.slice1_size = slice1_size;
+  push_constants.inner_size = inner_size;
+  push_constants.index_count = index_count;
+
+  const std::array<BoundArray, 4> bound_arrays = {{
+      {&updates, "updates"},
+      {&idx0, "idx0"},
+      {&idx1, "idx1"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GatherPair,
       bound_arrays,
       push_constants,
       push_constants.ne,

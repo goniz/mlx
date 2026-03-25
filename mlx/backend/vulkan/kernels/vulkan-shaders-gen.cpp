@@ -1161,247 +1161,68 @@ void process_shaders() {
        {"B_TYPE", "int"},
        {"D_TYPE", "uint"}});
 
-  string_to_spv("gather_f32_i32", "gather.comp", {{"VALUE_TYPE", "float"}});
-  string_to_spv("gather_f16_i32", "gather.comp", {{"VALUE_TYPE", "float16_t"}});
-  string_to_spv("gather_bf16_i32", "gather.comp", {{"VALUE_TYPE", "uint16_t"}});
-  string_to_spv("gather_i32_i32", "gather.comp", {{"VALUE_TYPE", "int"}});
-  string_to_spv("gather_u32_i32", "gather.comp", {{"VALUE_TYPE", "uint"}});
-  string_to_spv(
-      "gather_f32_i64",
-      "gather.comp",
-      {{"VALUE_TYPE", "float"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_f16_i64",
-      "gather.comp",
-      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_bf16_i64",
-      "gather.comp",
-      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_i32_i64",
-      "gather.comp",
-      {{"VALUE_TYPE", "int"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_u32_i64",
-      "gather.comp",
-      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_f32_u32",
-      "gather.comp",
-      {{"VALUE_TYPE", "float"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_f16_u32",
-      "gather.comp",
-      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_bf16_u32",
-      "gather.comp",
-      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_i32_u32",
-      "gather.comp",
-      {{"VALUE_TYPE", "int"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_u32_u32",
-      "gather.comp",
-      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_f32_u64",
-      "gather.comp",
-      {{"VALUE_TYPE", "float"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_f16_u64",
-      "gather.comp",
-      {{"VALUE_TYPE", "float16_t"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_bf16_u64",
-      "gather.comp",
-      {{"VALUE_TYPE", "uint16_t"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_i32_u64",
-      "gather.comp",
-      {{"VALUE_TYPE", "int"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_u32_u64",
-      "gather.comp",
-      {{"VALUE_TYPE", "uint"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
+  auto indexing_shaders = [&](const std::string& prefix,
+                              const std::string& shader_file) {
+    auto add_variant = [&](const std::string& value_tag,
+                           const std::string& value_type,
+                           const std::string& index_tag,
+                           const std::map<std::string, std::string>& extra) {
+      auto defines = merge_maps({{"VALUE_TYPE", value_type}}, extra);
+      string_to_spv(
+          prefix + "_" + value_tag + "_" + index_tag, shader_file, defines);
+    };
 
-  string_to_spv(
-      "gather_axis_f32_i32", "gather_axis.comp", {{"VALUE_TYPE", "float"}});
-  string_to_spv(
-      "gather_axis_f16_i32", "gather_axis.comp", {{"VALUE_TYPE", "float16_t"}});
-  string_to_spv(
-      "gather_axis_bf16_i32", "gather_axis.comp", {{"VALUE_TYPE", "uint16_t"}});
-  string_to_spv(
-      "gather_axis_i32_i32", "gather_axis.comp", {{"VALUE_TYPE", "int"}});
-  string_to_spv(
-      "gather_axis_u32_i32", "gather_axis.comp", {{"VALUE_TYPE", "uint"}});
-  string_to_spv(
-      "gather_axis_f32_i64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "float"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_axis_f16_i64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_axis_bf16_i64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_axis_i32_i64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "int"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_axis_u32_i64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "gather_axis_f32_u32",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "float"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_f16_u32",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_bf16_u32",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_i32_u32",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "int"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_u32_u32",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_f32_u64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "float"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_f16_u64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "float16_t"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_bf16_u64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "uint16_t"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_i32_u64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "int"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "gather_axis_u32_u64",
-      "gather_axis.comp",
-      {{"VALUE_TYPE", "uint"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
+    add_variant("f32", "float", "i32", {});
+    add_variant("f16", "float16_t", "i32", {});
+    add_variant("bf16", "uint16_t", "i32", {});
+    add_variant("i32", "int", "i32", {});
+    add_variant("u32", "uint", "i32", {});
 
-  string_to_spv(
-      "scatter_axis_f32_i32", "scatter_axis.comp", {{"VALUE_TYPE", "float"}});
-  string_to_spv(
-      "scatter_axis_f16_i32",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "float16_t"}});
-  string_to_spv(
-      "scatter_axis_bf16_i32",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "uint16_t"}});
-  string_to_spv(
-      "scatter_axis_i32_i32", "scatter_axis.comp", {{"VALUE_TYPE", "int"}});
-  string_to_spv(
-      "scatter_axis_u32_i32", "scatter_axis.comp", {{"VALUE_TYPE", "uint"}});
-  string_to_spv(
-      "scatter_axis_f32_i64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "float"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "scatter_axis_f16_i64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "scatter_axis_bf16_i64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "scatter_axis_i32_i64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "int"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "scatter_axis_u32_i64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_I64", "1"}});
-  string_to_spv(
-      "scatter_axis_f32_u32",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "float"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_f16_u32",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_bf16_u32",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_i32_u32",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "int"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_u32_u32",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_f32_u64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "float"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_f16_u64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "float16_t"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_bf16_u64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "uint16_t"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_i32_u64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "int"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
-  string_to_spv(
-      "scatter_axis_u32_u64",
-      "scatter_axis.comp",
-      {{"VALUE_TYPE", "uint"},
-       {"INDEX_IS_I64", "1"},
-       {"INDEX_IS_UNSIGNED", "1"}});
+    add_variant("f32", "float", "i64", {{"INDEX_IS_I64", "1"}});
+    add_variant("f16", "float16_t", "i64", {{"INDEX_IS_I64", "1"}});
+    add_variant("bf16", "uint16_t", "i64", {{"INDEX_IS_I64", "1"}});
+    add_variant("i32", "int", "i64", {{"INDEX_IS_I64", "1"}});
+    add_variant("u32", "uint", "i64", {{"INDEX_IS_I64", "1"}});
+
+    add_variant("f32", "float", "u32", {{"INDEX_IS_UNSIGNED", "1"}});
+    add_variant("f16", "float16_t", "u32", {{"INDEX_IS_UNSIGNED", "1"}});
+    add_variant("bf16", "uint16_t", "u32", {{"INDEX_IS_UNSIGNED", "1"}});
+    add_variant("i32", "int", "u32", {{"INDEX_IS_UNSIGNED", "1"}});
+    add_variant("u32", "uint", "u32", {{"INDEX_IS_UNSIGNED", "1"}});
+
+    add_variant(
+        "f32",
+        "float",
+        "u64",
+        {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+    add_variant(
+        "f16",
+        "float16_t",
+        "u64",
+        {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+    add_variant(
+        "bf16",
+        "uint16_t",
+        "u64",
+        {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+    add_variant(
+        "i32",
+        "int",
+        "u64",
+        {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+    add_variant(
+        "u32",
+        "uint",
+        "u64",
+        {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+  };
+
+  indexing_shaders("gather_take", "gather_take.comp");
+  indexing_shaders("gather_pair", "gather_pair.comp");
+  indexing_shaders("gather_axis", "gather_axis.comp");
+  indexing_shaders("scatter_take", "scatter_take.comp");
+  indexing_shaders("scatter_pair", "scatter_pair.comp");
+  indexing_shaders("scatter_axis", "scatter_axis.comp");
 
   string_to_spv(
       "mul_mat_vec_p021_f16_f32_subgroup_add",

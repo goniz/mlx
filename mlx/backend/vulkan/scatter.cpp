@@ -1,5 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
+#include <utility>
+
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/ops.h"
 
@@ -7,12 +9,43 @@ namespace mlx::core {
 
 namespace {
 
-std::vector<int> invert_perm(const std::vector<int>& perm) {
-  std::vector<int> inv(perm.size());
-  for (int i = 0; i < static_cast<int>(perm.size()); ++i) {
-    inv[perm[i]] = i;
+bool needs_row_contiguous(const array& arr) {
+  return !arr.flags().row_contiguous || arr.offset() != 0;
+}
+
+array ensure_row_contiguous(array arr, Stream s) {
+  if (needs_row_contiguous(arr)) {
+    arr = contiguous_copy_gpu(arr, s);
   }
-  return inv;
+  return arr;
+}
+
+CopyType source_copy_type(const array& src) {
+  if (src.data_size() == 1) {
+    return CopyType::Scalar;
+  }
+  if (src.flags().row_contiguous && src.offset() == 0) {
+    return CopyType::Vector;
+  }
+  return CopyType::General;
+}
+
+std::pair<array, bool> make_output_work(array& out) {
+  const bool staged_output = needs_row_contiguous(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  return {out_work, staged_output};
+}
+
+uint32_t
+checked_shape_product(const array& arr, int begin, int end, const char* label) {
+  uint32_t product = 1;
+  for (int i = begin; i < end; ++i) {
+    product =
+        checked_mul_u32(product, checked_u32_size(arr.shape(i), label), label);
+  }
+  return product;
 }
 
 bool try_eval_scatter_vulkan(
@@ -25,137 +58,198 @@ bool try_eval_scatter_vulkan(
     return false;
   }
 
-  if (reduce_type != Scatter::None || axes.size() != 2) {
-    return false;
-  }
-
   const auto& src = inputs[0];
-  array idx0 = inputs[1];
-  array idx1 = inputs[2];
-  array upd = inputs.back();
   if (src.ndim() == 0 || out.shape() != src.shape() ||
-      out.dtype() != src.dtype() || idx0.shape() != idx1.shape()) {
+      out.dtype() != src.dtype()) {
     return false;
   }
 
-  const int axis0 = normalize_axis(axes[0], src.ndim());
-  const int axis1 = normalize_axis(axes[1], src.ndim());
-  if (axis0 < 0 || axis1 < 0 || axis0 >= src.ndim() || axis1 >= src.ndim() ||
-      axis0 == axis1) {
-    return false;
-  }
+  if (axes.size() == 2) {
+    if (reduce_type != Scatter::None) {
+      return false;
+    }
 
-  for (int i = 0; i < src.ndim(); ++i) {
-    const int64_t expected = (i == axis0 || i == axis1) ? 1 : src.shape(i);
-    if (upd.shape(i + idx0.ndim()) != expected) {
+    int axis0 = normalize_axis(axes[0], src.ndim());
+    int axis1 = normalize_axis(axes[1], src.ndim());
+    array idx0 = inputs[1];
+    array idx1 = inputs[2];
+    array upd = inputs.back();
+    if (idx0.shape() != idx1.shape() || idx0.dtype() != idx1.dtype()) {
+      return false;
+    }
+    if (axis0 < 0 || axis1 < 0 || axis0 >= src.ndim() || axis1 >= src.ndim() ||
+        axis0 == axis1) {
+      return false;
+    }
+    if (axis0 > axis1) {
+      std::swap(axis0, axis1);
+      std::swap(idx0, idx1);
+    }
+
+    const int idx_ndim = idx0.ndim();
+    const uint32_t outer_size =
+        checked_shape_product(src, 0, axis0, "scatter_pair outer_size");
+    const uint32_t axis0_size =
+        checked_u32_size(src.shape(axis0), "scatter_pair axis0_size");
+    const uint32_t slice0_size = checked_u32_size(
+        upd.shape(idx_ndim + axis0), "scatter_pair slice0_size");
+    const uint32_t middle_size = checked_shape_product(
+        src, axis0 + 1, axis1, "scatter_pair middle_size");
+    const uint32_t axis1_size =
+        checked_u32_size(src.shape(axis1), "scatter_pair axis1_size");
+    const uint32_t slice1_size = checked_u32_size(
+        upd.shape(idx_ndim + axis1), "scatter_pair slice1_size");
+    const uint32_t inner_size = checked_shape_product(
+        src, axis1 + 1, src.ndim(), "scatter_pair inner_size");
+    const uint32_t index_count =
+        checked_u32_size(idx0.size(), "scatter_pair index_count");
+    const uint32_t slice_size = checked_mul_u32(
+        checked_mul_u32(
+            checked_mul_u32(
+                checked_mul_u32(
+                    outer_size,
+                    slice0_size,
+                    "scatter_pair expected_update_size"),
+                middle_size,
+                "scatter_pair expected_update_size"),
+            slice1_size,
+            "scatter_pair expected_update_size"),
+        inner_size,
+        "scatter_pair expected_update_size");
+    const uint32_t expected_update_size = checked_mul_u32(
+        index_count, slice_size, "scatter_pair expected_update_size");
+    if (upd.size() != expected_update_size) {
+      return false;
+    }
+    for (int i = 0; i < src.ndim(); ++i) {
+      const int64_t expected = (i == axis0) ? slice0_size
+          : (i == axis1)                    ? slice1_size
+                                            : src.shape(i);
+      if (upd.shape(idx_ndim + i) != expected) {
+        return false;
+      }
+    }
+
+    const auto shader_id = scatter_pair_shader_id(out.dtype(), idx0.dtype());
+    if (!shader_id.has_value()) {
+      return false;
+    }
+
+    idx0 = ensure_row_contiguous(idx0, s);
+    idx1 = ensure_row_contiguous(idx1, s);
+    upd = ensure_row_contiguous(upd, s);
+
+    auto [out_work, staged_output] = make_output_work(out);
+    copy_gpu(src, out_work, source_copy_type(src), s);
+
+    if (upd.size() == 0) {
+      if (staged_output) {
+        copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      }
+      return true;
+    }
+
+    try {
+      auto command_buffer = vulkan::begin_command_recording(s.index);
+      vulkan::dispatch_scatter_pair_op(
+          upd,
+          idx0,
+          idx1,
+          out_work,
+          *shader_id,
+          command_buffer,
+          s,
+          outer_size,
+          axis0_size,
+          slice0_size,
+          middle_size,
+          axis1_size,
+          slice1_size,
+          inner_size,
+          index_count);
+      vulkan::end_command_recording(s.index);
+
+      if (staged_output) {
+        copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      }
+      return true;
+    } catch (const std::runtime_error& e) {
+      if (trace_fallback_enabled()) {
+        std::ostringstream oss;
+        oss << "scatter_pair_dispatch_failed reason=" << e.what();
+        trace_fallback(oss.str());
+      }
       return false;
     }
   }
 
-  if (!idx0.flags().contiguous || idx0.offset() != 0 ||
-      idx0.strides().back() != 1) {
-    idx0 = contiguous_copy_gpu(idx0, s);
-  }
-  if (!idx1.flags().contiguous || idx1.offset() != 0 ||
-      idx1.strides().back() != 1) {
-    idx1 = contiguous_copy_gpu(idx1, s);
-  }
-  if (!upd.flags().contiguous || upd.offset() != 0 ||
-      upd.strides().back() != 1) {
-    upd = contiguous_copy_gpu(upd, s);
+  if (reduce_type != Scatter::None || axes.size() != 1) {
+    return false;
   }
 
-  std::vector<int> perm = {axis0, axis1};
-  for (int i = 0; i < src.ndim(); ++i) {
-    if (i != axis0 && i != axis1) {
-      perm.push_back(i);
-    }
+  int axis = normalize_axis(axes[0], src.ndim());
+  array idx = inputs[1];
+  array upd = inputs[2];
+  if (axis < 0 || axis >= src.ndim()) {
+    return false;
   }
-
-  const uint32_t dim1 =
-      checked_u32_size(src.shape(axis1), "scatter paired axis size");
-  const uint32_t index_count =
-      checked_u32_size(idx0.size(), "scatter paired index count");
-  const uint32_t flat_axis_size = checked_mul_u32(
-      checked_u32_size(src.shape(axis0), "scatter paired axis0 size"),
-      dim1,
-      "scatter paired flat axis size");
-
-  uint32_t slice_size = 1;
-  for (int i = 2; i < static_cast<int>(perm.size()); ++i) {
-    slice_size = checked_mul_u32(
-        slice_size,
-        checked_u32_size(src.shape(perm[i]), "scatter paired slice size"),
-        "scatter paired slice size");
-  }
-
-  array out_work(out.shape(), out.dtype(), nullptr, {});
-
-  CopyType copy_type =
-      src.flags().row_contiguous ? CopyType::Vector : CopyType::General;
-  copy_gpu(src, out_work, copy_type, s);
-  out_work.set_status(array::Status::available);
-
-  auto transposed = transpose(out_work, perm, s);
-  if (!transposed.flags().contiguous || transposed.offset() != 0 ||
-      transposed.strides().back() != 1) {
-    transposed = contiguous_copy_gpu(transposed, s);
-  }
-  if (transposed.has_primitive()) {
-    eval(transposed);
-  }
-
-  array out_flat = reshape_in_eval(
-      transposed,
-      Shape{1, static_cast<int>(flat_axis_size), static_cast<int>(slice_size)},
-      s);
-  array linear_idx = add(multiply(idx0, array(dim1, idx0.dtype()), s), idx1, s);
-  if (linear_idx.has_primitive()) {
-    eval(linear_idx);
-  }
-  if (!linear_idx.flags().contiguous || linear_idx.offset() != 0 ||
-      linear_idx.strides().back() != 1) {
-    linear_idx = contiguous_copy_gpu(linear_idx, s);
-  }
-  array idx_flat = reshape_in_eval(
-      linear_idx, Shape{1, static_cast<int>(index_count), 1}, s);
-  array upd_flat = reshape_in_eval(
-      upd,
-      Shape{1, static_cast<int>(index_count), static_cast<int>(slice_size)},
-      s);
-
-  const auto shader_id = scatter_axis_shader_id(out.dtype(), idx_flat.dtype());
+  const auto shader_id = scatter_shader_id(out.dtype(), idx.dtype());
   if (!shader_id.has_value()) {
     return false;
   }
 
+  idx = ensure_row_contiguous(idx, s);
+  upd = ensure_row_contiguous(upd, s);
+
+  const uint32_t size_pre =
+      checked_shape_product(src, 0, axis, "scatter_take size_pre");
+  const uint32_t size_axis =
+      checked_u32_size(src.shape(axis), "scatter_take size_axis");
+  const uint32_t size_post = checked_shape_product(
+      src, axis + 1, src.ndim(), "scatter_take size_post");
+  const uint32_t index_count =
+      checked_u32_size(idx.size(), "scatter_take index_count");
+  const uint32_t slice_size =
+      checked_mul_u32(size_pre, size_post, "scatter_take expected_update_size");
+  const uint32_t expected_update_size = checked_mul_u32(
+      index_count, slice_size, "scatter_take expected_update_size");
+  if (upd.size() != expected_update_size) {
+    return false;
+  }
+
+  auto [out_work, staged_output] = make_output_work(out);
+  copy_gpu(src, out_work, source_copy_type(src), s);
+
+  if (upd.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_scatter_axis_op(
-        upd_flat,
-        idx_flat,
-        out_flat,
+    vulkan::dispatch_scatter_take_op(
+        upd,
+        idx,
+        out_work,
         *shader_id,
         command_buffer,
         s,
-        1,
-        flat_axis_size,
-        slice_size,
+        size_pre,
+        size_axis,
+        size_post,
         index_count);
     vulkan::end_command_recording(s.index);
 
-    array restored = transpose(transposed, invert_perm(perm), s);
-    if (restored.has_primitive()) {
-      eval(restored);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
     }
-    copy_gpu(restored, out_work, CopyType::GeneralGeneral, s);
-    copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
-    out.set_status(array::Status::available);
     return true;
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {
       std::ostringstream oss;
-      oss << "scatter_dispatch_failed reason=" << e.what();
+      oss << "scatter_take_dispatch_failed reason=" << e.what();
       trace_fallback(oss.str());
     }
     return false;
@@ -202,50 +296,20 @@ bool try_eval_scatter_axis_vulkan(
     return false;
   }
 
-  if (!idx.flags().contiguous || idx.offset() != 0 ||
-      idx.strides().back() != 1) {
-    idx = contiguous_copy_gpu(idx, s);
-  }
-  if (!upd.flags().contiguous || upd.offset() != 0 ||
-      upd.strides().back() != 1) {
-    upd = contiguous_copy_gpu(upd, s);
-  }
+  idx = ensure_row_contiguous(idx, s);
+  upd = ensure_row_contiguous(upd, s);
 
-  uint32_t size_pre = 1;
-  for (int i = 0; i < axis; ++i) {
-    size_pre = checked_mul_u32(
-        size_pre,
-        checked_u32_size(src.shape(i), "scatter_axis size_pre"),
-        "scatter_axis size_pre");
-  }
+  const uint32_t size_pre =
+      checked_shape_product(src, 0, axis, "scatter_axis size_pre");
   const uint32_t size_axis =
       checked_u32_size(src.shape(axis), "scatter_axis size_axis");
-  uint32_t size_post = 1;
-  for (int i = axis + 1; i < src.ndim(); ++i) {
-    size_post = checked_mul_u32(
-        size_post,
-        checked_u32_size(src.shape(i), "scatter_axis size_post"),
-        "scatter_axis size_post");
-  }
+  const uint32_t size_post = checked_shape_product(
+      src, axis + 1, src.ndim(), "scatter_axis size_post");
   const uint32_t idx_axis_size =
       checked_u32_size(idx.shape(axis), "scatter_axis idx_axis_size");
 
-  array out_work = out;
-  const bool staged_output =
-      !out.flags().contiguous || out.offset() != 0 || out.strides().back() != 1;
-  if (staged_output) {
-    out_work = array(out.shape(), out.dtype(), nullptr, {});
-  }
-
-  CopyType copy_type;
-  if (src.data_size() == 1) {
-    copy_type = CopyType::Scalar;
-  } else if (src.flags().row_contiguous) {
-    copy_type = CopyType::Vector;
-  } else {
-    copy_type = CopyType::General;
-  }
-  copy_gpu(src, out_work, copy_type, s);
+  auto [out_work, staged_output] = make_output_work(out);
+  copy_gpu(src, out_work, source_copy_type(src), s);
 
   if (upd.size() == 0) {
     if (staged_output) {
@@ -254,34 +318,12 @@ bool try_eval_scatter_axis_vulkan(
     return true;
   }
 
-  array upd_flat = reshape_in_eval(
-      upd,
-      Shape{
-          static_cast<int>(size_pre),
-          static_cast<int>(idx_axis_size),
-          static_cast<int>(size_post)},
-      s);
-  array idx_flat = reshape_in_eval(
-      idx,
-      Shape{
-          static_cast<int>(size_pre),
-          static_cast<int>(idx_axis_size),
-          static_cast<int>(size_post)},
-      s);
-  array out_flat = reshape_in_eval(
-      out_work,
-      Shape{
-          static_cast<int>(size_pre),
-          static_cast<int>(size_axis),
-          static_cast<int>(size_post)},
-      s);
-
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_scatter_axis_op(
-        upd_flat,
-        idx_flat,
-        out_flat,
+        upd,
+        idx,
+        out_work,
         *shader_id,
         command_buffer,
         s,

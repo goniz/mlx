@@ -1,11 +1,42 @@
 // Copyright © 2024 Apple Inc.
 
+#include <utility>
+
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/ops.h"
 
 namespace mlx::core {
 
 namespace {
+
+bool needs_row_contiguous(const array& arr) {
+  return !arr.flags().row_contiguous || arr.offset() != 0;
+}
+
+array ensure_row_contiguous(array arr, Stream s) {
+  if (needs_row_contiguous(arr)) {
+    arr = contiguous_copy_gpu(arr, s);
+  }
+  return arr;
+}
+
+std::pair<array, bool> make_output_work(array& out) {
+  const bool staged_output = needs_row_contiguous(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  return {out_work, staged_output};
+}
+
+uint32_t
+checked_shape_product(const array& arr, int begin, int end, const char* label) {
+  uint32_t product = 1;
+  for (int i = begin; i < end; ++i) {
+    product =
+        checked_mul_u32(product, checked_u32_size(arr.shape(i), label), label);
+  }
+  return product;
+}
 
 bool try_eval_gather_vulkan(
     const std::vector<array>& inputs,
@@ -17,119 +48,90 @@ bool try_eval_gather_vulkan(
     return false;
   }
 
+  const auto& src_input = inputs[0];
+  if (src_input.ndim() == 0 || out.dtype() != src_input.dtype()) {
+    return false;
+  }
+
   if (axes.size() == 2) {
-    const auto& src_input = inputs[0];
+    int axis0 = normalize_axis(axes[0], src_input.ndim());
+    int axis1 = normalize_axis(axes[1], src_input.ndim());
     array idx0 = inputs[1];
     array idx1 = inputs[2];
-    if (src_input.ndim() == 0 || out.dtype() != src_input.dtype() ||
-        idx0.shape() != idx1.shape()) {
+    if (idx0.shape() != idx1.shape() || idx0.dtype() != idx1.dtype()) {
       return false;
     }
-
-    const int axis0 = normalize_axis(axes[0], src_input.ndim());
-    const int axis1 = normalize_axis(axes[1], src_input.ndim());
     if (axis0 < 0 || axis1 < 0 || axis0 >= src_input.ndim() ||
         axis1 >= src_input.ndim() || axis0 == axis1) {
       return false;
     }
+    if (axis0 > axis1) {
+      std::swap(axis0, axis1);
+      std::swap(idx0, idx1);
+    }
 
     for (int i = 0; i < src_input.ndim(); ++i) {
-      const int64_t expected =
-          (i == axis0 || i == axis1) ? 1 : src_input.shape(i);
-      if (slice_sizes[i] != expected) {
+      const int64_t expected = src_input.shape(i);
+      if (slice_sizes[i] != expected && i != axis0 && i != axis1) {
+        return false;
+      }
+      if (slice_sizes[i] < 0 || slice_sizes[i] > expected) {
         return false;
       }
     }
 
-    if (!idx0.flags().contiguous || idx0.offset() != 0 ||
-        idx0.strides().back() != 1) {
-      idx0 = contiguous_copy_gpu(idx0, s);
-    }
-    if (!idx1.flags().contiguous || idx1.offset() != 0 ||
-        idx1.strides().back() != 1) {
-      idx1 = contiguous_copy_gpu(idx1, s);
-    }
-
-    std::vector<int> perm = {axis0, axis1};
-    for (int i = 0; i < src_input.ndim(); ++i) {
-      if (i != axis0 && i != axis1) {
-        perm.push_back(i);
-      }
-    }
-
-    auto transposed = transpose(src_input, perm, s);
-    if (!transposed.flags().contiguous || transposed.offset() != 0 ||
-        transposed.strides().back() != 1) {
-      transposed = contiguous_copy_gpu(transposed, s);
-    }
-    if (transposed.has_primitive()) {
-      eval(transposed);
-    }
-
-    const uint32_t dim1 =
-        checked_u32_size(src_input.shape(axis1), "gather paired axis size");
-    const uint32_t index_count =
-        checked_u32_size(idx0.size(), "gather paired index count");
-    const uint32_t flat_axis_size = checked_mul_u32(
-        checked_u32_size(src_input.shape(axis0), "gather paired axis0 size"),
-        dim1,
-        "gather paired flat axis size");
-
-    uint32_t slice_size = 1;
-    for (int i = 2; i < static_cast<int>(perm.size()); ++i) {
-      slice_size = checked_mul_u32(
-          slice_size,
-          checked_u32_size(
-              src_input.shape(perm[i]), "gather paired slice size"),
-          "gather paired slice size");
-    }
-
-    array src_2d = reshape_in_eval(
-        transposed,
-        Shape{static_cast<int>(flat_axis_size), static_cast<int>(slice_size)},
-        s);
-    array linear_idx =
-        add(multiply(idx0, array(dim1, idx0.dtype()), s), idx1, s);
-    if (linear_idx.has_primitive()) {
-      eval(linear_idx);
-    }
-    if (!linear_idx.flags().contiguous || linear_idx.offset() != 0 ||
-        linear_idx.strides().back() != 1) {
-      linear_idx = contiguous_copy_gpu(linear_idx, s);
-    }
-    if (linear_idx.has_primitive()) {
-      eval(linear_idx);
-    }
-    array idx_1d =
-        reshape_in_eval(linear_idx, Shape{static_cast<int>(index_count)}, s);
-    array out_work = out;
-    const bool staged_output = !out.flags().contiguous || out.offset() != 0 ||
-        out.strides().back() != 1;
-    if (staged_output) {
-      out_work = array(out.shape(), out.dtype(), nullptr, {});
-    }
-    out_work.set_data(allocator::malloc(out_work.nbytes()));
-    array out_2d = reshape_in_eval(
-        out_work,
-        Shape{static_cast<int>(index_count), static_cast<int>(slice_size)},
-        s);
-
-    const auto shader_id = gather_shader_id(src_input.dtype(), idx_1d.dtype());
+    const auto shader_id =
+        gather_pair_shader_id(src_input.dtype(), idx0.dtype());
     if (!shader_id.has_value()) {
       return false;
     }
 
+    array src = ensure_row_contiguous(src_input, s);
+    idx0 = ensure_row_contiguous(idx0, s);
+    idx1 = ensure_row_contiguous(idx1, s);
+
+    const uint32_t outer_size =
+        checked_shape_product(src_input, 0, axis0, "gather_pair outer_size");
+    const uint32_t axis0_size =
+        checked_u32_size(src_input.shape(axis0), "gather_pair axis0_size");
+    const uint32_t slice0_size =
+        checked_u32_size(slice_sizes[axis0], "gather_pair slice0_size");
+    const uint32_t middle_size = checked_shape_product(
+        src_input, axis0 + 1, axis1, "gather_pair middle_size");
+    const uint32_t axis1_size =
+        checked_u32_size(src_input.shape(axis1), "gather_pair axis1_size");
+    const uint32_t slice1_size =
+        checked_u32_size(slice_sizes[axis1], "gather_pair slice1_size");
+    const uint32_t inner_size = checked_shape_product(
+        src_input, axis1 + 1, src_input.ndim(), "gather_pair inner_size");
+    const uint32_t index_count =
+        checked_u32_size(idx0.size(), "gather_pair index_count");
+
+    auto [out_work, staged_output] = make_output_work(out);
+    if (out_work.size() == 0) {
+      if (staged_output) {
+        copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      }
+      return true;
+    }
+
     try {
       auto command_buffer = vulkan::begin_command_recording(s.index);
-      vulkan::dispatch_gather_op(
-          src_2d,
-          idx_1d,
-          out_2d,
+      vulkan::dispatch_gather_pair_op(
+          src,
+          idx0,
+          idx1,
+          out_work,
           *shader_id,
           command_buffer,
           s,
-          slice_size,
-          flat_axis_size,
+          outer_size,
+          axis0_size,
+          slice0_size,
+          middle_size,
+          axis1_size,
+          slice1_size,
+          inner_size,
           index_count);
       vulkan::end_command_recording(s.index);
 
@@ -140,7 +142,7 @@ bool try_eval_gather_vulkan(
     } catch (const std::runtime_error& e) {
       if (trace_fallback_enabled()) {
         std::ostringstream oss;
-        oss << "gather_dispatch_failed reason=" << e.what();
+        oss << "gather_pair_dispatch_failed reason=" << e.what();
         trace_fallback(oss.str());
       }
       return false;
@@ -151,11 +153,7 @@ bool try_eval_gather_vulkan(
     return false;
   }
 
-  const auto& src_input = inputs[0];
   array idx = inputs[1];
-  if (src_input.ndim() == 0 || out.dtype() != src_input.dtype()) {
-    return false;
-  }
   const int axis = normalize_axis(axes[0], src_input.ndim());
   if (axis < 0 || axis >= src_input.ndim()) {
     trace_vulkan_unsupported("Gather", "axis is out of range");
@@ -178,82 +176,49 @@ bool try_eval_gather_vulkan(
     return false;
   }
 
-  if (!idx.flags().contiguous || idx.offset() != 0 ||
-      idx.strides().back() != 1) {
-    idx = contiguous_copy_gpu(idx, s);
-  }
+  array src = ensure_row_contiguous(src_input, s);
+  idx = ensure_row_contiguous(idx, s);
 
-  const uint32_t axis_size =
-      checked_u32_size(src_input.shape(axis), "gather axis size");
+  const uint32_t size_pre =
+      checked_shape_product(src_input, 0, axis, "gather_take size_pre");
+  const uint32_t size_axis =
+      checked_u32_size(src_input.shape(axis), "gather_take size_axis");
+  const uint32_t size_post = checked_shape_product(
+      src_input, axis + 1, src_input.ndim(), "gather_take size_post");
   const uint32_t index_count =
-      checked_u32_size(idx.size(), "gather index count");
-  const uint32_t slice_size =
-      checked_product_u32(slice_sizes, "gather slice size");
+      checked_u32_size(idx.size(), "gather_take index_count");
 
-  if (out.size() == 0) {
-    out.set_data(allocator::malloc(0));
+  auto [out_work, staged_output] = make_output_work(out);
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   }
 
-  array src_2d(
-      Shape{static_cast<int>(axis_size), static_cast<int>(slice_size)},
-      src_input.dtype(),
-      nullptr,
-      {});
-  if (axis == 0) {
-    array src = src_input;
-    if (!src.flags().contiguous || src.offset() != 0 ||
-        src.strides().back() != 1) {
-      src = contiguous_copy_gpu(src, s);
-    }
-    src_2d = reshape_in_eval(
-        src,
-        Shape{static_cast<int>(axis_size), static_cast<int>(slice_size)},
-        s);
-  } else {
-    std::vector<int> perm(src_input.ndim());
-    perm[0] = axis;
-    int dst_axis = 1;
-    for (int src_axis = 0; src_axis < src_input.ndim(); ++src_axis) {
-      if (src_axis != axis) {
-        perm[dst_axis++] = src_axis;
-      }
-    }
-    auto transposed = transpose(src_input, perm, s);
-    if (transposed.has_primitive()) {
-      eval(transposed);
-    }
-    copy_gpu(transposed, src_2d, CopyType::General, s);
-  }
-  array idx_1d = reshape_in_eval(idx, Shape{static_cast<int>(index_count)}, s);
-  array out_2d(
-      Shape{static_cast<int>(index_count), static_cast<int>(slice_size)},
-      out.dtype(),
-      nullptr,
-      {});
-  out_2d.set_data(allocator::malloc(out_2d.nbytes()));
-
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_gather_op(
-        src_2d,
-        idx_1d,
-        out_2d,
+    vulkan::dispatch_gather_take_op(
+        src,
+        idx,
+        out_work,
         *shader_id,
         command_buffer,
         s,
-        slice_size,
-        axis_size,
+        size_pre,
+        size_axis,
+        size_post,
         index_count);
     vulkan::end_command_recording(s.index);
 
-    array gathered = reshape_in_eval(out_2d, out.shape(), s);
-    copy_gpu(gathered, out, CopyType::GeneralGeneral, s);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {
       std::ostringstream oss;
-      oss << "gather_dispatch_failed reason=" << e.what();
+      oss << "gather_take_dispatch_failed reason=" << e.what();
       trace_fallback(oss.str());
     }
     return false;
@@ -289,42 +254,19 @@ bool try_eval_gather_axis_vulkan(
     return false;
   }
 
-  if (!src.flags().contiguous || src.offset() != 0 ||
-      src.strides().back() != 1) {
-    src = contiguous_copy_gpu(src, s);
-  }
-  if (!idx.flags().contiguous || idx.offset() != 0 ||
-      idx.strides().back() != 1) {
-    idx = contiguous_copy_gpu(idx, s);
-  }
+  src = ensure_row_contiguous(src, s);
+  idx = ensure_row_contiguous(idx, s);
 
-  uint32_t size_pre = 1;
-  for (int i = 0; i < axis; ++i) {
-    size_pre = checked_mul_u32(
-        size_pre,
-        checked_u32_size(src.shape(i), "gather_axis size_pre"),
-        "gather_axis size_pre");
-  }
+  const uint32_t size_pre =
+      checked_shape_product(src, 0, axis, "gather_axis size_pre");
   const uint32_t size_axis =
       checked_u32_size(src.shape(axis), "gather_axis size_axis");
-  uint32_t size_post = 1;
-  for (int i = axis + 1; i < src.ndim(); ++i) {
-    size_post = checked_mul_u32(
-        size_post,
-        checked_u32_size(src.shape(i), "gather_axis size_post"),
-        "gather_axis size_post");
-  }
+  const uint32_t size_post =
+      checked_shape_product(src, axis + 1, src.ndim(), "gather_axis size_post");
   const uint32_t idx_axis_size =
       checked_u32_size(idx.shape(axis), "gather_axis idx_axis_size");
 
-  array out_work = out;
-  const bool staged_output =
-      !out.flags().contiguous || out.offset() != 0 || out.strides().back() != 1;
-  if (staged_output) {
-    out_work = array(out.shape(), out.dtype(), nullptr, {});
-  }
-
-  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  auto [out_work, staged_output] = make_output_work(out);
   if (out_work.size() == 0) {
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
@@ -332,34 +274,12 @@ bool try_eval_gather_axis_vulkan(
     return true;
   }
 
-  array src_flat = reshape_in_eval(
-      src,
-      Shape{
-          static_cast<int>(size_pre),
-          static_cast<int>(size_axis),
-          static_cast<int>(size_post)},
-      s);
-  array idx_flat = reshape_in_eval(
-      idx,
-      Shape{
-          static_cast<int>(size_pre),
-          static_cast<int>(idx_axis_size),
-          static_cast<int>(size_post)},
-      s);
-  array out_flat = reshape_in_eval(
-      out_work,
-      Shape{
-          static_cast<int>(size_pre),
-          static_cast<int>(idx_axis_size),
-          static_cast<int>(size_post)},
-      s);
-
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_gather_axis_op(
-        src_flat,
-        idx_flat,
-        out_flat,
+        src,
+        idx,
+        out_work,
         *shader_id,
         command_buffer,
         s,

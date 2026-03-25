@@ -1173,7 +1173,9 @@ void copy_gpu_inplace(
   const array* source = &in;
   if (in.has_primitive()) {
     materialized_in.emplace(in);
-    materialized_in->eval();
+    if (materialized_in->status() == array::Status::unscheduled) {
+      materialized_in->eval();
+    }
     source = &*materialized_in;
   } else {
     auto data = in.data_shared_ptr();

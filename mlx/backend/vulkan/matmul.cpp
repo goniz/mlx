@@ -239,9 +239,7 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
     return true;
   }
 
-  if (arr.has_primitive()) {
-    arr.eval();
-  } else {
+  if (!arr.has_primitive()) {
     arr.wait();
   }
 

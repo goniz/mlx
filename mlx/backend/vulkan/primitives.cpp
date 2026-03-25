@@ -261,6 +261,12 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
+  if (reduce_type_ != SliceUpdate::None) {
+    throw std::runtime_error(
+        "[SliceUpdate::eval_gpu] Vulkan only supports SliceUpdate::None. "
+        "Reduce operations (Sum, Prod, Min, Max) are not yet implemented.");
+  }
+
   if (is_donatable(in, out) && in.dtype() == out.dtype()) {
     out.copy_shared_buffer(in);
   } else {

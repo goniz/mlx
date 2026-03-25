@@ -622,8 +622,6 @@ void VulkanContext::init() {
     device_create_info.queueCreateInfoCount =
         static_cast<uint32_t>(queue_create_infos.size());
     device_create_info.pQueueCreateInfos = queue_create_infos.data();
-    device_create_info.enabledLayerCount = 0;
-    device_create_info.ppEnabledLayerNames = nullptr;
     device_create_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
     device_create_info.ppEnabledExtensionNames = device_extensions.data();

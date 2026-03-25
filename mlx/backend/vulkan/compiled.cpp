@@ -1,7 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
 #include <fmt/format.h>
-#include <shaderc/shaderc.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -16,6 +15,7 @@
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/ops.h"
@@ -771,41 +771,6 @@ layout(push_constant) uniform PushConstants {
   os += "}\n";
 }
 
-// Compile GLSL source to SPIR-V using shaderc
-std::vector<uint32_t> compile_glsl_to_spirv(
-    const std::string& glsl_source,
-    const std::string& shader_name) {
-  shaderc::Compiler compiler;
-  shaderc::CompileOptions options;
-
-  // Set target environment
-  options.SetTargetEnvironment(
-      shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
-  options.SetSourceLanguage(shaderc_source_language_glsl);
-  options.SetForcedVersionProfile(450, shaderc_profile_core);
-
-  // Optimization level
-  options.SetOptimizationLevel(shaderc_optimization_level_performance);
-
-  // Compile the shader
-  auto result = compiler.CompileGlslToSpv(
-      glsl_source.c_str(),
-      glsl_source.size(),
-      shaderc_compute_shader,
-      shader_name.c_str(),
-      options);
-
-  if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
-    throw std::runtime_error(
-        fmt::format(
-            "Failed to compile Vulkan kernel '{}': {}",
-            shader_name,
-            result.GetErrorMessage()));
-  }
-
-  return std::vector<uint32_t>(result.cbegin(), result.cend());
-}
-
 } // namespace
 
 void Compiled::eval_gpu(
@@ -1001,7 +966,7 @@ void Compiled::eval_gpu(
 
     // Compile to SPIR-V
     try {
-      spirv = compile_glsl_to_spirv(glsl_source, kernel_name);
+      spirv = vulkan::compile_glsl_to_spirv(glsl_source, kernel_name);
     } catch (const std::exception& e) {
       std::cerr << "=== FAILED GLSL for: " << kernel_name
                 << " ===" << std::endl;

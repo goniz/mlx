@@ -157,6 +157,7 @@ if(Vulkan_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shader_compiler.cpp
     ${SHADER_CPP_FILES}
   )
   

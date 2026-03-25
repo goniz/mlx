@@ -18,7 +18,10 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <sstream>
 #include <string>
+
+#include "mlx/backend/vulkan/shader_compiler.h"
 
 namespace {
 
@@ -26,6 +29,8 @@ using mlx::core::Dtype;
 using mlx::core::Shape;
 using mlx::core::Strides;
 namespace vulkan = mlx::core::vulkan;
+
+std::string copy_dtype_suffix(Dtype dtype);
 
 bool has_row_contiguous_strides(const mlx::core::array& arr) {
   if (arr.ndim() == 0) {
@@ -123,19 +128,479 @@ size_t num_elements(const Shape& shape) {
       shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
 }
 
-int64_t resolve_dynamic_offset(const std::optional<mlx::core::array>& offset) {
+std::string dtype_to_glsl_storage_type(Dtype dtype) {
+  switch (dtype) {
+    case mlx::core::float32:
+      return "float";
+    case mlx::core::float16:
+      return "float16_t";
+    case mlx::core::bfloat16:
+      return "uint16_t";
+    case mlx::core::bool_:
+      return "uint8_t";
+    case mlx::core::uint16:
+      return "uint16_t";
+    case mlx::core::uint8:
+      return "uint8_t";
+    case mlx::core::int8:
+      return "int8_t";
+    case mlx::core::int16:
+      return "int16_t";
+    case mlx::core::int32:
+      return "int";
+    case mlx::core::uint32:
+      return "uint";
+    case mlx::core::uint64:
+      return "uint64_t";
+    case mlx::core::int64:
+      return "int64_t";
+    case mlx::core::complex64:
+      return "vec2";
+    default:
+      throw std::runtime_error(
+          "Unsupported dtype for Vulkan dynamic shader generation.");
+  }
+}
+
+bool uses_float16_extension(Dtype dtype) {
+  return dtype == mlx::core::float16;
+}
+
+bool uses_16bit_storage(Dtype dtype) {
+  return dtype == mlx::core::float16 || dtype == mlx::core::bfloat16 ||
+      dtype == mlx::core::int16 || dtype == mlx::core::uint16;
+}
+
+bool uses_8bit_storage(Dtype dtype) {
+  return dtype == mlx::core::bool_ || dtype == mlx::core::int8 ||
+      dtype == mlx::core::uint8;
+}
+
+std::string emit_dynamic_shader_preamble(Dtype dtype, bool needs_int64_output) {
+  std::ostringstream os;
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  if (needs_int64_output || dtype == mlx::core::int64 ||
+      dtype == mlx::core::uint64) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
+  }
+  if (uses_float16_extension(dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+  }
+  if (uses_16bit_storage(dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+    os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  }
+  if (uses_8bit_storage(dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
+    os << "#extension GL_EXT_shader_8bit_storage : require\n";
+  }
+  os << "\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  return os.str();
+}
+
+void append_layout_key(std::ostringstream& os, const Shape& shape) {
+  for (auto dim : shape) {
+    os << dim << ',';
+  }
+}
+
+void append_layout_key(std::ostringstream& os, const Strides& strides) {
+  for (auto stride : strides) {
+    os << stride << ',';
+  }
+}
+
+void validate_dynamic_offset_array(
+    const std::optional<mlx::core::array>& offset) {
   if (!offset.has_value()) {
-    return 0;
+    return;
   }
-  auto offset_value = *offset;
-  if (offset_value.has_primitive()) {
-    offset_value.eval();
-  }
-  if (offset_value.size() != 1 || offset_value.dtype() != mlx::core::int64) {
+  if (offset->size() != 1 || offset->dtype() != mlx::core::int64) {
     throw std::runtime_error(
         "Dynamic Vulkan copy offsets must be int64 scalars.");
   }
-  return offset_value.data<int64_t>()[0];
+}
+
+bool is_vulkan_storage_array(const mlx::core::array& arr) {
+  return arr.data_shared_ptr() != nullptr &&
+      mlx::core::vulkan::is_vulkan_buffer(arr.buffer());
+}
+
+void write_descriptor_binding(
+    std::vector<VkDescriptorSetLayoutBinding>& bindings,
+    uint32_t binding) {
+  bindings.push_back(
+      {binding,
+       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       1,
+       VK_SHADER_STAGE_COMPUTE_BIT,
+       nullptr});
+}
+
+void write_descriptor_buffer(
+    const mlx::core::array& arr,
+    uint32_t binding,
+    VkDescriptorSet descriptor_set,
+    std::vector<VkDescriptorBufferInfo>& infos,
+    std::vector<VkWriteDescriptorSet>& writes) {
+  auto* vulkan_buffer = static_cast<const vulkan::VulkanBuffer*>(
+      static_cast<const void*>(arr.buffer().ptr()));
+  if (vulkan_buffer == nullptr || vulkan_buffer->buffer == VK_NULL_HANDLE) {
+    throw std::runtime_error("Missing Vulkan buffer for dynamic copy shader.");
+  }
+
+  VkDescriptorBufferInfo info{};
+  info.buffer = vulkan_buffer->buffer;
+  info.offset = 0;
+  info.range = VK_WHOLE_SIZE;
+  infos.push_back(info);
+
+  VkWriteDescriptorSet write{};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = descriptor_set;
+  write.dstBinding = binding;
+  write.dstArrayElement = 0;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write.descriptorCount = 1;
+  write.pBufferInfo = &infos.back();
+  writes.push_back(write);
+}
+
+std::string build_dynamic_offset_shader(
+    Dtype dtype,
+    int64_t indices_base_offset,
+    const std::vector<int64_t>& stride_terms) {
+  std::ostringstream os;
+  os << emit_dynamic_shader_preamble(dtype, true);
+  os << "layout(set = 0, binding = 0) readonly buffer IndicesBuffer {"
+     << dtype_to_glsl_storage_type(dtype) << " data[];} indices_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer OffsetBuffer {int64_t data[];} offset_buf;\n\n";
+  os << "void main() {\n";
+  os << "  if (gl_GlobalInvocationID.x != 0u) {\n";
+  os << "    return;\n";
+  os << "  }\n";
+  os << "  int64_t acc = 0;\n";
+  for (size_t i = 0; i < stride_terms.size(); ++i) {
+    os << "  acc += int64_t(indices_buf.data["
+       << (indices_base_offset + static_cast<int64_t>(i)) << "]) * int64_t("
+       << stride_terms[i] << ");\n";
+  }
+  os << "  offset_buf.data[0] = acc;\n";
+  os << "}\n";
+  return os.str();
+}
+
+std::string build_dynamic_general_copy_shader(
+    Dtype dtype,
+    const Shape& shape,
+    const Strides& i_strides,
+    const Strides& o_strides,
+    int64_t in_base_offset,
+    int64_t out_base_offset,
+    int64_t i_offset,
+    int64_t o_offset,
+    int64_t dynamic_i_base_offset,
+    int64_t dynamic_o_base_offset,
+    bool has_dynamic_i_offset,
+    bool has_dynamic_o_offset,
+    size_t total_elements) {
+  std::ostringstream os;
+  os << emit_dynamic_shader_preamble(dtype, true);
+  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
+     << dtype_to_glsl_storage_type(dtype) << " data[];} input_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
+     << dtype_to_glsl_storage_type(dtype) << " data[];} output_buf;\n";
+  if (has_dynamic_i_offset) {
+    os << "layout(set = 0, binding = 2) readonly buffer DynamicInputOffset {int64_t data[];} dynamic_i_offset_buf;\n";
+  }
+  if (has_dynamic_o_offset) {
+    os << "layout(set = 0, binding = 3) readonly buffer DynamicOutputOffset {int64_t data[];} dynamic_o_offset_buf;\n";
+  }
+  os << "\nvoid main() {\n";
+  os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (linear_idx >= " << total_elements << "u) {\n";
+  os << "    return;\n";
+  os << "  }\n";
+  os << "  int64_t input_index = int64_t(" << (in_base_offset + i_offset)
+     << ");\n";
+  os << "  int64_t output_index = int64_t(" << (out_base_offset + o_offset)
+     << ");\n";
+  if (has_dynamic_i_offset) {
+    os << "  input_index += dynamic_i_offset_buf.data[" << dynamic_i_base_offset
+       << "];\n";
+  }
+  if (has_dynamic_o_offset) {
+    os << "  output_index += dynamic_o_offset_buf.data["
+       << dynamic_o_base_offset << "];\n";
+  }
+  if (!shape.empty()) {
+    os << "  uint remaining = linear_idx;\n";
+    os << "  const uint shape_dims[" << shape.size() << "] = uint["
+       << shape.size() << "](";
+    for (size_t i = 0; i < shape.size(); ++i) {
+      if (i > 0) {
+        os << ", ";
+      }
+      os << static_cast<uint32_t>(shape[i]);
+    }
+    os << ");\n";
+    os << "  const int64_t input_strides[" << i_strides.size() << "] = int64_t["
+       << i_strides.size() << "](";
+    for (size_t i = 0; i < i_strides.size(); ++i) {
+      if (i > 0) {
+        os << ", ";
+      }
+      os << i_strides[i];
+    }
+    os << ");\n";
+    os << "  const int64_t output_strides[" << o_strides.size()
+       << "] = int64_t[" << o_strides.size() << "](";
+    for (size_t i = 0; i < o_strides.size(); ++i) {
+      if (i > 0) {
+        os << ", ";
+      }
+      os << o_strides[i];
+    }
+    os << ");\n";
+    os << "  for (int dim = " << (static_cast<int>(shape.size()) - 1)
+       << "; dim >= 0; --dim) {\n";
+    os << "    uint coord = remaining % shape_dims[dim];\n";
+    os << "    remaining /= shape_dims[dim];\n";
+    os << "    input_index += int64_t(coord) * input_strides[dim];\n";
+    os << "    output_index += int64_t(coord) * output_strides[dim];\n";
+    os << "  }\n";
+  }
+  os << "  output_buf.data[output_index] = input_buf.data[input_index];\n";
+  os << "}\n";
+  return os.str();
+}
+
+void ensure_dynamic_shader_registered(
+    const std::string& shader_name,
+    const std::string& glsl_source) {
+  auto& manager = vulkan::KernelManager::get();
+  if (manager.get_shader(shader_name) != nullptr) {
+    return;
+  }
+
+  auto spirv = vulkan::compile_glsl_to_spirv(glsl_source, shader_name);
+  manager.register_shader(
+      shader_name, spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
+void dispatch_dynamic_offset_kernel(
+    const mlx::core::array& indices,
+    mlx::core::array& offset,
+    const std::vector<int64_t>& stride_terms,
+    const mlx::core::Stream& s) {
+  if (!is_vulkan_storage_array(indices) || !is_vulkan_storage_array(offset)) {
+    throw std::runtime_error(
+        "compute_dynamic_offset requires Vulkan-backed arrays.");
+  }
+
+  const int64_t indices_base_offset = element_offset(indices);
+  std::ostringstream layout_key;
+  layout_key << static_cast<int>(indices.dtype().val()) << ':'
+             << indices_base_offset << ':';
+  append_layout_key(
+      layout_key, Strides(stride_terms.begin(), stride_terms.end()));
+  const std::string shader_name = "compute_dynamic_offset_" +
+      copy_dtype_suffix(indices.dtype()) + "_" +
+      std::to_string(std::hash<std::string>{}(layout_key.str()));
+
+  ensure_dynamic_shader_registered(
+      shader_name,
+      build_dynamic_offset_shader(
+          indices.dtype(), indices_base_offset, stride_terms));
+
+  std::vector<VkDescriptorSetLayoutBinding> bindings;
+  write_descriptor_binding(bindings, 0);
+  write_descriptor_binding(bindings, 1);
+
+  auto& manager = vulkan::KernelManager::get();
+  auto* pipeline = manager.get_pipeline(shader_name, bindings, 0);
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
+  vk::DescriptorSet descriptor_set =
+      manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+
+  std::vector<VkDescriptorBufferInfo> infos;
+  std::vector<VkWriteDescriptorSet> writes;
+  infos.reserve(2);
+  writes.reserve(2);
+  write_descriptor_buffer(indices, 0, descriptor_set, infos, writes);
+  write_descriptor_buffer(offset, 1, descriptor_set, infos, writes);
+  vkUpdateDescriptorSets(
+      vulkan::VulkanContext::get().device(),
+      static_cast<uint32_t>(writes.size()),
+      writes.data(),
+      0,
+      nullptr);
+
+  vkCmdBindPipeline(
+      command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+  VkDescriptorSet vk_descriptor_set =
+      static_cast<VkDescriptorSet>(descriptor_set);
+  vkCmdBindDescriptorSets(
+      command_buffer,
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeline->layout,
+      0,
+      1,
+      &vk_descriptor_set,
+      0,
+      nullptr);
+  vkCmdDispatch(command_buffer, 1, 1, 1);
+
+  vulkan::retain_array_for_stream(s, indices);
+  vulkan::retain_array_for_stream(s, offset);
+  vulkan::end_command_recording(s.index);
+}
+
+bool dispatch_dynamic_general_copy(
+    const mlx::core::array& in,
+    mlx::core::array& out,
+    const Shape& shape,
+    const Strides& i_strides,
+    const Strides& o_strides,
+    int64_t i_offset,
+    int64_t o_offset,
+    const mlx::core::Stream& s,
+    const std::optional<mlx::core::array>& dynamic_i_offset,
+    const std::optional<mlx::core::array>& dynamic_o_offset) {
+  validate_dynamic_offset_array(dynamic_i_offset);
+  validate_dynamic_offset_array(dynamic_o_offset);
+
+  if (in.dtype() != out.dtype()) {
+    throw std::runtime_error(
+        "Dynamic Vulkan copy currently requires matching input/output dtypes.");
+  }
+  if (!is_vulkan_storage_array(in) || !is_vulkan_storage_array(out)) {
+    throw std::runtime_error(
+        "Dynamic Vulkan copy requires Vulkan-backed input and output arrays.");
+  }
+
+  const size_t total_elements = num_elements(shape);
+  if (total_elements == 0) {
+    return true;
+  }
+  if (total_elements > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        "Dynamic Vulkan copy does not support tensors with more than 2^32 elements.");
+  }
+  if (shape.size() > 4) {
+    return false;
+  }
+
+  const int64_t in_base_offset = element_offset(in);
+  const int64_t out_base_offset = element_offset(out);
+  const int64_t dynamic_i_base_offset =
+      dynamic_i_offset.has_value() ? element_offset(*dynamic_i_offset) : 0;
+  const int64_t dynamic_o_base_offset =
+      dynamic_o_offset.has_value() ? element_offset(*dynamic_o_offset) : 0;
+
+  std::ostringstream layout_key;
+  layout_key << static_cast<int>(in.dtype().val()) << ':' << in_base_offset
+             << ':' << out_base_offset << ':' << i_offset << ':' << o_offset
+             << ':' << dynamic_i_base_offset << ':' << dynamic_o_base_offset
+             << ':' << dynamic_i_offset.has_value() << ':'
+             << dynamic_o_offset.has_value() << ':';
+  append_layout_key(layout_key, shape);
+  layout_key << ':';
+  append_layout_key(layout_key, i_strides);
+  layout_key << ':';
+  append_layout_key(layout_key, o_strides);
+
+  const std::string shader_name = "dynamic_general_copy_" +
+      copy_dtype_suffix(in.dtype()) + "_" +
+      std::to_string(std::hash<std::string>{}(layout_key.str()));
+
+  ensure_dynamic_shader_registered(
+      shader_name,
+      build_dynamic_general_copy_shader(
+          in.dtype(),
+          shape,
+          i_strides,
+          o_strides,
+          in_base_offset,
+          out_base_offset,
+          i_offset,
+          o_offset,
+          dynamic_i_base_offset,
+          dynamic_o_base_offset,
+          dynamic_i_offset.has_value(),
+          dynamic_o_offset.has_value(),
+          total_elements));
+
+  std::vector<VkDescriptorSetLayoutBinding> bindings;
+  write_descriptor_binding(bindings, 0);
+  write_descriptor_binding(bindings, 1);
+  if (dynamic_i_offset.has_value()) {
+    write_descriptor_binding(bindings, 2);
+  }
+  if (dynamic_o_offset.has_value()) {
+    write_descriptor_binding(bindings, 3);
+  }
+
+  auto& manager = vulkan::KernelManager::get();
+  auto* pipeline = manager.get_pipeline(shader_name, bindings, 0);
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
+  vk::DescriptorSet descriptor_set =
+      manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+
+  std::vector<VkDescriptorBufferInfo> infos;
+  std::vector<VkWriteDescriptorSet> writes;
+  infos.reserve(4);
+  writes.reserve(4);
+  write_descriptor_buffer(in, 0, descriptor_set, infos, writes);
+  write_descriptor_buffer(out, 1, descriptor_set, infos, writes);
+  if (dynamic_i_offset.has_value()) {
+    write_descriptor_buffer(
+        *dynamic_i_offset, 2, descriptor_set, infos, writes);
+  }
+  if (dynamic_o_offset.has_value()) {
+    write_descriptor_buffer(
+        *dynamic_o_offset, 3, descriptor_set, infos, writes);
+  }
+  vkUpdateDescriptorSets(
+      vulkan::VulkanContext::get().device(),
+      static_cast<uint32_t>(writes.size()),
+      writes.data(),
+      0,
+      nullptr);
+
+  vkCmdBindPipeline(
+      command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+  VkDescriptorSet vk_descriptor_set =
+      static_cast<VkDescriptorSet>(descriptor_set);
+  vkCmdBindDescriptorSets(
+      command_buffer,
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeline->layout,
+      0,
+      1,
+      &vk_descriptor_set,
+      0,
+      nullptr);
+
+  const uint32_t workgroups = std::max<uint32_t>(
+      (static_cast<uint32_t>(total_elements) + 255u) / 256u, 1u);
+  vkCmdDispatch(command_buffer, workgroups, 1, 1);
+
+  vulkan::retain_array_for_stream(s, in);
+  vulkan::retain_array_for_stream(s, out);
+  if (dynamic_i_offset.has_value()) {
+    vulkan::retain_array_for_stream(s, *dynamic_i_offset);
+  }
+  if (dynamic_o_offset.has_value()) {
+    vulkan::retain_array_for_stream(s, *dynamic_o_offset);
+  }
+  vulkan::end_command_recording(s.index);
+  return true;
 }
 
 mlx::core::array make_copy_view(
@@ -636,30 +1101,6 @@ std::optional<vulkan::StaticShaderId> get_copy_shader_id(
   return std::nullopt;
 }
 
-int64_t read_dynamic_index(const mlx::core::array& indices, size_t i) {
-  switch (indices.dtype()) {
-    case mlx::core::int8:
-      return static_cast<int64_t>(indices.data<int8_t>()[i]);
-    case mlx::core::uint8:
-      return static_cast<int64_t>(indices.data<uint8_t>()[i]);
-    case mlx::core::int16:
-      return static_cast<int64_t>(indices.data<int16_t>()[i]);
-    case mlx::core::uint16:
-      return static_cast<int64_t>(indices.data<uint16_t>()[i]);
-    case mlx::core::int32:
-      return static_cast<int64_t>(indices.data<int32_t>()[i]);
-    case mlx::core::uint32:
-      return static_cast<int64_t>(indices.data<uint32_t>()[i]);
-    case mlx::core::int64:
-      return static_cast<int64_t>(indices.data<int64_t>()[i]);
-    case mlx::core::uint64:
-      return static_cast<int64_t>(indices.data<uint64_t>()[i]);
-    default:
-      throw std::runtime_error(
-          "compute_dynamic_offset requires integer index types.");
-  }
-}
-
 } // namespace
 
 namespace mlx::core {
@@ -693,11 +1134,6 @@ void copy_gpu_inplace(
     return;
   }
 
-  const int64_t resolved_i_offset =
-      i_offset + resolve_dynamic_offset(dynamic_i_offset);
-  const int64_t resolved_o_offset =
-      o_offset + resolve_dynamic_offset(dynamic_o_offset);
-
   auto dispatch_shape = data_shape;
   auto dispatch_i_strides = i_strides;
   auto dispatch_o_strides = o_strides;
@@ -722,10 +1158,12 @@ void copy_gpu_inplace(
           sub_shape,
           sub_i_strides,
           sub_o_strides,
-          resolved_i_offset + i * dispatch_i_strides[0],
-          resolved_o_offset + i * dispatch_o_strides[0],
+          i_offset + i * dispatch_i_strides[0],
+          o_offset + i * dispatch_o_strides[0],
           ctype,
-          s);
+          s,
+          dynamic_i_offset,
+          dynamic_o_offset);
     }
     return;
   }
@@ -745,6 +1183,31 @@ void copy_gpu_inplace(
       source = &*materialized_in;
     }
   }
+
+  if (dynamic_i_offset.has_value() || dynamic_o_offset.has_value()) {
+    if (ctype != CopyType::GeneralGeneral) {
+      throw std::runtime_error(
+          "Dynamic Vulkan copy offsets require GeneralGeneral copy.");
+    }
+    if (!dispatch_dynamic_general_copy(
+            *source,
+            out,
+            dispatch_shape,
+            dispatch_i_strides,
+            dispatch_o_strides,
+            i_offset,
+            o_offset,
+            s,
+            dynamic_i_offset,
+            dynamic_o_offset)) {
+      throw std::runtime_error(
+          "Dynamic Vulkan copy does not support tensors with rank greater than 4.");
+    }
+    return;
+  }
+
+  const int64_t resolved_i_offset = i_offset;
+  const int64_t resolved_o_offset = o_offset;
 
   auto in_view = make_copy_view(
       *source, dispatch_shape, dispatch_i_strides, resolved_i_offset);
@@ -1135,10 +1598,23 @@ array compute_dynamic_offset(
         "compute_dynamic_offset expected indices.size() == axes.size().");
   }
 
-  auto indices_eval = indices;
-  indices_eval.eval();
+  switch (indices.dtype()) {
+    case mlx::core::int8:
+    case mlx::core::uint8:
+    case mlx::core::int16:
+    case mlx::core::uint16:
+    case mlx::core::int32:
+    case mlx::core::uint32:
+    case mlx::core::int64:
+    case mlx::core::uint64:
+      break;
+    default:
+      throw std::runtime_error(
+          "compute_dynamic_offset requires integer index types.");
+  }
 
-  int64_t offset_value = 0;
+  std::vector<int64_t> stride_terms;
+  stride_terms.reserve(axes.size());
   for (size_t i = 0; i < axes.size(); ++i) {
     int axis = axes[i];
     if (axis < 0) {
@@ -1147,12 +1623,12 @@ array compute_dynamic_offset(
     if (axis < 0 || axis >= static_cast<int>(strides.size())) {
       throw std::out_of_range("compute_dynamic_offset axis out of range.");
     }
-    offset_value += read_dynamic_index(indices_eval, i) * strides[axis];
+    stride_terms.push_back(strides[axis]);
   }
 
   array offset({1}, int64, nullptr, {});
   offset.set_data(allocator::malloc(offset.itemsize()));
-  offset.data<int64_t>()[0] = offset_value;
+  dispatch_dynamic_offset_kernel(indices, offset, stride_terms, s);
   return offset;
 }
 

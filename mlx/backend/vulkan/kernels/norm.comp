@@ -35,7 +35,7 @@ void main() {
     }
 
     const float mean = sum[0].x / p.KX;
-    const float var = sum[0].y / p.KX - mean * mean;
+    const float var = max(sum[0].y / p.KX - mean * mean, 0.0f);
     const float inv_std = inversesqrt(var + p.param1);
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {

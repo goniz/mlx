@@ -1260,6 +1260,24 @@ void process_shaders() {
       "group_norm.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv(
+      "layer_norm_affine_f32",
+      "layer_norm_affine.comp",
+      merge_maps(base_dict, {{"D_TYPE", "float"}}));
+  string_to_spv(
+      "layer_norm_affine_f32_f16",
+      "layer_norm_affine.comp",
+      merge_maps(
+          base_dict,
+          {{"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}}));
+  string_to_spv(
+      "layer_norm_affine_f32_f16_rte",
+      "layer_norm_affine.comp",
+      merge_maps(base_dict, {{"D_TYPE", "float16_t"}, {"RTE16", "1"}}));
+  string_to_spv(
+      "layer_norm_affine_f32_bf16",
+      "layer_norm_affine.comp",
+      merge_maps(base_dict, {{"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}}));
+  string_to_spv(
       "rms_norm_f32",
       "rms_norm.comp",
       merge_maps(

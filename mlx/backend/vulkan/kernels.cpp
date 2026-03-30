@@ -302,6 +302,7 @@ enum class KernelSpecId {
   Arange,
   SumRows,
   Argmax,
+  SoftmaxBack,
   Softmax,
   SoftmaxLarge,
   DiagMaskInf,
@@ -320,6 +321,7 @@ enum class KernelSpecId {
   AffineQuant,
   Nvfp4Dequant,
   FusedAffineMatmul,
+  LayerNormAffine,
 };
 
 struct KernelSpec {
@@ -345,7 +347,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 26> kKernelSpecs = {
+const std::array<KernelSpec, 28> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -376,6 +378,10 @@ const std::array<KernelSpec, 26> kKernelSpecs = {
         DispatchGridKind::RowWise),
     make_kernel_spec(
         {0, 1},
+        sizeof(GenericPushConstants),
+        DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 2},
         sizeof(GenericPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
@@ -449,6 +455,10 @@ const std::array<KernelSpec, 26> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4},
         sizeof(FusedAffineMatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(LayerNormAffinePushConstants),
         DispatchGridKind::Linear1D),
 };
 
@@ -1924,6 +1934,66 @@ void dispatch_unary_op(
       s);
 }
 
+void dispatch_norm_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float eps) {
+  const uint32_t axis_size = checked_u32(in.shape(in.ndim() - 1), "norm axis");
+  const uint32_t row_count = axis_size == 0 ? 0 : checked_u32(out.size() / axis_size, "norm rows");
+  const auto push_constants = make_generic_push_constants(axis_size, eps, 0.0f, 0.0f, 0.0f);
+  const uint32_t grid_x = std::min<uint32_t>(row_count, 512u);
+  const uint32_t grid_y = std::min<uint32_t>((row_count + 511u) / 512u, 512u);
+  const uint32_t grid_z = (row_count + 262144u - 1u) / 262144u;
+  const std::array<uint32_t, 3> grid = {grid_x, grid_y, grid_z};
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GenericUnary,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_layer_norm_affine_op(
+    const array& x,
+    const array& weight,
+    const array& bias,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const LayerNormAffinePushConstants& push_constants) {
+    const std::array<BoundArray, 4> bound_arrays = {{
+      {&x, "src0"},
+      {&weight, "src1"},
+      {&bias, "src2"},
+      {&out, "dst"},
+  }};
+  const std::array<uint32_t, 3> grid = {
+      (push_constants.ne + 255u) / 256u,
+      1u,
+      1u,
+  };
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::LayerNormAffine,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s,
+      grid);
+}
+
 void dispatch_generic_unary_op(
     const array& in,
     array& out,
@@ -2084,6 +2154,55 @@ void dispatch_softmax_op(
       bound_arrays,
       push_constants,
       push_constants.nrows_x,
+      cmd_buffer,
+      s,
+      std::nullopt,
+      {32u});
+}
+
+void dispatch_softmax_back_op(
+    const array& grad,
+    const array& y,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float scale) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (grad.ndim() == 0 || grad.shape() != y.shape() || grad.shape() != out.shape()) {
+    throw std::runtime_error(
+        "[vulkan::kernels] SoftmaxBack requires matching non-scalar shapes.");
+  }
+
+  const uint32_t row_width = checked_u32(out.shape(out.ndim() - 1), "softmax_back KX");
+  if (row_width == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] SoftmaxBack requires non-zero KX.");
+  }
+
+  const uint32_t total_elements = checked_u32(out.size(), "softmax_back elements");
+  if (total_elements % row_width != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] SoftmaxBack elements are not divisible by KX.");
+  }
+  const uint32_t row_count = total_elements / row_width;
+  auto push_constants = make_generic_push_constants(row_width, scale, 0.0f, 0.0f, 0.0f);
+  push_constants.KY = row_count;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&grad, "src0"},
+      {&y, "src1"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::SoftmaxBack,
+      bound_arrays,
+      push_constants,
+      row_count,
       cmd_buffer,
       s,
       std::nullopt,

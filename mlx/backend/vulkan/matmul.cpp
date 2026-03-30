@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/matmul.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/gpu/eval.h"
@@ -9,6 +10,7 @@
 #include "mlx/backend/vulkan/matmul.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
+#include "mlx/utils.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -239,6 +241,11 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
     return true;
   }
 
+  if (arr.has_primitive()) {
+    arr = contiguous_copy_gpu(arr, s);
+    return has_vulkan_buffer(arr);
+  }
+
   if (!arr.has_primitive()) {
     arr.wait();
   }
@@ -415,10 +422,28 @@ bool try_eval_mul_mm_vulkan(
   if (a.ndim() != b.ndim() || a.ndim() != out.ndim()) {
     return false;
   }
-  for (int i = 0; i < static_cast<int>(a.ndim()) - 2; ++i) {
-    if (a.shape(i) != b.shape(i) || a.shape(i) != out.shape(i)) {
+
+  auto materialize_broadcast_input = [&](array& in) {
+    Shape target_shape = out.shape();
+    target_shape[target_shape.size() - 2] = in.shape(in.ndim() - 2);
+    target_shape[target_shape.size() - 1] = in.shape(in.ndim() - 1);
+    if (in.shape() == target_shape) {
+      return true;
+    }
+    if (broadcast_shapes(in.shape(), target_shape) != target_shape) {
       return false;
     }
+    if (!ensure_vulkan_buffer(in, s)) {
+      return false;
+    }
+    array view(target_shape, in.dtype(), nullptr, {});
+    broadcast(in, view);
+    in = view;
+    return true;
+  };
+
+  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+    return false;
   }
 
   if (a.dtype() != b.dtype()) {
@@ -440,6 +465,9 @@ bool try_eval_mul_mm_vulkan(
   // This matches ggml's BF16xBF16 path and avoids costly staging casts.
 
   if (!is_row_contiguous_zero_offset(a)) {
+    if (!ensure_vulkan_buffer(a, s)) {
+      return false;
+    }
     a = contiguous_copy_gpu(a, s);
   }
   if (!is_row_contiguous_zero_offset(a)) {
@@ -448,6 +476,9 @@ bool try_eval_mul_mm_vulkan(
 
   array b_t = swapaxes_in_eval(b, -1, -2);
   if (!is_row_contiguous_zero_offset(b_t)) {
+    if (!ensure_vulkan_buffer(b_t, s)) {
+      return false;
+    }
     b_t = contiguous_copy_gpu(b_t, s);
   }
   if (!is_row_contiguous_zero_offset(b_t)) {

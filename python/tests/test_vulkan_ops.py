@@ -97,6 +97,77 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
                     rtol=rtol,
                 )
 
+    def test_fast_layer_norm_low_precision_regression(self):
+        for dtype, atol, rtol in (
+            (mx.float16, 5e-2, 5e-2),
+            (mx.bfloat16, 7e-2, 7e-2),
+        ):
+            with self.subTest(dtype=str(dtype)):
+                self._assert_cpu_gpu_same(
+                    lambda dtype=dtype: mx.fast.layer_norm(
+                        mx.arange(1, 1 + 2 * 16 * 128, dtype=dtype).reshape(2, 16, 128)
+                        / 128.0,
+                        mx.linspace(0.5, 1.5, 128, dtype=dtype),
+                        mx.linspace(-0.25, 0.25, 128, dtype=dtype),
+                        1e-5,
+                    ).astype(mx.float32),
+                    atol=atol,
+                    rtol=rtol,
+                )
+
+    def test_fast_layer_norm_vjp_regression(self):
+        def fn():
+            x = mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8) / 32.0
+            w = mx.linspace(0.5, 1.2, 8, dtype=mx.float32)
+            b = mx.linspace(-0.2, 0.2, 8, dtype=mx.float32)
+            cotangent = (
+                mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8) / 64.0
+            )
+            _, vjps = mx.vjp(
+                lambda x, w, b: mx.fast.layer_norm(x, w, b, 1e-5),
+                (x, w, b),
+                (cotangent,),
+            )
+            return vjps
+
+        self._assert_cpu_gpu_same(fn, atol=1e-5, rtol=1e-5)
+
+    def test_fast_layer_norm_optional_affine_regression(self):
+        cases = (
+            ("weight_only", True, False),
+            ("bias_only", False, True),
+        )
+
+        for name, use_weight, use_bias in cases:
+            with self.subTest(case=name):
+                self._assert_cpu_gpu_same(
+                    lambda use_weight=use_weight, use_bias=use_bias: mx.fast.layer_norm(
+                        mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8)
+                        / 32.0,
+                        mx.linspace(0.5, 1.2, 8, dtype=mx.float32)
+                        if use_weight
+                        else None,
+                        mx.linspace(-0.2, 0.2, 8, dtype=mx.float32)
+                        if use_bias
+                        else None,
+                        1e-5,
+                    ),
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+
+    def test_fast_layer_norm_strided_affine_regression(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.layer_norm(
+                mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8) / 32.0,
+                mx.linspace(0.5, 1.2, 16, dtype=mx.float32)[::2],
+                mx.linspace(-0.2, 0.2, 16, dtype=mx.float32)[::2],
+                1e-5,
+            ),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
     def test_scaled_dot_product_attention_causal_gqa(self):
         self._assert_cpu_gpu_same(
             lambda: mx.fast.scaled_dot_product_attention(
@@ -189,6 +260,111 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             atol=6e-2,
             rtol=6e-2,
         )
+
+    def test_scaled_dot_product_attention_additive_mask(self):
+        mask = mx.where(
+            mx.arange(8)[None, None, None, :] <= mx.arange(8)[None, None, :, None],
+            mx.array(0.0, mx.float16),
+            mx.array(-1e9, mx.float16),
+        )
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.scaled_dot_product_attention(
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 64.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 48.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 32.0,
+                scale=32**-0.5,
+                mask=mask,
+            ).astype(mx.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_scaled_dot_product_attention_bool_mask(self):
+        mask = mx.arange(8)[None, None, None, :] <= mx.arange(8)[None, None, :, None]
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.scaled_dot_product_attention(
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 64.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 48.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 32.0,
+                scale=32**-0.5,
+                mask=mask,
+            ).astype(mx.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_scaled_dot_product_attention_additive_mask_gqa(self):
+        mask = mx.where(
+            mx.arange(8)[None, None, None, :] <= mx.arange(8)[None, None, :, None],
+            mx.array(0.0, mx.float16),
+            mx.array(-1e9, mx.float16),
+        )
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.scaled_dot_product_attention(
+                mx.arange(1, 1 + 1 * 4 * 8 * 32, dtype=mx.float16).reshape(1, 4, 8, 32)
+                / 64.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 48.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 32.0,
+                scale=32**-0.5,
+                mask=mask,
+            ).astype(mx.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_scaled_dot_product_attention_bool_mask_gqa(self):
+        mask = mx.arange(8)[None, None, None, :] <= mx.arange(8)[None, None, :, None]
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.scaled_dot_product_attention(
+                mx.arange(1, 1 + 1 * 4 * 8 * 32, dtype=mx.float16).reshape(1, 4, 8, 32)
+                / 64.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 48.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 32.0,
+                scale=32**-0.5,
+                mask=mask,
+            ).astype(mx.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_scaled_dot_product_attention_vjp_gqa(self):
+        def fn():
+            q = (
+                mx.arange(1, 1 + 1 * 4 * 8 * 32, dtype=mx.float16).reshape(1, 4, 8, 32)
+                / 64.0
+            )
+            k = (
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 48.0
+            )
+            v = (
+                mx.arange(1, 1 + 1 * 2 * 8 * 32, dtype=mx.float16).reshape(1, 2, 8, 32)
+                / 32.0
+            )
+            cotangent = (
+                mx.arange(1, 1 + 1 * 4 * 8 * 32, dtype=mx.float16).reshape(1, 4, 8, 32)
+                / 96.0
+            )
+            _, vjps = mx.vjp(
+                lambda q, k, v: mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=32**-0.5
+                ),
+                (q, k, v),
+                (cotangent,),
+            )
+            return tuple(x.astype(mx.float32) for x in vjps)
+
+        self._assert_cpu_gpu_same(fn, atol=7e-2, rtol=7e-2)
 
     def test_dynamic_slice_update_5d_regression(self):
         self._assert_cpu_gpu_same(

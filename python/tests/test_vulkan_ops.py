@@ -132,6 +132,42 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
 
         self._assert_cpu_gpu_same(fn, atol=1e-5, rtol=1e-5)
 
+    def test_fast_layer_norm_optional_affine_regression(self):
+        cases = (
+            ("weight_only", True, False),
+            ("bias_only", False, True),
+        )
+
+        for name, use_weight, use_bias in cases:
+            with self.subTest(case=name):
+                self._assert_cpu_gpu_same(
+                    lambda use_weight=use_weight, use_bias=use_bias: mx.fast.layer_norm(
+                        mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8)
+                        / 32.0,
+                        mx.linspace(0.5, 1.2, 8, dtype=mx.float32)
+                        if use_weight
+                        else None,
+                        mx.linspace(-0.2, 0.2, 8, dtype=mx.float32)
+                        if use_bias
+                        else None,
+                        1e-5,
+                    ),
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+
+    def test_fast_layer_norm_strided_affine_regression(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.layer_norm(
+                mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8) / 32.0,
+                mx.linspace(0.5, 1.2, 16, dtype=mx.float32)[::2],
+                mx.linspace(-0.2, 0.2, 16, dtype=mx.float32)[::2],
+                1e-5,
+            ),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
     def test_scaled_dot_product_attention_causal_gqa(self):
         self._assert_cpu_gpu_same(
             lambda: mx.fast.scaled_dot_product_attention(

@@ -1624,6 +1624,13 @@ bool try_eval_layer_norm_vulkan(
     }
     return param;
   };
+  auto make_default_affine_param = [&](float value) {
+    array host(value, float32);
+    array dev({1}, float32, nullptr, {});
+    dev.set_data(allocator::malloc(dev.nbytes()));
+    copy_gpu(host, dev, CopyType::Scalar, s);
+    return dev;
+  };
 
   const bool needs_affine = has_weight || has_bias;
   array out_target = needs_affine
@@ -1644,15 +1651,16 @@ bool try_eval_layer_norm_vulkan(
   std::optional<array> w_work;
   std::optional<array> b_work;
 
-  if (has_weight) {
-    w_work = materialize_param(w);
-    if ((w.ndim() == 1 && !w_work->flags().row_contiguous) || w_work->offset() != 0) {
+  if (needs_affine) {
+    w_work = has_weight ? materialize_param(w) : make_default_affine_param(1.0f);
+    b_work = has_bias ? materialize_param(b) : make_default_affine_param(0.0f);
+
+    if (((w_work->ndim() == 1) && !w_work->flags().row_contiguous) ||
+        w_work->offset() != 0) {
       return false;
     }
-  }
-  if (has_bias) {
-    b_work = materialize_param(b);
-    if ((b.ndim() == 1 && !b_work->flags().row_contiguous) || b_work->offset() != 0) {
+    if (((b_work->ndim() == 1) && !b_work->flags().row_contiguous) ||
+        b_work->offset() != 0) {
       return false;
     }
   }
@@ -1686,8 +1694,12 @@ bool try_eval_layer_norm_vulkan(
       vulkan::LayerNormAffinePushConstants affine_push_constants{};
       affine_push_constants.ne = checked_u32_size(final_work.size(), "layer_norm_affine elements");
       affine_push_constants.axis_size = checked_u32_size(x.shape(x.ndim() - 1), "layer_norm_affine axis");
-      affine_push_constants.w_stride = w.ndim() == 1 ? checked_u32_size(w.strides(0), "layer_norm_affine w_stride") : 0u;
-      affine_push_constants.b_stride = b.ndim() == 1 ? checked_u32_size(b.strides(0), "layer_norm_affine b_stride") : 0u;
+      affine_push_constants.w_stride = has_weight && w_work->ndim() == 1
+          ? checked_u32_size(w_work->strides(0), "layer_norm_affine w_stride")
+          : 0u;
+      affine_push_constants.b_stride = has_bias && b_work->ndim() == 1
+          ? checked_u32_size(b_work->strides(0), "layer_norm_affine b_stride")
+          : 0u;
       const auto affine_shader_id = out_target.dtype() == bfloat16
           ? vulkan::StaticShaderId::layer_norm_affine_f32_bf16
           : vulkan::StaticShaderId::layer_norm_affine_f32;

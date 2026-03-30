@@ -647,6 +647,15 @@ void dispatch_softmax_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s);
 
+void dispatch_softmax_back_op(
+    const array& grad,
+    const array& y,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float scale = 1.0f);
+
 void dispatch_softmax_large_op(
     const array& in,
     array& out,

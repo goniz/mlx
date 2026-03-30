@@ -1,7 +1,9 @@
 // Copyright © 2024 Apple Inc.
 
+#include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/utils.h"
 
 #include <algorithm>
 
@@ -63,6 +65,38 @@ bool is_vulkan_compare_dtype(Dtype dtype) {
   }
 }
 
+bool has_vulkan_buffer(const array& arr) {
+  auto data = arr.data_shared_ptr();
+  return data != nullptr && data->buffer.ptr() != nullptr;
+}
+
+bool ensure_vulkan_buffer(array& arr, Stream s) {
+  if (has_vulkan_buffer(arr)) {
+    return true;
+  }
+
+  if (arr.has_primitive()) {
+    arr = contiguous_copy_gpu(arr, s);
+    return has_vulkan_buffer(arr);
+  }
+
+  if (!arr.has_primitive()) {
+    arr.wait();
+  }
+
+  if (has_vulkan_buffer(arr)) {
+    return true;
+  }
+
+  auto data = arr.data_shared_ptr();
+  if (data == nullptr || data->buffer.ptr() == nullptr) {
+    return false;
+  }
+
+  arr = contiguous_copy_gpu(arr, s);
+  return has_vulkan_buffer(arr);
+}
+
 template <typename Primitive>
 constexpr vulkan::BinaryDispatchVariant binary_dispatch_variant() {
   if constexpr (std::is_same_v<Primitive, Add>) {
@@ -95,6 +129,18 @@ bool try_eval_binary_op_vulkan(
     array& out,
     const char* op_name,
     Stream s) {
+  auto trace_binary_unsupported = [&](std::string_view reason, const array& lhs, const array& rhs) {
+    if (!trace_fallback_enabled()) {
+      return;
+    }
+    std::ostringstream oss;
+    oss << "binary_vulkan_unsupported op=" << op_name << " reason=" << reason
+        << " lhs_shape=" << lhs.shape() << " lhs_dtype=" << lhs.dtype()
+        << " rhs_shape=" << rhs.shape() << " rhs_dtype=" << rhs.dtype()
+        << " out_shape=" << out.shape() << " out_dtype=" << out.dtype();
+    trace_fallback(oss.str());
+  };
+
   if (inputs.size() != 2) {
     return false;
   }
@@ -115,6 +161,11 @@ bool try_eval_binary_op_vulkan(
   const bool integer_case = a.dtype() == b.dtype() &&
       a.dtype() == out.dtype() && is_vulkan_integer_dtype(a.dtype());
   if (!float_case && !integer_case && !bool_add && !mixed_numeric_div) {
+    trace_binary_unsupported("unsupported_dtype_combo", a, b);
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s)) {
     return false;
   }
 
@@ -167,7 +218,24 @@ bool try_eval_binary_op_vulkan(
     b = b_f32;
   }
 
-  if (a.shape() != out.shape() || b.shape() != out.shape()) {
+  auto materialize_broadcast_input = [&](array& in) {
+    if (in.shape() == out.shape()) {
+      return true;
+    }
+    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
+      return false;
+    }
+    if (!ensure_vulkan_buffer(in, s)) {
+      return false;
+    }
+    array view(out.shape(), in.dtype(), nullptr, {});
+    broadcast(in, view);
+    in = view;
+    return true;
+  };
+
+  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+    trace_binary_unsupported("broadcast_materialization_failed", a, b);
     return false;
   }
 
@@ -204,6 +272,7 @@ bool try_eval_binary_op_vulkan(
   if (!is_supported_elementwise_layout(a) ||
       !is_supported_elementwise_layout(b) ||
       !is_supported_elementwise_layout(out_kernel)) {
+    trace_binary_unsupported("unsupported_elementwise_layout", a, b);
     return false;
   }
 
@@ -224,6 +293,7 @@ bool try_eval_binary_op_vulkan(
             out_kernel.dtype(),
             out_kernel.dtype() == float16);
   if (!shader_id.has_value()) {
+    trace_binary_unsupported("missing_shader", a, b);
     return false;
   }
 

@@ -13,8 +13,11 @@
 #include <unordered_map>
 
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/common/broadcasting.h"
+#include "mlx/backend/common/utils.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
+#include "mlx/backend/vulkan/matmul.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/quantized.h"
 #include "mlx/backend/vulkan/vulkan.h"
@@ -39,6 +42,7 @@ constexpr char kFlashAttnKCastScratchLane[] = "flash_attn.k_cast";
 constexpr char kFlashAttnVCastScratchLane[] = "flash_attn.v_cast";
 
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
+array ensure_sdpa_rowwise_layout(array arr, Stream s);
 
 struct FlashAttentionCausalMaskCacheEntry {
   Shape shape;
@@ -923,18 +927,6 @@ bool sdpa_vulkan_supported(
     }
     return false;
   }
-  if (is_training) {
-    if (reason != nullptr) {
-      *reason = "training unsupported";
-    }
-    return false;
-  }
-  if (output_logsumexp) {
-    if (reason != nullptr) {
-      *reason = "logsumexp output unsupported";
-    }
-    return false;
-  }
   if (has_sinks) {
     if (reason != nullptr) {
       *reason = "sinks unsupported";
@@ -944,12 +936,6 @@ bool sdpa_vulkan_supported(
   if (has_mask && !do_causal && !has_arr_mask) {
     if (reason != nullptr) {
       *reason = "non-causal mask unsupported";
-    }
-    return false;
-  }
-  if (has_arr_mask && q.shape(1) != k.shape(1)) {
-    if (reason != nullptr) {
-      *reason = "array mask with GQA unsupported";
     }
     return false;
   }
@@ -986,25 +972,479 @@ std::vector<array> eval_fallback_outputs(
   return outputs;
 }
 
-array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
-  eval(scores);
+bool is_supported_sdpa_rowwise_layout(const array& arr) {
+  return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
+      arr.strides().back() == 1;
+}
 
-  array masked(scores.shape(), float32, nullptr, {});
+bool has_vulkan_buffer_fast(const array& arr) {
+  auto data = arr.data_shared_ptr();
+  return data != nullptr && data->buffer.ptr() != nullptr;
+}
+
+array ensure_sdpa_rowwise_layout(array arr, Stream s) {
+  if (!has_vulkan_buffer_fast(arr) || !is_supported_sdpa_rowwise_layout(arr)) {
+    arr = contiguous_copy_gpu(arr, s);
+  }
+  return arr;
+}
+
+array reshape_sdpa_contiguous_view(const array& arr, const Shape& shape) {
+  array out(shape, arr.dtype(), nullptr, {});
+  out.copy_shared_buffer(
+      arr,
+      make_contiguous_strides(shape),
+      {true, true, false},
+      arr.data_size(),
+      arr.offset());
+  return out;
+}
+
+array collapse_sdpa_matmul_view(const array& arr) {
+  if (arr.ndim() <= 4) {
+    return arr;
+  }
+  Shape shape = arr.shape();
+  int64_t leading = 1;
+  for (size_t i = 0; i < shape.size() - 3; ++i) {
+    leading *= shape[i];
+  }
+  return reshape_sdpa_contiguous_view(
+      arr,
+      {
+          static_cast<int>(leading),
+          static_cast<int>(shape[shape.size() - 3]),
+          static_cast<int>(shape[shape.size() - 2]),
+          static_cast<int>(shape[shape.size() - 1]),
+      });
+}
+
+array collapse_sdpa_scores_view(const array& arr) {
+  if (arr.ndim() <= 3) {
+    return arr;
+  }
+  Shape shape = arr.shape();
+  int64_t leading = 1;
+  for (size_t i = 0; i < shape.size() - 2; ++i) {
+    leading *= shape[i];
+  }
+  return reshape_sdpa_contiguous_view(
+      arr,
+      {
+          static_cast<int>(leading),
+          static_cast<int>(shape[shape.size() - 2]),
+          static_cast<int>(shape[shape.size() - 1]),
+      });
+}
+
+array expand_sdpa_dim_view(const array& arr, int axis) {
+  int ndim = arr.ndim();
+  int normalized_axis = axis < 0 ? axis + ndim + 1 : axis;
+  Shape shape = arr.shape();
+  Strides strides = arr.strides();
+  shape.insert(shape.begin() + normalized_axis, 1);
+  strides.insert(strides.begin() + normalized_axis, 1);
+  array out(shape, arr.dtype(), nullptr, {});
+  out.copy_shared_buffer(arr, strides, arr.flags(), arr.data_size(), arr.offset());
+  return out;
+}
+
+array broadcast_sdpa_view(const array& arr, const Shape& shape) {
+  if (arr.shape() == shape) {
+    return arr;
+  }
+  array out(shape, arr.dtype(), nullptr, {});
+  broadcast(arr, out);
+  return out;
+}
+
+array swap_sdpa_last_two_dims_view(const array& arr) {
+  if (arr.ndim() < 2) {
+    return arr;
+  }
+  Shape shape = arr.shape();
+  Strides strides = arr.strides();
+  std::swap(shape[shape.size() - 1], shape[shape.size() - 2]);
+  std::swap(strides[strides.size() - 1], strides[strides.size() - 2]);
+  array out(shape, arr.dtype(), nullptr, {});
+  out.copy_shared_buffer(arr, strides, arr.flags(), arr.data_size(), arr.offset());
+  return out;
+}
+
+array cast_to_f32_sdpa(const array& arr, Stream s) {
+  if (arr.dtype() == float32 && has_vulkan_buffer_fast(arr) &&
+      is_supported_sdpa_rowwise_layout(arr)) {
+    return arr;
+  }
+  array out(arr.shape(), float32, nullptr, {});
+  copy_gpu(arr, out, CopyType::General, s);
+  out.set_status(array::Status::evaluated);
+  return out;
+}
+
+void eval_sdpa_binary_vulkan(
+    array lhs,
+    array rhs,
+    array& out,
+    vulkan::StaticShaderId shader_id,
+    Stream s) {
+  lhs = ensure_sdpa_rowwise_layout(lhs, s);
+  rhs = ensure_sdpa_rowwise_layout(rhs, s);
+  if (lhs.shape() != rhs.shape() || lhs.shape() != out.shape()) {
+    throw std::runtime_error("SDPA binary dispatch received incompatible shapes.");
+  }
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_binary_op(
+      lhs,
+      rhs,
+      out,
+      shader_id,
+      command_buffer,
+      s,
+      vulkan::BinaryDispatchVariant::Standard);
+  vulkan::end_command_recording(s.index);
+  out.set_status(array::Status::evaluated);
+}
+
+vulkan::StaticShaderId sdpa_add_shader(Dtype dtype) {
+  switch (dtype) {
+    case float16:
+      return vulkan::StaticShaderId::add_f16_f16_f16;
+    case float32:
+      return vulkan::StaticShaderId::add_f32_f32_f32;
+    default:
+      throw std::runtime_error("Unsupported SDPA add dtype.");
+  }
+}
+
+vulkan::StaticShaderId sdpa_mul_shader(Dtype dtype) {
+  switch (dtype) {
+    case float16:
+      return vulkan::StaticShaderId::mul_f16_f16_f16;
+    case float32:
+      return vulkan::StaticShaderId::mul_f32_f32_f32;
+    default:
+      throw std::runtime_error("Unsupported SDPA mul dtype.");
+  }
+}
+
+vulkan::StaticShaderId sdpa_sub_shader(Dtype dtype) {
+  switch (dtype) {
+    case float16:
+      return vulkan::StaticShaderId::sub_f16_f16_f16;
+    case float32:
+      return vulkan::StaticShaderId::sub_f32_f32_f32;
+    default:
+      throw std::runtime_error("Unsupported SDPA sub dtype.");
+  }
+}
+
+void eval_sdpa_binary_add_vulkan(array lhs, array rhs, array& out, Stream s) {
+  eval_sdpa_binary_vulkan(
+      std::move(lhs),
+      std::move(rhs),
+      out,
+      sdpa_add_shader(out.dtype()),
+      s);
+}
+
+void eval_sdpa_binary_mul_vulkan(array lhs, array rhs, array& out, Stream s) {
+  eval_sdpa_binary_vulkan(
+      std::move(lhs),
+      std::move(rhs),
+      out,
+      sdpa_mul_shader(out.dtype()),
+      s);
+}
+
+void eval_sdpa_binary_sub_vulkan(array lhs, array rhs, array& out, Stream s) {
+  eval_sdpa_binary_vulkan(
+      std::move(lhs),
+      std::move(rhs),
+      out,
+      sdpa_sub_shader(out.dtype()),
+      s);
+}
+
+void eval_sdpa_scale_vulkan(const array& in, array& out, float scale, Stream s) {
+  array scale_host(scale, float32);
+  array scale_dev(scale_host.shape(), float32, nullptr, {});
+  copy_gpu(scale_host, scale_dev, CopyType::General, s);
+  scale_dev.set_status(array::Status::evaluated);
+  eval_sdpa_binary_mul_vulkan(
+      in, broadcast_sdpa_view(scale_dev, in.shape()), out, s);
+}
+
+void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
+  in = ensure_sdpa_rowwise_layout(in, s);
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  const uint32_t row_width =
+      checked_u32_size(in.shape(in.ndim() - 1), "sdpa softmax width");
+  if (row_width > 16384u) {
+    vulkan::dispatch_softmax_large_op(
+        in,
+        out,
+        vulkan::StaticShaderId::soft_max_large1_f32,
+        vulkan::StaticShaderId::soft_max_large2_f32,
+        vulkan::StaticShaderId::soft_max_large3_f32,
+        command_buffer,
+        s);
+  } else {
+    vulkan::dispatch_softmax_op(
+        in,
+        out,
+        vulkan::StaticShaderId::soft_max_f32,
+        command_buffer,
+        s);
+  }
+  vulkan::end_command_recording(s.index);
+  out.set_status(array::Status::evaluated);
+}
+
+void eval_sdpa_logsumexp_vulkan(array in, array& out, Stream s) {
+  in = ensure_sdpa_rowwise_layout(in, s);
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_sum_rows_op(
+      in,
+      out,
+      vulkan::StaticShaderId::logsumexp_f32,
+      command_buffer,
+      s);
+  vulkan::end_command_recording(s.index);
+  out.set_status(array::Status::evaluated);
+}
+
+void eval_sdpa_softmax_back_vulkan(array grad, array y, array& out, Stream s) {
+  grad = ensure_sdpa_rowwise_layout(grad, s);
+  y = ensure_sdpa_rowwise_layout(y, s);
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_softmax_back_op(
+      grad,
+      y,
+      out,
+      vulkan::StaticShaderId::soft_max_back_f32,
+      command_buffer,
+      s);
+  vulkan::end_command_recording(s.index);
+  out.set_status(array::Status::evaluated);
+}
+
+void eval_sdpa_repeat_back_vulkan(array in, array& out, Stream s) {
+  in = ensure_sdpa_rowwise_layout(in, s);
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_unary_op(
+      in,
+      out,
+      vulkan::StaticShaderId::repeat_back_f32,
+      command_buffer,
+      s);
+  vulkan::end_command_recording(s.index);
+  out.set_status(array::Status::evaluated);
+}
+
+void eval_sdpa_sum_rows_vulkan(array in, array& out, Stream s) {
+  in = ensure_sdpa_rowwise_layout(in, s);
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_sum_rows_op(
+      in,
+      out,
+      vulkan::StaticShaderId::sum_rows_f32,
+      command_buffer,
+      s);
+  vulkan::end_command_recording(s.index);
+  out.set_status(array::Status::evaluated);
+}
+
+void eval_sdpa_matmul_vulkan(const array& a, const array& b, array& out, Stream s) {
+  array a_work = a;
+  array b_work = b;
+
+  if (a_work.ndim() > 2) {
+    Shape a_shape = out.shape();
+    a_shape[a_shape.size() - 1] = a_work.shape(a_work.ndim() - 1);
+    a_shape[a_shape.size() - 2] = a_work.shape(a_work.ndim() - 2);
+    if (a_work.shape() != a_shape) {
+      a_work = broadcast_sdpa_view(a_work, a_shape);
+    }
+  }
+  if (b_work.ndim() > 2) {
+    Shape b_shape = out.shape();
+    b_shape[b_shape.size() - 1] = b_work.shape(b_work.ndim() - 1);
+    b_shape[b_shape.size() - 2] = b_work.shape(b_work.ndim() - 2);
+    if (b_work.shape() != b_shape) {
+      b_work = broadcast_sdpa_view(b_work, b_shape);
+    }
+  }
+
+  a_work = ensure_sdpa_rowwise_layout(a_work, s);
+  b_work = ensure_sdpa_rowwise_layout(b_work, s);
+
+  array out_work = out;
+  if (out_work.ndim() > 4) {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+    a_work = collapse_sdpa_matmul_view(a_work);
+    b_work = collapse_sdpa_matmul_view(b_work);
+    out_work = collapse_sdpa_matmul_view(out_work);
+  }
+
+  if (!try_eval_matmul_vulkan({a_work, b_work}, out_work, s)) {
+    throw std::runtime_error(
+        "SDPA Vulkan matmul dispatch failed for broadcasted attention shapes.");
+  }
+  out.set_status(array::Status::evaluated);
+}
+
+bool try_eval_sdpa_heads_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    array* logsumexp_out,
+    float scale,
+    bool do_causal,
+    Stream s) {
+  const char* stage = "validate";
+  try {
+  if (inputs.size() < 3) {
+    return false;
+  }
+
+  const array& q_in = inputs[0];
+  const array& k_in = inputs[1];
+  const array& v_in = inputs[2];
+  if (q_in.ndim() != 4 || k_in.ndim() != 4 || v_in.ndim() != 4) {
+    return false;
+  }
+
+  const int n_q_heads = q_in.shape(1);
+  const int n_kv_heads = k_in.shape(1);
+  const int n_repeats = n_q_heads / n_kv_heads;
+  if (n_repeats <= 0) {
+    return false;
+  }
+
+  const int batch = q_in.shape(0);
+  const int q_len = q_in.shape(2);
+  const int kv_len = k_in.shape(2);
+  const int q_dim = q_in.shape(3);
+  const int v_dim = v_in.shape(3);
+  const int batch_heads = batch * n_kv_heads;
+
+  stage = "cast_inputs";
+  array q = cast_to_f32_sdpa(multiply(array(scale, q_in.dtype()), q_in, s), s);
+  array k = cast_to_f32_sdpa(k_in, s);
+  array v = cast_to_f32_sdpa(v_in, s);
+
+  stage = "reshape_q";
+  q = reshape(q, {batch_heads, n_repeats, q_len, q_dim}, s);
+  q = ensure_sdpa_rowwise_layout(q, s);
+  q.set_status(array::Status::evaluated);
+
+  stage = "prepare_k";
+  k = broadcast_to(
+      expand_dims(k, 2, s),
+      {batch, n_kv_heads, n_repeats, kv_len, q_dim},
+      s);
+  k = reshape(k, {batch_heads, n_repeats, kv_len, q_dim}, s);
+  k = ensure_sdpa_rowwise_layout(k, s);
+  k.set_status(array::Status::evaluated);
+
+  stage = "scores_matmul";
+  Shape scores_shape = {batch_heads, n_repeats, q_len, kv_len};
+  array scores(scores_shape, float32, nullptr, {});
+  eval_sdpa_matmul_vulkan(q, swap_sdpa_last_two_dims_view(k), scores, s);
+
+  std::optional<array> mask_work;
+  if (inputs.size() > 3) {
+    stage = "prepare_mask";
+    array mask = cast_to_f32_sdpa(inputs[3], s);
+    if (mask.ndim() == 4 && mask.shape(1) == 1) {
+      mask = broadcast_to(mask, {batch, n_q_heads, q_len, kv_len}, s);
+    }
+    mask = ensure_sdpa_rowwise_layout(mask, s);
+    mask = reshape_sdpa_contiguous_view(mask, scores.shape());
+    mask = ensure_sdpa_rowwise_layout(mask, s);
+    mask.set_status(array::Status::evaluated);
+    mask_work = mask;
+  }
+
+  if (do_causal) {
+    stage = "causal_mask";
+    const int n_past = k_in.shape(2) - q_in.shape(2);
+    scores = apply_diag_mask_inf_vulkan(scores, n_past, s);
+  }
+
+  if (mask_work.has_value()) {
+    stage = "add_mask";
+    array masked(scores.shape(), float32, nullptr, {});
+    eval_sdpa_binary_add_vulkan(scores, *mask_work, masked, s);
+    scores = masked;
+  }
+
+  if (logsumexp_out != nullptr) {
+    stage = "logsumexp";
+    Shape logsumexp_shape = scores.shape();
+    logsumexp_shape.back() = 1;
+    array logsumexp_f32(logsumexp_shape, float32, nullptr, {});
+    eval_sdpa_logsumexp_vulkan(scores, logsumexp_f32, s);
+    copy_gpu(
+        reshape_sdpa_contiguous_view(logsumexp_f32, logsumexp_out->shape()),
+        *logsumexp_out,
+        CopyType::General,
+        s);
+    logsumexp_out->set_status(array::Status::evaluated);
+  }
+
+  stage = "softmax";
+  array probs(scores.shape(), float32, nullptr, {});
+  eval_sdpa_softmax_vulkan(scores, probs, s);
+
+  stage = "prepare_v";
+  array v_work = broadcast_to(
+      expand_dims(v, 2, s),
+      {batch, n_kv_heads, n_repeats, kv_len, v_dim},
+      s);
+  v_work = reshape(v_work, {batch_heads, n_repeats, kv_len, v_dim}, s);
+  v_work = ensure_sdpa_rowwise_layout(v_work, s);
+
+  stage = "result_matmul";
+  array result_f32(scores.shape(), float32, nullptr, {});
+  result_f32 = array({batch_heads, n_repeats, q_len, v_dim}, float32, nullptr, {});
+  eval_sdpa_matmul_vulkan(probs, v_work, result_f32, s);
+  stage = "copy_out";
+  copy_gpu(reshape_sdpa_contiguous_view(result_f32, out.shape()), out, CopyType::General, s);
+  out.set_status(array::Status::evaluated);
+  return true;
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        std::string("ScaledDotProductAttention GQA stage failed at ") + stage +
+        ": " + e.what());
+  }
+}
+
+array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
+  array in = ensure_sdpa_rowwise_layout(scores, s);
+
+  array masked(in.shape(), float32, nullptr, {});
   masked.set_status(array::Status::available);
   masked.set_data(allocator::malloc(masked.nbytes()));
 
-  const std::vector<array> tracked_inputs = {scores};
+  const std::vector<array> tracked_inputs = {in};
   const std::vector<array> tracked_outputs = {masked};
   begin_tracked_manual_op(s, "diag_mask_inf", tracked_inputs, tracked_outputs);
 
   auto command_buffer = vulkan::begin_command_recording(s.index);
   vulkan::dispatch_diag_mask_inf_op(
-      scores,
+      in,
       masked,
       vulkan::StaticShaderId::diag_mask_inf_f32,
       command_buffer,
       s,
-      checked_u32_size(scores.shape(scores.ndim() - 2), "rows_per_channel"),
+      checked_u32_size(in.shape(in.ndim() - 2), "rows_per_channel"),
       checked_u32_size(n_past, "n_past"));
   vulkan::end_command_recording(s.index);
   end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
@@ -1325,16 +1765,7 @@ bool ScaledDotProductAttention::supports_bool_mask() {
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
-  if (detail::in_grad_tracing() && trace_fallback_enabled()) {
-    std::ostringstream oss;
-    oss << "q_shape=" << q.shape();
-    trace_use_fallback(
-        "ScaledDotProductAttentionVJP",
-        s,
-        "no Vulkan implementation",
-        oss.str());
-  }
-  return true;
+  return s.device == Device::cpu;
 }
 
 void ScaledDotProductAttention::eval_gpu(
@@ -1370,7 +1801,7 @@ void ScaledDotProductAttention::eval_gpu(
 
   auto s = stream();
 
-  if (!has_arr_mask && try_eval_flash_attention_vulkan(
+  if (!has_arr_mask && !output_logsumexp_ && try_eval_flash_attention_vulkan(
           inputs, outputs[0], scale_, do_causal_, s)) {
     return;
   }
@@ -1383,10 +1814,20 @@ void ScaledDotProductAttention::eval_gpu(
   const int n_kv_heads = k.shape(1);
   const int n_repeats = n_q_heads / n_kv_heads;
 
-  if (n_repeats > 1) {
-    q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
-    k = expand_dims(k, 2, s);
-    v = expand_dims(v, 2, s);
+  if (output_logsumexp_ || n_repeats > 1) {
+    array* logsumexp_out = outputs.size() > 1 ? &outputs[1] : nullptr;
+    if (try_eval_sdpa_heads_vulkan(
+            inputs,
+            outputs[0],
+            logsumexp_out,
+            scale_,
+            do_causal_,
+            s)) {
+      return;
+    }
+    throw std::runtime_error(
+        output_logsumexp_ ? "ScaledDotProductAttention logsumexp path failed on Vulkan."
+                          : "ScaledDotProductAttention GQA path failed on Vulkan.");
   }
 
   auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
@@ -1473,8 +1914,161 @@ void ScaledDotProductAttention::eval_gpu(
 void ScaledDotProductAttentionVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error(
-      "ScaledDotProductAttentionVJP has no Vulkan implementation.");
+  if (outputs.size() != 3) {
+    throw std::runtime_error(
+        "ScaledDotProductAttentionVJP expects three outputs.");
+  }
+  if (inputs.size() < 6) {
+    throw std::runtime_error(
+        "ScaledDotProductAttentionVJP expects at least six inputs.");
+  }
+  if (has_sinks_) {
+    throw std::runtime_error(
+        "ScaledDotProductAttentionVJP with attention sinks is not supported on Vulkan.");
+  }
+
+  auto s = stream();
+  const int primals_size = static_cast<int>(inputs.size()) - 3;
+  const bool has_arr_mask = primals_size > 3;
+
+  const array& q_in = inputs[0];
+  const array& k_in = inputs[1];
+  const array& v_in = inputs[2];
+
+  const int n_q_heads = q_in.shape(1);
+  const int n_kv_heads = k_in.shape(1);
+  const int n_repeats = n_q_heads / n_kv_heads;
+  const int batch = q_in.shape(0);
+  const int q_len = q_in.shape(2);
+  const int kv_len = k_in.shape(2);
+  const int q_dim = q_in.shape(3);
+  const int v_dim = v_in.shape(3);
+  const int batch_heads = batch * n_kv_heads;
+
+  auto prepare_q = [&](const array& src) {
+    array q4 = src;
+    q4 = reshape(q4, {batch_heads, n_repeats, q_len, q_dim}, s);
+    q4 = ensure_sdpa_rowwise_layout(q4, s);
+    q4.set_status(array::Status::evaluated);
+    return q4;
+  };
+
+  auto prepare_kv = [&](const array& src, int width) {
+    array out4 = src;
+    out4 = broadcast_to(
+        expand_dims(out4, 2, s),
+        {batch, n_kv_heads, n_repeats, kv_len, width},
+        s);
+    out4 = reshape(out4, {batch_heads, n_repeats, kv_len, width}, s);
+    out4 = ensure_sdpa_rowwise_layout(out4, s);
+    out4.set_status(array::Status::evaluated);
+    return out4;
+  };
+
+  array q_unscaled_h = prepare_q(q_in);
+  array q_scaled_h = prepare_q(multiply(array(scale_, q_in.dtype()), q_in, s));
+  array k4_h = prepare_kv(k_in, q_dim);
+  array v4_h = prepare_kv(v_in, v_dim);
+
+  array q_unscaled = cast_to_f32_sdpa(q_unscaled_h, s);
+  array q_scaled = cast_to_f32_sdpa(q_scaled_h, s);
+  array k4 = cast_to_f32_sdpa(k4_h, s);
+  array v4 = cast_to_f32_sdpa(v4_h, s);
+
+  Shape scores_shape = {batch_heads, n_repeats, q_len, kv_len};
+  array scores(scores_shape, float32, nullptr, {});
+  eval_sdpa_matmul_vulkan(q_scaled_h, swap_sdpa_last_two_dims_view(k4_h), scores, s);
+
+  if (has_arr_mask) {
+    array mask = cast_to_f32_sdpa(inputs[3], s);
+    if (mask.ndim() == 4 && mask.shape(1) == 1) {
+      mask = broadcast_to(mask, {batch, n_q_heads, q_len, kv_len}, s);
+    }
+    mask = ensure_sdpa_rowwise_layout(mask, s);
+    mask = reshape_sdpa_contiguous_view(mask, scores_shape);
+    mask.set_status(array::Status::evaluated);
+    array masked(scores_shape, float32, nullptr, {});
+    eval_sdpa_binary_add_vulkan(scores, mask, masked, s);
+    scores = masked;
+  }
+
+  if (do_causal_) {
+    const int n_past = kv_len - q_len;
+    scores = apply_diag_mask_inf_vulkan(scores, n_past, s);
+  }
+
+  array probs(scores_shape, float32, nullptr, {});
+  eval_sdpa_softmax_vulkan(scores, probs, s);
+
+  array probs_h(scores_shape, q_in.dtype(), nullptr, {});
+  copy_gpu(probs, probs_h, CopyType::General, s);
+  probs_h = ensure_sdpa_rowwise_layout(probs_h, s);
+  probs_h.set_status(array::Status::evaluated);
+
+  array d_o_h = inputs.back();
+  d_o_h = reshape(d_o_h, {batch_heads, n_repeats, q_len, v_dim}, s);
+  d_o_h = ensure_sdpa_rowwise_layout(d_o_h, s);
+  d_o_h.set_status(array::Status::evaluated);
+
+  array d_v_full_h({batch_heads, n_repeats, kv_len, v_dim}, q_in.dtype(), nullptr, {});
+  eval_sdpa_matmul_vulkan(swap_sdpa_last_two_dims_view(probs_h), d_o_h, d_v_full_h, s);
+  array d_v_full = cast_to_f32_sdpa(d_v_full_h, s);
+
+  array d_p_h(scores_shape, q_in.dtype(), nullptr, {});
+  eval_sdpa_matmul_vulkan(d_o_h, swap_sdpa_last_two_dims_view(v4_h), d_p_h, s);
+
+  array sv_h(scores_shape, q_in.dtype(), nullptr, {});
+  eval_sdpa_binary_mul_vulkan(probs_h, d_p_h, sv_h, s);
+  array sv_f32 = cast_to_f32_sdpa(sv_h, s);
+  array row_sum_f32({batch_heads, n_repeats, q_len, 1}, float32, nullptr, {});
+  eval_sdpa_sum_rows_vulkan(sv_f32, row_sum_f32, s);
+  array row_sum_h(row_sum_f32.shape(), q_in.dtype(), nullptr, {});
+  copy_gpu(row_sum_f32, row_sum_h, CopyType::General, s);
+  row_sum_h.set_status(array::Status::evaluated);
+
+  array row_bcast_h = broadcast_sdpa_view(row_sum_h, scores_shape);
+  row_bcast_h = ensure_sdpa_rowwise_layout(row_bcast_h, s);
+  row_bcast_h.set_status(array::Status::evaluated);
+
+  array d_p_minus_row_h(scores_shape, q_in.dtype(), nullptr, {});
+  eval_sdpa_binary_sub_vulkan(d_p_h, row_bcast_h, d_p_minus_row_h, s);
+  array d_s_h(scores_shape, q_in.dtype(), nullptr, {});
+  eval_sdpa_binary_mul_vulkan(probs_h, d_p_minus_row_h, d_s_h, s);
+
+  array d_q_scaled_h({batch_heads, n_repeats, q_len, q_dim}, q_in.dtype(), nullptr, {});
+  eval_sdpa_matmul_vulkan(d_s_h, k4_h, d_q_scaled_h, s);
+  array d_q_scaled = cast_to_f32_sdpa(d_q_scaled_h, s);
+  array d_q({batch_heads, n_repeats, q_len, q_dim}, float32, nullptr, {});
+  eval_sdpa_scale_vulkan(d_q_scaled, d_q, scale_, s);
+
+  array d_k_full_h({batch_heads, n_repeats, kv_len, q_dim}, q_in.dtype(), nullptr, {});
+  eval_sdpa_matmul_vulkan(
+      swap_sdpa_last_two_dims_view(d_s_h), q_scaled_h, d_k_full_h, s);
+  array d_k_full = cast_to_f32_sdpa(d_k_full_h, s);
+
+  array d_k = d_k_full;
+  array d_v = d_v_full;
+  if (n_repeats > 1) {
+    array d_k_reduce_out({batch_heads, 1, kv_len, q_dim}, float32, nullptr, {});
+    eval_sdpa_repeat_back_vulkan(d_k_full, d_k_reduce_out, s);
+    d_k = reshape_sdpa_contiguous_view(d_k_reduce_out, k_in.shape());
+
+    array d_v_reduce_out({batch_heads, 1, kv_len, v_dim}, float32, nullptr, {});
+    eval_sdpa_repeat_back_vulkan(d_v_full, d_v_reduce_out, s);
+    d_v = reshape_sdpa_contiguous_view(d_v_reduce_out, v_in.shape());
+  } else {
+    d_k = reshape_sdpa_contiguous_view(d_k_full, k_in.shape());
+    d_v = reshape_sdpa_contiguous_view(d_v_full, v_in.shape());
+  }
+
+  d_q = reshape_sdpa_contiguous_view(d_q, q_in.shape());
+
+  copy_gpu(d_q, outputs[0], CopyType::General, s);
+  copy_gpu(d_k, outputs[1], CopyType::General, s);
+  copy_gpu(d_v, outputs[2], CopyType::General, s);
+  outputs[0].set_status(array::Status::evaluated);
+  outputs[1].set_status(array::Status::evaluated);
+  outputs[2].set_status(array::Status::evaluated);
 }
 
 bool LayerNorm::use_fallback(Stream s) {

@@ -302,6 +302,7 @@ enum class KernelSpecId {
   Arange,
   SumRows,
   Argmax,
+  SoftmaxBack,
   Softmax,
   SoftmaxLarge,
   DiagMaskInf,
@@ -346,7 +347,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 27> kKernelSpecs = {
+const std::array<KernelSpec, 28> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -377,6 +378,10 @@ const std::array<KernelSpec, 27> kKernelSpecs = {
         DispatchGridKind::RowWise),
     make_kernel_spec(
         {0, 1},
+        sizeof(GenericPushConstants),
+        DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 2},
         sizeof(GenericPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
@@ -2149,6 +2154,55 @@ void dispatch_softmax_op(
       bound_arrays,
       push_constants,
       push_constants.nrows_x,
+      cmd_buffer,
+      s,
+      std::nullopt,
+      {32u});
+}
+
+void dispatch_softmax_back_op(
+    const array& grad,
+    const array& y,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float scale) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (grad.ndim() == 0 || grad.shape() != y.shape() || grad.shape() != out.shape()) {
+    throw std::runtime_error(
+        "[vulkan::kernels] SoftmaxBack requires matching non-scalar shapes.");
+  }
+
+  const uint32_t row_width = checked_u32(out.shape(out.ndim() - 1), "softmax_back KX");
+  if (row_width == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] SoftmaxBack requires non-zero KX.");
+  }
+
+  const uint32_t total_elements = checked_u32(out.size(), "softmax_back elements");
+  if (total_elements % row_width != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] SoftmaxBack elements are not divisible by KX.");
+  }
+  const uint32_t row_count = total_elements / row_width;
+  auto push_constants = make_generic_push_constants(row_width, scale, 0.0f, 0.0f, 0.0f);
+  push_constants.KY = row_count;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&grad, "src0"},
+      {&y, "src1"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::SoftmaxBack,
+      bound_arrays,
+      push_constants,
+      row_count,
       cmd_buffer,
       s,
       std::nullopt,

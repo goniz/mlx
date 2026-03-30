@@ -532,6 +532,13 @@ struct FusedAffineMatmulPushConstants {
   uint32_t num_groups;
 };
 
+struct LayerNormAffinePushConstants {
+  uint32_t ne;
+  uint32_t axis_size;
+  uint32_t w_stride;
+  uint32_t b_stride;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -580,6 +587,24 @@ void dispatch_unary_op(
     const Stream& s,
     float param1 = 0.0f,
     float param2 = 0.0f);
+
+void dispatch_norm_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float eps);
+
+void dispatch_layer_norm_affine_op(
+    const array& x,
+    const array& weight,
+    const array& bias,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const LayerNormAffinePushConstants& push_constants);
 
 void dispatch_generic_unary_op(
     const array& in,

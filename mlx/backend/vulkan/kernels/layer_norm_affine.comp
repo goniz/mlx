@@ -1,0 +1,37 @@
+#version 450
+
+#include "types.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint axis_size;
+    uint w_stride;
+    uint b_stride;
+} p;
+
+layout(binding = 0) readonly buffer X { float data_x[]; };
+layout(binding = 1) readonly buffer W { float data_w[]; };
+layout(binding = 2) readonly buffer B { float data_b[]; };
+layout(binding = 3) writeonly buffer D { D_TYPE data_d[]; };
+
+void store_value(uint idx, float value) {
+#if defined(DATA_D_BF16)
+    data_d[idx] = D_TYPE(fp32_to_bf16(value));
+#else
+    data_d[idx] = D_TYPE(value);
+#endif
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint col = idx % p.axis_size;
+    const uint w_idx = p.w_stride == 0 ? 0 : col * p.w_stride;
+    const uint b_idx = p.b_stride == 0 ? 0 : col * p.b_stride;
+    store_value(idx, data_x[idx] * data_w[w_idx] + data_b[b_idx]);
+}

@@ -320,6 +320,7 @@ enum class KernelSpecId {
   AffineQuant,
   Nvfp4Dequant,
   FusedAffineMatmul,
+  LayerNormAffine,
 };
 
 struct KernelSpec {
@@ -345,7 +346,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 26> kKernelSpecs = {
+const std::array<KernelSpec, 27> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -449,6 +450,10 @@ const std::array<KernelSpec, 26> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4},
         sizeof(FusedAffineMatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(LayerNormAffinePushConstants),
         DispatchGridKind::Linear1D),
 };
 
@@ -1922,6 +1927,66 @@ void dispatch_unary_op(
       push_constants.ne,
       cmd_buffer,
       s);
+}
+
+void dispatch_norm_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float eps) {
+  const uint32_t axis_size = checked_u32(in.shape(in.ndim() - 1), "norm axis");
+  const uint32_t row_count = axis_size == 0 ? 0 : checked_u32(out.size() / axis_size, "norm rows");
+  const auto push_constants = make_generic_push_constants(axis_size, eps, 0.0f, 0.0f, 0.0f);
+  const uint32_t grid_x = std::min<uint32_t>(row_count, 512u);
+  const uint32_t grid_y = std::min<uint32_t>((row_count + 511u) / 512u, 512u);
+  const uint32_t grid_z = (row_count + 262144u - 1u) / 262144u;
+  const std::array<uint32_t, 3> grid = {grid_x, grid_y, grid_z};
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GenericUnary,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_layer_norm_affine_op(
+    const array& x,
+    const array& weight,
+    const array& bias,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const LayerNormAffinePushConstants& push_constants) {
+    const std::array<BoundArray, 4> bound_arrays = {{
+      {&x, "src0"},
+      {&weight, "src1"},
+      {&bias, "src2"},
+      {&out, "dst"},
+  }};
+  const std::array<uint32_t, 3> grid = {
+      (push_constants.ne + 255u) / 256u,
+      1u,
+      1u,
+  };
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::LayerNormAffine,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s,
+      grid);
 }
 
 void dispatch_generic_unary_op(

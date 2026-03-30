@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <unordered_map>
@@ -1129,6 +1130,159 @@ bool try_eval_rms_norm_vulkan(
   }
 }
 
+bool try_eval_layer_norm_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    float eps,
+    Stream s) {
+  if (inputs.size() != 3) {
+    return false;
+  }
+
+  array x = inputs[0];
+  array w = inputs[1];
+  array b = inputs[2];
+  if (x.ndim() == 0 || x.shape() != out.shape()) {
+    return false;
+  }
+
+  const bool has_weight = w.ndim() != 0;
+  const bool has_bias = b.ndim() != 0;
+  if ((has_weight && (w.ndim() != 1 || w.shape(0) != x.shape(x.ndim() - 1))) ||
+      (has_bias && (b.ndim() != 1 || b.shape(0) != x.shape(x.ndim() - 1)))) {
+    return false;
+  }
+
+  if (!is_vulkan_float_dtype(x.dtype()) ||
+      (has_weight && !is_vulkan_float_dtype(w.dtype())) ||
+      (has_bias && !is_vulkan_float_dtype(b.dtype())) ||
+      !is_vulkan_float_dtype(out.dtype())) {
+    return false;
+  }
+
+  if (x.dtype() != float32) {
+    array x_f32(x.shape(), float32, nullptr, {});
+    copy_gpu(x, x_f32, CopyType::General, s);
+    x = x_f32;
+  }
+  if (!is_supported_unary_layout(x)) {
+    x = contiguous_copy_gpu(x, s);
+  }
+
+  if (!is_supported_unary_layout(x)) {
+    return false;
+  }
+
+  auto materialize_param = [&](array param) {
+    if (param.dtype() != float32) {
+      array param_f32(param.shape(), float32, nullptr, {});
+      copy_gpu(param, param_f32, CopyType::General, s);
+      param = param_f32;
+    }
+    if (!param.flags().row_contiguous || param.offset() != 0) {
+      param = contiguous_copy_gpu(param, s);
+    }
+    return param;
+  };
+
+  const bool needs_affine = has_weight || has_bias;
+  array out_target = needs_affine
+      ? (out.dtype() == float16 ? array(out.shape(), float32, nullptr, {}) : out)
+      : (out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {}));
+  const bool staged_output = needs_affine ? !is_supported_elementwise_layout(out_target)
+                                          : !is_supported_unary_layout(out_target);
+  array final_work = staged_output
+      ? array(out_target.shape(), out_target.dtype(), nullptr, {})
+      : out_target;
+
+  array norm_out = needs_affine ? array(x.shape(), float32, nullptr, {}) : final_work;
+  norm_out.set_data(allocator::malloc(norm_out.nbytes()));
+  if (!is_supported_unary_layout(norm_out)) {
+    return false;
+  }
+
+  std::optional<array> w_work;
+  std::optional<array> b_work;
+
+  if (has_weight) {
+    w_work = materialize_param(w);
+    if ((w.ndim() == 1 && !w_work->flags().row_contiguous) || w_work->offset() != 0) {
+      return false;
+    }
+  }
+  if (has_bias) {
+    b_work = materialize_param(b);
+    if ((b.ndim() == 1 && !b_work->flags().row_contiguous) || b_work->offset() != 0) {
+      return false;
+    }
+  }
+
+  if (needs_affine || staged_output) {
+    final_work.set_data(allocator::malloc(final_work.nbytes()));
+  }
+
+  if (!is_supported_elementwise_layout(final_work)) {
+    return false;
+  }
+
+  const std::vector<array> tracked_inputs =
+      needs_affine ? std::vector<array>{x, *w_work, *b_work} : std::vector<array>{x};
+  const std::vector<array> tracked_outputs =
+      needs_affine ? std::vector<array>{norm_out, final_work} : std::vector<array>{final_work};
+  begin_tracked_manual_op(s, "layer_norm", tracked_inputs, tracked_outputs);
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_norm_op(
+        x,
+        norm_out,
+        vulkan::StaticShaderId::norm_f32,
+        command_buffer,
+        s,
+        eps);
+
+    if (needs_affine) {
+      insert_compute_barrier(command_buffer);
+      vulkan::LayerNormAffinePushConstants affine_push_constants{};
+      affine_push_constants.ne = checked_u32_size(final_work.size(), "layer_norm_affine elements");
+      affine_push_constants.axis_size = checked_u32_size(x.shape(x.ndim() - 1), "layer_norm_affine axis");
+      affine_push_constants.w_stride = w.ndim() == 1 ? checked_u32_size(w.strides(0), "layer_norm_affine w_stride") : 0u;
+      affine_push_constants.b_stride = b.ndim() == 1 ? checked_u32_size(b.strides(0), "layer_norm_affine b_stride") : 0u;
+      const auto affine_shader_id = out_target.dtype() == bfloat16
+          ? vulkan::StaticShaderId::layer_norm_affine_f32_bf16
+          : vulkan::StaticShaderId::layer_norm_affine_f32;
+      vulkan::dispatch_layer_norm_affine_op(
+          norm_out,
+          *w_work,
+          *b_work,
+          final_work,
+          affine_shader_id,
+          command_buffer,
+          s,
+          affine_push_constants);
+    }
+
+    vulkan::end_command_recording(s.index);
+    end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
+  } catch (const std::runtime_error& e) {
+    end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "layer_norm_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+
+  if (staged_output) {
+    copy_gpu(final_work, out_target, CopyType::GeneralGeneral, s);
+  }
+  if (out_target.id() != out.id()) {
+    copy_gpu(out_target, out, CopyType::GeneralGeneral, s);
+  }
+  return true;
+}
+
 } // namespace
 
 bool ScaledDotProductAttention::use_fallback(
@@ -1300,20 +1454,77 @@ void ScaledDotProductAttentionVJP::eval_gpu(
 }
 
 bool LayerNorm::use_fallback(Stream s) {
-  trace_use_fallback("LayerNorm", s, "no Vulkan implementation");
-  return true;
+  return s.device == Device::cpu;
 }
 
 void LayerNorm::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("LayerNorm has no Vulkan implementation.");
+  if (outputs.size() != 1) {
+    throw std::runtime_error("LayerNorm expects a single output.");
+  }
+  if (!try_eval_layer_norm_vulkan(inputs, outputs[0], eps_, stream())) {
+    throw std::runtime_error("LayerNorm failed on Vulkan.");
+  }
 }
 
 void LayerNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("LayerNormVJP has no Vulkan implementation.");
+  if (inputs.size() != 4 || outputs.size() != 3) {
+    throw std::runtime_error("LayerNormVJP expects 4 inputs and 3 outputs.");
+  }
+
+  auto s = stream();
+  const array& x = inputs[0];
+  const array& w = inputs[1];
+  const array& b = inputs[2];
+  const array& g = inputs[3];
+
+  array norm = number_of_elements(x, {-1}, true, x.dtype(), s);
+  array sumx = sum(x, /* axis= */ -1, /* keepdims= */ true, s);
+  array sumx2 = sum(square(x, s), /* axis= */ -1, /* keepdims= */ true, s);
+  array mu = multiply(sumx, norm, s);
+  array mu2 = multiply(sumx2, norm, s);
+  array var = subtract(mu2, square(mu, s), s);
+  array n = rsqrt(add(var, array(eps_, x.dtype()), s), s);
+  array n3 = power(n, array(3, x.dtype()), s);
+  array x_c = subtract(x, mu, s);
+
+  array wg = multiply(w, g, s);
+  array sumwg =
+      multiply(sum(wg, /* axis= */ -1, /* keepdims= */ true, s), norm, s);
+  array sumwgxc = multiply(
+      sum(multiply(wg, x_c, s), /* axis= */ -1, /* keepdims= */ true, s),
+      norm,
+      s);
+  array t1 = multiply(multiply(x_c, sumwgxc, s), n3, s);
+  array t2 = multiply(subtract(wg, sumwg, s), n, s);
+  array gx = subtract(t2, t1, s);
+
+  std::vector<int> axes(g.ndim() - 1);
+  std::iota(axes.begin(), axes.end(), 0);
+
+  array gw = (w.ndim() == 0)
+      ? zeros_like(w, s)
+      : sum(
+            multiply(g, multiply(x_c, n, s), s),
+            axes,
+            /* keepdims= */ false,
+            s);
+  array gb =
+      (b.ndim() == 0) ? zeros_like(b, s)
+                      : sum(g, axes, /* keepdims= */ false, s);
+
+  eval(gx);
+  eval(gw);
+  eval(gb);
+  outputs[0].copy_shared_buffer(gx);
+  outputs[1].copy_shared_buffer(gw);
+  outputs[2].copy_shared_buffer(gb);
+  outputs[0].set_status(array::Status::evaluated);
+  outputs[1].set_status(array::Status::evaluated);
+  outputs[2].set_status(array::Status::evaluated);
 }
 
 bool RMSNorm::use_fallback(Stream s) {

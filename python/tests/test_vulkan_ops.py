@@ -97,6 +97,41 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
                     rtol=rtol,
                 )
 
+    def test_fast_layer_norm_low_precision_regression(self):
+        for dtype, atol, rtol in (
+            (mx.float16, 5e-2, 5e-2),
+            (mx.bfloat16, 7e-2, 7e-2),
+        ):
+            with self.subTest(dtype=str(dtype)):
+                self._assert_cpu_gpu_same(
+                    lambda dtype=dtype: mx.fast.layer_norm(
+                        mx.arange(1, 1 + 2 * 16 * 128, dtype=dtype).reshape(2, 16, 128)
+                        / 128.0,
+                        mx.linspace(0.5, 1.5, 128, dtype=dtype),
+                        mx.linspace(-0.25, 0.25, 128, dtype=dtype),
+                        1e-5,
+                    ).astype(mx.float32),
+                    atol=atol,
+                    rtol=rtol,
+                )
+
+    def test_fast_layer_norm_vjp_regression(self):
+        def fn():
+            x = mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8) / 32.0
+            w = mx.linspace(0.5, 1.2, 8, dtype=mx.float32)
+            b = mx.linspace(-0.2, 0.2, 8, dtype=mx.float32)
+            cotangent = (
+                mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8) / 64.0
+            )
+            _, vjps = mx.vjp(
+                lambda x, w, b: mx.fast.layer_norm(x, w, b, 1e-5),
+                (x, w, b),
+                (cotangent,),
+            )
+            return vjps
+
+        self._assert_cpu_gpu_same(fn, atol=1e-5, rtol=1e-5)
+
     def test_scaled_dot_product_attention_causal_gqa(self):
         self._assert_cpu_gpu_same(
             lambda: mx.fast.scaled_dot_product_attention(

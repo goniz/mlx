@@ -941,15 +941,15 @@ bool sdpa_vulkan_supported(
     }
     return false;
   }
-  if (has_arr_mask) {
+  if (has_mask && !do_causal && !has_arr_mask) {
     if (reason != nullptr) {
-      *reason = "array mask unsupported";
+      *reason = "non-causal mask unsupported";
     }
     return false;
   }
-  if (has_mask && !do_causal) {
+  if (has_arr_mask && q.shape(1) != k.shape(1)) {
     if (reason != nullptr) {
-      *reason = "non-causal mask unsupported";
+      *reason = "array mask with GQA unsupported";
     }
     return false;
   }
@@ -1370,7 +1370,7 @@ void ScaledDotProductAttention::eval_gpu(
 
   auto s = stream();
 
-  if (try_eval_flash_attention_vulkan(
+  if (!has_arr_mask && try_eval_flash_attention_vulkan(
           inputs, outputs[0], scale_, do_causal_, s)) {
     return;
   }
@@ -1390,6 +1390,30 @@ void ScaledDotProductAttention::eval_gpu(
   }
 
   auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
+  if (has_arr_mask) {
+    if (scores.dtype() != float32) {
+      scores = astype(scores, float32, s);
+    }
+    array mask = inputs[3];
+    if (n_repeats > 1 && mask.ndim() >= 3) {
+      if (mask.shape(-3) == 1) {
+        mask = expand_dims(mask, -3, s);
+      } else {
+        mask = unflatten(mask, -3, {n_kv_heads, n_repeats}, s);
+      }
+    }
+    if (mask.shape() != scores.shape()) {
+      mask = broadcast_to(mask, scores.shape(), s);
+    }
+    if (mask.dtype() != scores.dtype()) {
+      mask = astype(mask, scores.dtype(), s);
+    }
+    scores = add(scores, mask, s);
+    if (!scores.flags().row_contiguous || scores.offset() != 0 ||
+        scores.strides().back() != 1) {
+      scores = contiguous_copy_gpu(scores, s);
+    }
+  }
   if (do_causal_) {
     if (scores.dtype() != float32) {
       scores = astype(scores, float32, s);

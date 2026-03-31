@@ -1,7 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
-#include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/matmul.h"
+#include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/vulkan/allocator.h"
@@ -12,6 +12,7 @@
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
@@ -23,8 +24,6 @@ namespace mlx::core {
 
 namespace {
 
-constexpr uint32_t kMulMmTileM = 32;
-constexpr uint32_t kMulMmTileN = 32;
 constexpr uint32_t kMaxGridZ = 65535;
 constexpr char kMatvecMatrixCastScratchLane[] = "matvec.matrix_f16";
 constexpr char kMatvecVectorCastScratchLane[] = "matvec.vec_f16";
@@ -32,9 +31,32 @@ constexpr char kMatvecOutScratchLane[] = "matvec.out_work";
 constexpr char kMulMmACastScratchLane[] = "mul_mm.a_f16";
 constexpr char kMulMmBCastScratchLane[] = "mul_mm.b_f16";
 constexpr char kMulMmOutScratchLane[] = "mul_mm.out_t";
+constexpr char kMulMmSplitKScratchLane[] = "mul_mm.split_k";
 
 bool is_supported_matmul_dtype(Dtype dtype) {
   return dtype == float32 || dtype == float16 || dtype == bfloat16;
+}
+
+void insert_compute_barrier(VkCommandBuffer command_buffer) {
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask =
+      static_cast<VkAccessFlags>(vk::AccessFlagBits::eShaderWrite);
+  barrier.dstAccessMask = static_cast<VkAccessFlags>(
+      vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+  vkCmdPipelineBarrier(
+      command_buffer,
+      static_cast<VkPipelineStageFlags>(
+          vk::PipelineStageFlagBits::eComputeShader),
+      static_cast<VkPipelineStageFlags>(
+          vk::PipelineStageFlagBits::eComputeShader),
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
 }
 
 bool matmul_debug_enabled() {
@@ -194,21 +216,61 @@ std::vector<vulkan::StaticShaderId> matvec_shader_candidates(
   return {};
 }
 
-std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(Dtype dtype) {
+enum class MatmulFamily : uint8_t {
+  Small,
+  Medium,
+  Large,
+};
+
+struct MatmulFamilySpec {
+  std::array<uint32_t, 11> spec;
+  uint32_t fp32_accum_k_threshold;
+};
+
+struct MatmulProfile {
+  uint32_t preferred_subgroup_size;
+  std::array<MatmulFamilySpec, 3> aligned;
+  std::array<MatmulFamilySpec, 3> unaligned;
+};
+
+struct MatmulDispatchTuning {
+  std::vector<uint32_t> specialization_constants;
+  MatmulFamily family{MatmulFamily::Small};
+  bool aligned{false};
+  bool prefer_fp32_accum{false};
+  uint32_t split_k_threshold{0};
+};
+
+constexpr std::array<uint32_t, 11> kSafeMatmulSpec =
+    {32, 32, 32, 16, 32, 32, 2, 2, 2, 1, 32};
+
+std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(
+    Dtype dtype,
+    bool prefer_fp32_accum) {
   switch (dtype) {
     case float16:
-      return {
-          vulkan::StaticShaderId::matmul_f16,
-          vulkan::StaticShaderId::matmul_f16_fp32,
-      };
+      return prefer_fp32_accum
+          ? std::vector<vulkan::StaticShaderId>{
+                vulkan::StaticShaderId::matmul_f16_fp32,
+                vulkan::StaticShaderId::matmul_f16,
+            }
+          : std::vector<vulkan::StaticShaderId>{
+                vulkan::StaticShaderId::matmul_f16,
+                vulkan::StaticShaderId::matmul_f16_fp32,
+            };
     case bfloat16:
       if (!vulkan::VulkanContext::get().shader_bfloat16_supported()) {
         return {};
       }
-      return {
-          vulkan::StaticShaderId::matmul_bf16,
-          vulkan::StaticShaderId::matmul_bf16_fp32,
-      };
+      return prefer_fp32_accum
+          ? std::vector<vulkan::StaticShaderId>{
+                vulkan::StaticShaderId::matmul_bf16_fp32,
+                vulkan::StaticShaderId::matmul_bf16,
+            }
+          : std::vector<vulkan::StaticShaderId>{
+                vulkan::StaticShaderId::matmul_bf16,
+                vulkan::StaticShaderId::matmul_bf16_fp32,
+            };
     case float32:
       return {
           vulkan::StaticShaderId::matmul_f32_f32_fp32,
@@ -217,6 +279,139 @@ std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(Dtype dtype) {
     default:
       return {};
   }
+}
+
+const char* matmul_family_name(MatmulFamily family) {
+  switch (family) {
+    case MatmulFamily::Small:
+      return "small";
+    case MatmulFamily::Medium:
+      return "medium";
+    case MatmulFamily::Large:
+      return "large";
+  }
+  return "small";
+}
+
+MatmulProfile default_matmul_profile(uint32_t subgroup_size) {
+  (void)subgroup_size;
+  return {
+      32,
+      {{{kSafeMatmulSpec, 512},
+        {kSafeMatmulSpec, 1024},
+        {kSafeMatmulSpec, 2048}}},
+      {{{kSafeMatmulSpec, 512},
+        {kSafeMatmulSpec, 768},
+        {kSafeMatmulSpec, 1536}}},
+  };
+}
+
+MatmulProfile matmul_profile_for_device() {
+  const auto& ctx = vulkan::VulkanContext::get();
+  const uint32_t device_subgroup = std::max(ctx.subgroup_size(), 32u);
+
+  switch (ctx.architecture()) {
+    case vulkan::GpuArchitecture::AmdRdna:
+      return {
+          std::max(device_subgroup, 64u),
+          {{{kSafeMatmulSpec, 768},
+            {kSafeMatmulSpec, 1536},
+            {kSafeMatmulSpec, 3072}}},
+          {{{kSafeMatmulSpec, 512},
+            {kSafeMatmulSpec, 1024},
+            {kSafeMatmulSpec, 2048}}},
+      };
+    case vulkan::GpuArchitecture::Nvidia:
+      return {
+          32,
+          {{{kSafeMatmulSpec, 2048},
+            {kSafeMatmulSpec, 4096},
+            {kSafeMatmulSpec, 8192}}},
+          {{{kSafeMatmulSpec, 1024},
+            {kSafeMatmulSpec, 2048},
+            {kSafeMatmulSpec, 4096}}},
+      };
+    case vulkan::GpuArchitecture::Intel:
+    case vulkan::GpuArchitecture::Apple:
+    case vulkan::GpuArchitecture::Qualcomm:
+      return {
+          32,
+          {{{kSafeMatmulSpec, 768},
+            {kSafeMatmulSpec, 1536},
+            {kSafeMatmulSpec, 3072}}},
+          {{{kSafeMatmulSpec, 512},
+            {kSafeMatmulSpec, 1024},
+            {kSafeMatmulSpec, 2048}}},
+      };
+    case vulkan::GpuArchitecture::AmdCdna:
+    case vulkan::GpuArchitecture::Unknown:
+      return default_matmul_profile(device_subgroup);
+  }
+  return default_matmul_profile(device_subgroup);
+}
+
+MatmulFamily classify_matmul_family(uint32_t m, uint32_t n, uint32_t k) {
+  const uint64_t mn = static_cast<uint64_t>(m) * static_cast<uint64_t>(n);
+  if (m <= 32 || n <= 32 || mn <= 4096 || k <= 256) {
+    return MatmulFamily::Small;
+  }
+  if (mn <= 65536 || k <= 2048) {
+    return MatmulFamily::Medium;
+  }
+  return MatmulFamily::Large;
+}
+
+bool matmul_inputs_aligned(uint32_t m, uint32_t n, uint32_t k) {
+  return (m % 4u) == 0 && (n % 8u) == 0 && (k % 8u) == 0;
+}
+
+uint32_t round_up_div(uint32_t value, uint32_t divisor) {
+  return (value + divisor - 1u) / divisor;
+}
+
+uint32_t
+choose_split_k(uint32_t k, uint32_t num_batches, uint32_t split_k_threshold) {
+  if (split_k_threshold == 0 || k < split_k_threshold || num_batches > 2u) {
+    return 1u;
+  }
+
+  uint32_t split_k = round_up_div(k, split_k_threshold);
+  split_k = std::clamp(split_k, 1u, 8u);
+
+  if (k / split_k < 64u) {
+    return 1u;
+  }
+
+  return split_k;
+}
+
+MatmulDispatchTuning
+select_matmul_dispatch_tuning(Dtype dtype, uint32_t m, uint32_t n, uint32_t k) {
+  const auto profile = matmul_profile_for_device();
+  const bool aligned = matmul_inputs_aligned(m, n, k);
+  const MatmulFamily family = classify_matmul_family(m, n, k);
+  const size_t family_index = static_cast<size_t>(family);
+  const auto& family_spec =
+      aligned ? profile.aligned[family_index] : profile.unaligned[family_index];
+
+  MatmulDispatchTuning tuning;
+  tuning.specialization_constants.assign(
+      family_spec.spec.begin(), family_spec.spec.end());
+  tuning.family = family;
+  tuning.aligned = aligned;
+  tuning.split_k_threshold = family_spec.fp32_accum_k_threshold;
+  tuning.prefer_fp32_accum = dtype == float32 ||
+      (dtype != float32 && k >= family_spec.fp32_accum_k_threshold);
+
+  if (const auto& ctx = vulkan::VulkanContext::get();
+      !ctx.cooperative_matrix_supported() &&
+      ctx.architecture() == vulkan::GpuArchitecture::AmdRdna &&
+      tuning.specialization_constants.size() > 0) {
+    tuning.specialization_constants[0] =
+        std::min(tuning.specialization_constants[0], 64u);
+  }
+
+  return tuning;
 }
 
 bool is_row_contiguous_zero_offset(const array& arr) {
@@ -505,14 +700,15 @@ bool try_eval_mul_mm_vulkan(
     return false;
   }
 
-  auto shader_candidates = mul_mm_shader_candidates(a.dtype());
-  if (shader_candidates.empty()) {
-    return false;
-  }
-
   const uint32_t m = static_cast<uint32_t>(out.shape(-2));
   const uint32_t n = static_cast<uint32_t>(out.shape(-1));
   const uint32_t k = static_cast<uint32_t>(a.shape(-1));
+  auto tuning = select_matmul_dispatch_tuning(a.dtype(), m, n, k);
+  auto shader_candidates =
+      mul_mm_shader_candidates(a.dtype(), tuning.prefer_fp32_accum);
+  if (shader_candidates.empty()) {
+    return false;
+  }
 
   const uint32_t batch_stride_a =
       static_cast<uint32_t>(a.shape(-2) * a.shape(-1));
@@ -533,6 +729,30 @@ bool try_eval_mul_mm_vulkan(
     return false;
   }
   const uint32_t num_batches = static_cast<uint32_t>(num_batches_u64);
+  const uint32_t split_k =
+      choose_split_k(k, num_batches, tuning.split_k_threshold);
+
+  std::optional<array> split_k_out;
+  if (split_k > 1u) {
+    const uint64_t split_k_elems = static_cast<uint64_t>(batch_stride_d) *
+        static_cast<uint64_t>(num_batches) * static_cast<uint64_t>(split_k);
+    if (split_k_elems >
+        static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+    split_k_out = vulkan::acquire_scratch_array(
+        s,
+        kMulMmSplitKScratchLane,
+        {
+            static_cast<int>(split_k * num_batches),
+            static_cast<int>(n),
+            static_cast<int>(m),
+        },
+        float32);
+    if (!ensure_vulkan_buffer(*split_k_out, s)) {
+      return false;
+    }
+  }
 
   if (num_batches > 1) {
     ::mlx::core::gpu::synchronize(s);
@@ -549,15 +769,21 @@ bool try_eval_mul_mm_vulkan(
   push_constants.batch_stride_b = batch_stride_b;
   push_constants.batch_stride_d = batch_stride_d;
   push_constants.num_batches = num_batches;
-  push_constants.k_split = k;
+  push_constants.k_split = round_up_div(k, split_k);
   push_constants.ne02 = num_batches;
   push_constants.ne12 = num_batches;
   push_constants.broadcast2 = 1;
   push_constants.broadcast3 = 1;
   push_constants.padded_N = n;
 
-  const uint32_t blocks_m = (m + kMulMmTileM - 1) / kMulMmTileM;
-  const uint32_t blocks_n = (n + kMulMmTileN - 1) / kMulMmTileN;
+  const uint32_t tile_m = tuning.specialization_constants.size() > 1
+      ? tuning.specialization_constants[1]
+      : 32u;
+  const uint32_t tile_n = tuning.specialization_constants.size() > 2
+      ? tuning.specialization_constants[2]
+      : 32u;
+  const uint32_t blocks_m = (m + tile_m - 1) / tile_m;
+  const uint32_t blocks_n = (n + tile_n - 1) / tile_n;
 
   if (matmul_debug_enabled()) {
     std::cerr << "[vulkan::mul_mm] a_shape=" << a.shape()
@@ -568,38 +794,75 @@ bool try_eval_mul_mm_vulkan(
               << "," << n << "," << k
               << " stride(a,b,d)=" << push_constants.stride_a << ","
               << push_constants.stride_b << "," << push_constants.stride_d
-              << " batch=" << num_batches << "\n";
+              << " batch=" << num_batches
+              << " family=" << matmul_family_name(tuning.family)
+              << " aligned=" << tuning.aligned
+              << " subgroup=" << tuning.specialization_constants[10]
+              << " fp32_accum=" << tuning.prefer_fp32_accum
+              << " split_k_threshold=" << tuning.split_k_threshold
+              << " split_k=" << split_k << "\n";
   }
 
   for (const auto shader_id : shader_candidates) {
     bool dispatched = true;
     bool should_recover_stream = false;
-    for (uint32_t base_z = 0; base_z < num_batches; base_z += kMaxGridZ) {
-      const uint32_t chunk_z = std::min(kMaxGridZ, num_batches - base_z);
-      push_constants.base_work_group_z = base_z;
-      const std::array<uint32_t, 3> grid = {blocks_m, blocks_n, chunk_z};
+    try {
+      auto command_buffer = vulkan::begin_command_recording(s.index);
+      for (uint32_t base_z = 0; base_z < num_batches; base_z += kMaxGridZ) {
+        const uint32_t chunk_z = std::min(kMaxGridZ, num_batches - base_z);
+        push_constants.base_work_group_z = base_z;
+        const std::array<uint32_t, 3> grid = {
+            blocks_m * split_k,
+            blocks_n,
+            chunk_z,
+        };
 
-      try {
-        auto command_buffer = vulkan::begin_command_recording(s.index);
         vulkan::dispatch_mul_mm_op(
-            a, b_t, out_t, shader_id, command_buffer, s, push_constants, grid);
-        vulkan::end_command_recording(s.index);
-      } catch (const std::runtime_error& e) {
-        if (matmul_debug_enabled()) {
-          std::cerr << "[vulkan::mul_mm] shader="
-                    << vulkan::static_shader_name(shader_id)
-                    << " failed: " << e.what() << "\n";
-        }
-        const std::string message = e.what();
-        if (message.find("[vulkan::submit_commands]") != std::string::npos ||
-            message.find("VkResult=") != std::string::npos) {
-          should_recover_stream = true;
-        }
-        dispatched = false;
+            a,
+            b_t,
+            split_k_out.has_value() ? *split_k_out : out_t,
+            shader_id,
+            command_buffer,
+            s,
+            push_constants,
+            grid,
+            tuning.specialization_constants);
       }
-      if (!dispatched) {
-        break;
+
+      if (split_k_out.has_value()) {
+        insert_compute_barrier(command_buffer);
+        vulkan::MatmulSplitKReducePushConstants reduce_push_constants{};
+        reduce_push_constants.ne = batch_stride_d * num_batches;
+        reduce_push_constants.k_num = split_k;
+        vulkan::dispatch_matmul_split_k_reduce_op(
+            *split_k_out,
+            out_t,
+            vulkan::StaticShaderId::split_k_reduce,
+            command_buffer,
+            s,
+            reduce_push_constants,
+            {
+                round_up_div(batch_stride_d * num_batches, 256u),
+                1u,
+                1u,
+            },
+            {});
+        vulkan::mark_scratch_array_written(s, kMulMmSplitKScratchLane);
       }
+
+      vulkan::end_command_recording(s.index);
+    } catch (const std::runtime_error& e) {
+      if (matmul_debug_enabled()) {
+        std::cerr << "[vulkan::mul_mm] shader="
+                  << vulkan::static_shader_name(shader_id)
+                  << " failed: " << e.what() << "\n";
+      }
+      const std::string message = e.what();
+      if (message.find("[vulkan::submit_commands]") != std::string::npos ||
+          message.find("VkResult=") != std::string::npos) {
+        should_recover_stream = true;
+      }
+      dispatched = false;
     }
 
     if (dispatched) {

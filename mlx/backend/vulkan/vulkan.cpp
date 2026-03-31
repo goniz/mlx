@@ -91,8 +91,7 @@ QueueFamilyIndices find_queue_families(vk::PhysicalDevice physical_device) {
   indices.compute_family = compute_family;
   indices.transfer_family = compute_family;
 
-  const bool distinct_transfer_family =
-      (compute_family != transfer_family) &&
+  const bool distinct_transfer_family = (compute_family != transfer_family) &&
       (queue_families[transfer_family].queueFlags &
        vk::QueueFlagBits::eTransfer) != vk::QueueFlagBits{};
   if (distinct_transfer_family) {
@@ -121,6 +120,33 @@ bool has_device_extension(
       [name](const vk::ExtensionProperties& ext) {
         return std::string(ext.extensionName) == name;
       });
+}
+
+bool device_name_contains(const std::string& name, const char* needle) {
+  return name.find(needle) != std::string::npos;
+}
+
+GpuArchitecture classify_gpu_architecture(
+    uint32_t vendor_id,
+    const std::string& device_name) {
+  switch (vendor_id) {
+    case 0x1002u:
+      if (device_name_contains(device_name, "Instinct") ||
+          device_name_contains(device_name, "MI")) {
+        return GpuArchitecture::AmdCdna;
+      }
+      return GpuArchitecture::AmdRdna;
+    case 0x10DEu:
+      return GpuArchitecture::Nvidia;
+    case 0x8086u:
+      return GpuArchitecture::Intel;
+    case 0x106Bu:
+      return GpuArchitecture::Apple;
+    case 0x5143u:
+      return GpuArchitecture::Qualcomm;
+    default:
+      return GpuArchitecture::Unknown;
+  }
 }
 
 bool bf16_capability_debug_enabled() {
@@ -323,8 +349,13 @@ void VulkanContext::init() {
   bool subgroup_require_full_support = false;
   uint32_t subgroup_min_size = 0;
   uint32_t subgroup_max_size = 0;
+  uint32_t subgroup_size = 0;
   bool pipeline_robustness_supported = false;
+  bool cooperative_matrix_supported = false;
   bool coopmat_flash_attention_f32acc_supported = false;
+  bool integer_dot_product_supported = false;
+  uint32_t vendor_id = 0;
+  GpuArchitecture architecture = GpuArchitecture::Unknown;
   vk::PhysicalDeviceMemoryProperties mem_properties;
   vk::Semaphore timeline_semaphore;
   uint64_t timeline_value = 0;
@@ -393,6 +424,9 @@ void VulkanContext::init() {
         has_device_extension(extensions, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
 
     auto device_properties = physical_device.getProperties();
+    vendor_id = device_properties.vendorID;
+    architecture = classify_gpu_architecture(
+        vendor_id, std::string(device_properties.deviceName));
 
     is_unified_memory =
         (device_properties.deviceType ==
@@ -451,6 +485,9 @@ void VulkanContext::init() {
     vk::PhysicalDeviceShaderFloat16Int8Features supported_shader_float16_int8;
     supported_features.pNext = &supported_vulkan11_features;
     supported_vulkan11_features.pNext = &supported_shader_float16_int8;
+    vk::PhysicalDeviceShaderIntegerDotProductFeatures
+        supported_shader_integer_dot_product{};
+    supported_shader_float16_int8.pNext = &supported_shader_integer_dot_product;
 
     vk::PhysicalDeviceSubgroupSizeControlFeatures
         supported_subgroup_size_control{};
@@ -461,7 +498,8 @@ void VulkanContext::init() {
     vk::PhysicalDeviceShaderBfloat16FeaturesKHR supported_shader_bfloat16{};
 
     if (has_subgroup_size_control_ext) {
-      supported_shader_float16_int8.pNext = &supported_subgroup_size_control;
+      supported_shader_integer_dot_product.pNext =
+          &supported_subgroup_size_control;
       if (has_pipeline_robustness_ext) {
         supported_subgroup_size_control.pNext = &supported_pipeline_robustness;
         if (has_cooperative_matrix_ext) {
@@ -478,10 +516,11 @@ void VulkanContext::init() {
           supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
         }
       } else if (has_shader_bfloat16_ext) {
-        supported_shader_float16_int8.pNext = &supported_shader_bfloat16;
+        supported_shader_integer_dot_product.pNext = &supported_shader_bfloat16;
       }
     } else if (has_pipeline_robustness_ext) {
-      supported_shader_float16_int8.pNext = &supported_pipeline_robustness;
+      supported_shader_integer_dot_product.pNext =
+          &supported_pipeline_robustness;
       if (has_cooperative_matrix_ext) {
         supported_pipeline_robustness.pNext = &supported_cooperative_matrix;
         if (has_shader_bfloat16_ext) {
@@ -491,21 +530,28 @@ void VulkanContext::init() {
         supported_pipeline_robustness.pNext = &supported_shader_bfloat16;
       }
     } else if (has_cooperative_matrix_ext) {
-      supported_shader_float16_int8.pNext = &supported_cooperative_matrix;
+      supported_shader_integer_dot_product.pNext =
+          &supported_cooperative_matrix;
       if (has_shader_bfloat16_ext) {
         supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
       }
     } else if (has_shader_bfloat16_ext) {
-      supported_shader_float16_int8.pNext = &supported_shader_bfloat16;
+      supported_shader_integer_dot_product.pNext = &supported_shader_bfloat16;
     }
 
     physical_device.getFeatures2(&supported_features);
 
     // Query subgroup size control properties
+    vk::PhysicalDeviceSubgroupProperties subgroup_props{};
     vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control_props;
+    vk::PhysicalDeviceShaderIntegerDotProductProperties
+        shader_integer_dot_product_props{};
     vk::PhysicalDeviceProperties2 props2;
-    props2.pNext = &subgroup_size_control_props;
+    props2.pNext = &subgroup_props;
+    subgroup_props.pNext = &subgroup_size_control_props;
+    subgroup_size_control_props.pNext = &shader_integer_dot_product_props;
     physical_device.getProperties2(&props2);
+    subgroup_size = subgroup_props.subgroupSize;
 
     // Build enabled features
     vk::PhysicalDeviceFeatures2 enabled_features;
@@ -513,6 +559,9 @@ void VulkanContext::init() {
     vk::PhysicalDeviceShaderFloat16Int8Features enabled_shader_float16_int8;
     enabled_features.pNext = &enabled_vulkan11_features;
     enabled_vulkan11_features.pNext = &enabled_shader_float16_int8;
+    vk::PhysicalDeviceShaderIntegerDotProductFeatures
+        enabled_shader_integer_dot_product{};
+    enabled_shader_float16_int8.pNext = &enabled_shader_integer_dot_product;
 
     vk::PhysicalDeviceSubgroupSizeControlFeatures
         enabled_subgroup_size_control{};
@@ -523,7 +572,7 @@ void VulkanContext::init() {
 
     // Link enabled feature chain (same pattern as supported features)
     if (has_subgroup_size_control_ext) {
-      enabled_shader_float16_int8.pNext = &enabled_subgroup_size_control;
+      enabled_shader_integer_dot_product.pNext = &enabled_subgroup_size_control;
       if (has_pipeline_robustness_ext) {
         enabled_subgroup_size_control.pNext = &enabled_pipeline_robustness;
         if (has_cooperative_matrix_ext) {
@@ -540,10 +589,10 @@ void VulkanContext::init() {
           enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
         }
       } else if (has_shader_bfloat16_ext) {
-        enabled_shader_float16_int8.pNext = &enabled_shader_bfloat16;
+        enabled_shader_integer_dot_product.pNext = &enabled_shader_bfloat16;
       }
     } else if (has_pipeline_robustness_ext) {
-      enabled_shader_float16_int8.pNext = &enabled_pipeline_robustness;
+      enabled_shader_integer_dot_product.pNext = &enabled_pipeline_robustness;
       if (has_cooperative_matrix_ext) {
         enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
         if (has_shader_bfloat16_ext) {
@@ -553,12 +602,12 @@ void VulkanContext::init() {
         enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
       }
     } else if (has_cooperative_matrix_ext) {
-      enabled_shader_float16_int8.pNext = &enabled_cooperative_matrix;
+      enabled_shader_integer_dot_product.pNext = &enabled_cooperative_matrix;
       if (has_shader_bfloat16_ext) {
         enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
       }
     } else if (has_shader_bfloat16_ext) {
-      enabled_shader_float16_int8.pNext = &enabled_shader_bfloat16;
+      enabled_shader_integer_dot_product.pNext = &enabled_shader_bfloat16;
     }
 
     if (supported_vulkan11_features.storageBuffer16BitAccess) {
@@ -595,9 +644,14 @@ void VulkanContext::init() {
       enabled_pipeline_robustness.pipelineRobustness = VK_TRUE;
       pipeline_robustness_supported = true;
     }
+    if (supported_shader_integer_dot_product.shaderIntegerDotProduct) {
+      enabled_shader_integer_dot_product.shaderIntegerDotProduct = VK_TRUE;
+      integer_dot_product_supported = true;
+    }
     if (has_cooperative_matrix_ext &&
         supported_cooperative_matrix.cooperativeMatrix) {
       enabled_cooperative_matrix.cooperativeMatrix = VK_TRUE;
+      cooperative_matrix_supported = true;
       coopmat_flash_attention_f32acc_supported = false;
 
       // Check for flash attention support
@@ -665,7 +719,8 @@ void VulkanContext::init() {
     device = physical_device.createDevice(device_create_info);
 
     // 5. Get queues and create timeline semaphore
-    compute_queue = device.getQueue(compute_queue_family_index, compute_queue_index);
+    compute_queue =
+        device.getQueue(compute_queue_family_index, compute_queue_index);
     if (has_separate_transfer_queue) {
       transfer_queue =
           device.getQueue(transfer_queue_family_index, transfer_queue_index);
@@ -702,10 +757,15 @@ void VulkanContext::init() {
     this->subgroup_require_full_support_ = subgroup_require_full_support;
     this->subgroup_min_size_ = subgroup_min_size;
     this->subgroup_max_size_ = subgroup_max_size;
+    this->subgroup_size_ = subgroup_size;
     this->pipeline_robustness_supported_ = pipeline_robustness_supported;
+    this->cooperative_matrix_supported_ = cooperative_matrix_supported;
     this->coopmat_flash_attention_f32acc_supported_ =
         coopmat_flash_attention_f32acc_supported &&
         subgroup_require_full_support;
+    this->integer_dot_product_supported_ = integer_dot_product_supported;
+    this->vendor_id_ = vendor_id;
+    this->architecture_ = architecture;
     initialized_ = true;
   } catch (...) {
     // Clean up partially initialized resources on failure
@@ -759,8 +819,13 @@ void VulkanContext::cleanup() {
   subgroup_require_full_support_ = false;
   subgroup_min_size_ = 0;
   subgroup_max_size_ = 0;
+  subgroup_size_ = 0;
   pipeline_robustness_supported_ = false;
+  cooperative_matrix_supported_ = false;
   coopmat_flash_attention_f32acc_supported_ = false;
+  integer_dot_product_supported_ = false;
+  vendor_id_ = 0;
+  architecture_ = GpuArchitecture::Unknown;
 
   // Clear memory properties by creating a default-constructed one
   vk::PhysicalDeviceMemoryProperties empty_props;

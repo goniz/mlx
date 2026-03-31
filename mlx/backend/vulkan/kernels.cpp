@@ -26,11 +26,11 @@ constexpr char kCumsumMultipassScratchLane[] = "cumsum.multipass.tmp";
 
 bool trace_descriptor_epochs_enabled() {
   static const bool enabled = []() {
-    if (const char* env = std::getenv("MLX_VULKAN_TRACE_SYNC");
+    if (const char* env = std::getenv("MLX_VULKAN_TRACE_DESCRIPTORS");
         env != nullptr) {
       return std::string(env) != "0";
     }
-    if (const char* env = std::getenv("MLX_VULKAN_TRACE_DESCRIPTORS");
+    if (const char* env = std::getenv("MLX_VULKAN_TRACE_SYNC");
         env != nullptr) {
       return std::string(env) != "0";
     }

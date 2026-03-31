@@ -30,6 +30,8 @@ using mlx::core::Shape;
 using mlx::core::Strides;
 namespace vulkan = mlx::core::vulkan;
 
+constexpr size_t kMinTransferQueueCopyBytes = 256 * 1024;
+
 std::string copy_dtype_suffix(Dtype dtype);
 
 bool has_row_contiguous_strides(const mlx::core::array& arr) {
@@ -336,40 +338,17 @@ std::string build_dynamic_general_copy_shader(
   }
   if (!shape.empty()) {
     os << "  uint remaining = linear_idx;\n";
-    os << "  const uint shape_dims[" << shape.size() << "] = uint["
-       << shape.size() << "](";
-    for (size_t i = 0; i < shape.size(); ++i) {
-      if (i > 0) {
-        os << ", ";
-      }
-      os << static_cast<uint32_t>(shape[i]);
+    for (int dim = static_cast<int>(shape.size()) - 1; dim >= 0; --dim) {
+      os << "  {\n";
+      os << "    uint coord = remaining % " << static_cast<uint32_t>(shape[dim])
+         << "u;\n";
+      os << "    remaining /= " << static_cast<uint32_t>(shape[dim]) << "u;\n";
+      os << "    input_index += int64_t(coord) * int64_t(" << i_strides[dim]
+         << ");\n";
+      os << "    output_index += int64_t(coord) * int64_t(" << o_strides[dim]
+         << ");\n";
+      os << "  }\n";
     }
-    os << ");\n";
-    os << "  const int64_t input_strides[" << i_strides.size() << "] = int64_t["
-       << i_strides.size() << "](";
-    for (size_t i = 0; i < i_strides.size(); ++i) {
-      if (i > 0) {
-        os << ", ";
-      }
-      os << i_strides[i];
-    }
-    os << ");\n";
-    os << "  const int64_t output_strides[" << o_strides.size()
-       << "] = int64_t[" << o_strides.size() << "](";
-    for (size_t i = 0; i < o_strides.size(); ++i) {
-      if (i > 0) {
-        os << ", ";
-      }
-      os << o_strides[i];
-    }
-    os << ");\n";
-    os << "  for (int dim = " << (static_cast<int>(shape.size()) - 1)
-       << "; dim >= 0; --dim) {\n";
-    os << "    uint coord = remaining % shape_dims[dim];\n";
-    os << "    remaining /= shape_dims[dim];\n";
-    os << "    input_index += int64_t(coord) * input_strides[dim];\n";
-    os << "    output_index += int64_t(coord) * output_strides[dim];\n";
-    os << "  }\n";
   }
   os << "  output_buf.data[output_index] = input_buf.data[input_index];\n";
   os << "}\n";
@@ -918,6 +897,10 @@ bool trace_copy_dispatch_enabled() {
   return enabled;
 }
 
+bool should_use_transfer_queue_for_copy(size_t copy_bytes) {
+  return copy_bytes >= kMinTransferQueueCopyBytes;
+}
+
 std::optional<vulkan::StaticShaderId> get_copy_shader_id(
     const mlx::core::array& in,
     mlx::core::array& out) {
@@ -1401,8 +1384,13 @@ void copy_gpu_inplace(
     return;
   }
 
+  const size_t copy_bytes =
+      static_cast<size_t>(dispatch_elements) * size_of(out.dtype());
+  // Small copies, especially decode-time KV cache updates, are latency
+  // sensitive and do better when they stay in the current compute submission.
   const bool use_transfer_queue =
-      raw_buffer_copy || contiguous_large_rank_copy || segmented_buffer_copy;
+      (raw_buffer_copy || contiguous_large_rank_copy || segmented_buffer_copy) &&
+      should_use_transfer_queue_for_copy(copy_bytes);
   vk::CommandBuffer cmd_buffer = use_transfer_queue
       ? vulkan::begin_transfer_command_recording(s.index)
       : vulkan::begin_command_recording(s.index);

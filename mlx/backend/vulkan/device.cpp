@@ -1395,8 +1395,7 @@ class VulkanDevice {
     resources->compute_command_buffer =
         vk_device.allocateCommandBuffers(compute_alloc_info)[0];
 
-    if (has_separate_transfer &&
-        compute_queue_family != transfer_queue_family) {
+    if (has_separate_transfer) {
       vk::CommandPoolCreateInfo transfer_pool_info(
           vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
           transfer_queue_family);

@@ -7,7 +7,10 @@ FetchContent_MakeAvailable(doctest)
 add_executable(tests ${PROJECT_SOURCE_DIR}/tests/tests.cpp)
 
 if(MLX_BUILD_METAL OR MLX_BUILD_CUDA OR MLX_BUILD_VULKAN)
-  set(METAL_TEST_SOURCES gpu_tests.cpp)
+  set(GPU_TEST_SOURCES gpu_tests.cpp)
+  if(MLX_BUILD_VULKAN)
+    list(APPEND GPU_TEST_SOURCES vulkan_multi_queue_tests.cpp)
+  endif()
 endif()
 
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
@@ -34,11 +37,15 @@ target_sources(
           utils_tests.cpp
           vmap_tests.cpp
           linalg_tests.cpp
-          ${METAL_TEST_SOURCES})
+          ${GPU_TEST_SOURCES})
 
 target_link_libraries(tests PRIVATE mlx doctest)
 target_compile_options(tests PRIVATE ${SANITIZER_COMPILE_FLAGS})
 target_link_options(tests PRIVATE ${SANITIZER_LINK_FLAGS})
+
+if(MLX_BUILD_VULKAN)
+  target_compile_definitions(tests PRIVATE MLX_BUILD_VULKAN)
+endif()
 
 doctest_discover_tests(tests)
 add_test(NAME tests COMMAND tests)

@@ -501,6 +501,31 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             gpu_out = self._run_on_device(mx.gpu, run_copy)
             self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
 
+    def test_host_staging_arena_growth_and_reuse_vulkan_gpu(self):
+        for cycle in range(3):
+            host_srcs = [
+                self._run_on_device(
+                    mx.cpu,
+                    lambda start=start: mx.arange(
+                        start,
+                        start + 128 * 1024,
+                        dtype=mx.float32,
+                    ),
+                )
+                for start in (cycle, cycle + 1, cycle + 2)
+            ]
+
+            def run_copy(host_srcs=host_srcs):
+                parts = [
+                    host_src[1024:-1024].astype(mx.float16).astype(mx.float32)
+                    for host_src in host_srcs
+                ]
+                return mx.concatenate(parts, axis=0)
+
+            cpu_out = self._run_on_device(mx.cpu, run_copy)
+            gpu_out = self._run_on_device(mx.gpu, run_copy)
+            self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
+
 
 def _cases():
     return [

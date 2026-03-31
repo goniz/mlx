@@ -1,4 +1,3 @@
-// Copyright © 2024 Apple Inc.
 // Multi-queue decode correctness and queue-ownership stress tests for Vulkan backend.
 
 #include <atomic>
@@ -19,14 +18,23 @@ using namespace mlx::core;
 
 #ifdef MLX_BUILD_VULKAN
 
-// Timeout handling for stress tests
+// Timeout handling for stress tests - uses generation counter to prevent
+// stale timeout threads from affecting later tests
 static std::atomic<bool> g_test_timeout_reached{false};
+static std::atomic<uint64_t> g_timeout_generation{0};
 
 static void set_test_timeout(int seconds) {
-  g_test_timeout_reached = false;
-  std::thread([seconds]() {
+  uint64_t current_gen = g_timeout_generation.fetch_add(1) + 1;
+  g_test_timeout_reached.store(false);
+  
+  std::thread([seconds, current_gen]() {
     std::this_thread::sleep_for(std::chrono::seconds(seconds));
-    g_test_timeout_reached = true;
+    // Only set timeout if generation hasn't changed (i.e., we're still in the same test)
+    uint64_t expected_gen = current_gen;
+    // This is a best-effort check - we only set the flag if generation matches
+    if (g_timeout_generation.load() == current_gen) {
+      g_test_timeout_reached.store(true);
+    }
   }).detach();
 }
 
@@ -95,26 +103,37 @@ void run_decode_kv_append_workload(
   synchronize(compute_stream);
 }
 
-// Cross-queue handoff stress test: upload -> compute -> readback
+// Cross-queue handoff stress test: upload -> compute -> readback with correctness check
 void run_cross_queue_handoff_stress(int iterations, int data_size) {
   auto stream = new_stream(Device::gpu);
   
   for (int i = 0; i < iterations && !check_timeout(); ++i) {
-    // Stage 1: Create data on CPU
+    // Stage 1: Create deterministic data on CPU
     auto host_data = arange(0, data_size, float32, Device::cpu) / static_cast<float>(data_size);
     
-    // Stage 2: Compute on GPU (compute queue) - move to GPU via stream
+    // Compute reference result on CPU
+    auto cpu_result = square(host_data) + host_data * 2.0f + 1.0f;
+    eval(cpu_result);
+    
+    // Stage 2: Compute on GPU (compute queue) - move to GPU via astype
     auto gpu_data = astype(host_data, float32, Device::gpu);
-    auto result = square(gpu_data) + gpu_data * 2.0f + 1.0f;
+    auto gpu_result = square(gpu_data) + gpu_data * 2.0f + 1.0f;
     
     // Stage 3: Readback to CPU
-    auto host_result = astype(result, float32, Device::cpu);
+    auto host_result = astype(gpu_result, float32, Device::cpu);
     
     // Verify correctness
     eval(host_result);
     synchronize(stream);
     
-    // Basic sanity check - use sum to get scalar and check it's finite
+    // Verify GPU result matches CPU reference (with small tolerance for floating point)
+    auto diff = abs(host_result - cpu_result);
+    auto max_diff = max(diff);
+    eval(max_diff);
+    float max_diff_val = max_diff.item<float>();
+    CHECK(max_diff_val < 1e-5f);
+    
+    // Also verify result values are finite
     auto scalar_check = sum(host_result);
     eval(scalar_check);
     float val = scalar_check.item<float>();
@@ -297,22 +316,22 @@ TEST_CASE("vulkan multi-queue: cross-queue synchronization") {
   auto stream1 = new_stream(Device::gpu);
   auto stream2 = new_stream(Device::gpu);
   
-  // Run operations on different streams that depend on same data
+  // Create shared data on GPU
   auto shared = arange(0, 1000, float32, Device::gpu) / 1000.0f;
+  eval(shared);
   
-  // Stream 1: heavy computation
+  // Stream 1: heavy computation on shared data
   auto result1 = square(shared);
   for (int i = 0; i < 5; ++i) {
     result1 = square(result1);
   }
-  
-  // Stream 2: different computation on same data
-  auto result2 = sqrt(abs(shared));
-  
-  // Both should produce correct results
   eval(result1);
+  
+  // Stream 2: different computation on same shared data
+  auto result2 = sqrt(abs(shared));
   eval(result2);
   
+  // Synchronize both streams to ensure all work is complete
   synchronize(stream1);
   synchronize(stream2);
   

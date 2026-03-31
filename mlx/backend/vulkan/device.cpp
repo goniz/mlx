@@ -372,6 +372,15 @@ struct ScratchSlot {
   bool needs_barrier{false};
 };
 
+struct StagingScratchOwner {
+  std::shared_ptr<array::Data> owner;
+  size_t bytes{0};
+  bool in_use{false};
+};
+
+constexpr char kStagingUploadScratchLane[] = "staging.upload";
+constexpr char kStagingReadbackScratchLane[] = "staging.readback";
+
 std::shared_ptr<array::Data> make_owned_staging_allocation(size_t size) {
   auto data = std::make_shared<array::Data>(allocator::malloc(size));
   auto* buffer = static_cast<VulkanBuffer*>(data->buffer.ptr());
@@ -440,6 +449,7 @@ struct StreamData {
   std::vector<BufferAccessRange> unsynced_reads;
   std::vector<BufferAccessRange> unsynced_writes;
   std::unordered_map<std::string, ScratchSlot> scratch_slots;
+  std::unordered_map<std::string, std::vector<StagingScratchOwner>> staging_slots;
   std::deque<std::string> recent_primitives;
   uint64_t deferred_total_bytes{0};
   uint64_t deferred_heavy_bytes{0};
@@ -667,6 +677,89 @@ class VulkanDevice {
     }
 
     return make_scratch_view(*slot.owner, std::move(shape), dtype);
+  }
+
+  std::shared_ptr<array::Data> acquire_staging_scratch(
+      const Stream& s,
+      const std::string& lane,
+      size_t bytes) {
+    auto* stream = get_stream(s.index);
+    retire_submissions(stream, false);
+
+    auto& owners = stream->staging_slots[lane];
+    StagingScratchOwner* best_fit = nullptr;
+    StagingScratchOwner* growable = nullptr;
+
+    for (auto& owner : owners) {
+      if (owner.in_use) {
+        continue;
+      }
+      if (owner.bytes >= bytes) {
+        if (best_fit == nullptr || owner.bytes < best_fit->bytes) {
+          best_fit = &owner;
+        }
+      } else if (growable == nullptr) {
+        growable = &owner;
+      }
+    }
+
+    StagingScratchOwner* selected = best_fit;
+    if (selected == nullptr) {
+      selected = growable;
+      if (selected == nullptr) {
+        owners.push_back(
+            StagingScratchOwner{make_owned_staging_allocation(bytes), bytes, false});
+        selected = &owners.back();
+      } else {
+        selected->owner = make_owned_staging_allocation(bytes);
+        selected->bytes = bytes;
+      }
+    }
+
+    selected->in_use = true;
+    return selected->owner;
+  }
+
+  void release_staging_scratch(
+      StreamData* stream,
+      const std::string& lane,
+      const array::Data* owner_data) {
+    if (stream == nullptr || owner_data == nullptr) {
+      return;
+    }
+
+    auto it = stream->staging_slots.find(lane);
+    if (it == stream->staging_slots.end()) {
+      return;
+    }
+
+    for (auto& owner : it->second) {
+      if (owner.owner.get() == owner_data) {
+        owner.in_use = false;
+        return;
+      }
+    }
+  }
+
+  void retain_data(int stream_index, std::shared_ptr<array::Data> data) {
+    if (!data) {
+      return;
+    }
+
+    auto* stream = get_stream(stream_index);
+    if (stream->recording) {
+      if (stream->recording_ref_ids.insert(data.get()).second) {
+        stream->recording_refs.push_back(std::move(data));
+      }
+      return;
+    }
+
+    if (!stream->in_flight_submissions.empty()) {
+      auto& submission = stream->in_flight_submissions.back();
+      if (submission.ref_ids.insert(data.get()).second) {
+        submission.refs.push_back(std::move(data));
+      }
+    }
   }
 
   void mark_scratch_written(const Stream& s, const std::string& lane) {
@@ -1808,8 +1901,15 @@ void enqueue_owned_staging_upload(
         "[vulkan::enqueue_owned_staging_upload] Null destination buffer.");
   }
 
-  auto staging = make_owned_staging_allocation(size);
-  auto* staging_buffer = get_vulkan_buffer(staging);
+  auto* stream = VulkanDevice::get().get_stream(s.index);
+  auto staging_data = VulkanDevice::get().acquire_staging_scratch(
+      s, kStagingUploadScratchLane, size);
+  auto* staging_buffer = get_vulkan_buffer(staging_data);
+  if (staging_buffer == nullptr || staging_buffer->buffer == VK_NULL_HANDLE ||
+      staging_buffer->mapped_ptr == nullptr) {
+    throw std::runtime_error(
+        "[vulkan::staging] Failed to acquire host-visible upload buffer.");
+  }
   std::memcpy(
       static_cast<char*>(staging_buffer->mapped_ptr),
       src,
@@ -1822,7 +1922,13 @@ void enqueue_owned_staging_upload(
   copy_region.size = static_cast<VkDeviceSize>(size);
   command_buffer.copyBuffer(staging_buffer->buffer, dst_buffer, {copy_region});
 
-  retain_shared_for_stream(s, std::static_pointer_cast<void>(staging));
+  VulkanDevice::get().retain_data(s.index, staging_data);
+  add_completion_callback_for_stream(
+      s,
+      [stream, staging_data = std::move(staging_data)]() {
+        VulkanDevice::get().release_staging_scratch(
+            stream, kStagingUploadScratchLane, staging_data.get());
+      });
   end_transfer_command_recording(s.index);
 }
 
@@ -1845,8 +1951,15 @@ void enqueue_owned_staging_readback(
         "[vulkan::enqueue_owned_staging_readback] Null source buffer.");
   }
 
-  auto staging = make_owned_staging_allocation(size);
-  auto* staging_buffer = get_vulkan_buffer(staging);
+  auto* stream = VulkanDevice::get().get_stream(s.index);
+  auto staging_data = VulkanDevice::get().acquire_staging_scratch(
+      s, kStagingReadbackScratchLane, size);
+  auto* staging_buffer = get_vulkan_buffer(staging_data);
+  if (staging_buffer == nullptr || staging_buffer->buffer == VK_NULL_HANDLE ||
+      staging_buffer->mapped_ptr == nullptr) {
+    throw std::runtime_error(
+        "[vulkan::staging] Failed to acquire host-visible readback buffer.");
+  }
 
   vk::CommandBuffer command_buffer = begin_transfer_command_recording(s.index);
   vk::BufferCopy copy_region;
@@ -1855,14 +1968,17 @@ void enqueue_owned_staging_readback(
   copy_region.size = static_cast<VkDeviceSize>(size);
   command_buffer.copyBuffer(src_buffer, staging_buffer->buffer, {copy_region});
 
-  retain_shared_for_stream(s, std::static_pointer_cast<void>(staging));
+  VulkanDevice::get().retain_data(s.index, staging_data);
   add_completion_callback_for_stream(
       s,
-      [staging = std::move(staging),
+      [stream,
+       staging_data = std::move(staging_data),
        size,
        completion = std::move(completion)]() {
-        auto* completed_buffer = get_vulkan_buffer(staging);
+        auto* completed_buffer = get_vulkan_buffer(staging_data);
         completion(completed_buffer->mapped_ptr, size);
+        VulkanDevice::get().release_staging_scratch(
+            stream, kStagingReadbackScratchLane, staging_data.get());
       });
   end_transfer_command_recording(s.index);
 }

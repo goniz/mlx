@@ -20,6 +20,10 @@ namespace mlx::core::vulkan {
 
 namespace {
 
+constexpr char kSoftmaxLargeMaxScratchLane[] = "softmax.large.tmp_max";
+constexpr char kSoftmaxLargeSumScratchLane[] = "softmax.large.tmp_sum";
+constexpr char kCumsumMultipassScratchLane[] = "cumsum.multipass.tmp";
+
 bool trace_descriptor_epochs_enabled() {
   static const bool enabled = []() {
     if (const char* env = std::getenv("MLX_VULKAN_TRACE_SYNC");
@@ -2261,10 +2265,10 @@ void dispatch_softmax_large_op(
   }
   const int tmp_elements = static_cast<int>(tmp_elements_u64);
 
-  array temp_max({tmp_elements}, float32, nullptr, {});
-  array temp_sum({tmp_elements}, float32, nullptr, {});
-  temp_max.set_data(allocator::malloc(temp_max.nbytes()));
-  temp_sum.set_data(allocator::malloc(temp_sum.nbytes()));
+  array temp_max = acquire_scratch_array(
+      s, kSoftmaxLargeMaxScratchLane, {tmp_elements}, float32);
+  array temp_sum = acquire_scratch_array(
+      s, kSoftmaxLargeSumScratchLane, {tmp_elements}, float32);
 
   const std::array<BoundArray, 6> bound_arrays = {{
       {&in, "src0"},
@@ -2339,6 +2343,9 @@ void dispatch_softmax_large_op(
       s,
       grid,
       {128u, 4u});
+
+  mark_scratch_array_written(s, kSoftmaxLargeMaxScratchLane);
+  mark_scratch_array_written(s, kSoftmaxLargeSumScratchLane);
 }
 
 void dispatch_diag_mask_inf_op(
@@ -2555,8 +2562,8 @@ void dispatch_cumsum_op(
   }
   const int tmp_elements = static_cast<int>(tmp_elements_u64);
 
-  array temp({tmp_elements}, float32, nullptr, {});
-  temp.set_data(allocator::malloc(temp.nbytes()));
+  array temp = acquire_scratch_array(
+      s, kCumsumMultipassScratchLane, {tmp_elements}, float32);
 
   const std::array<BoundArray, 3> bound_arrays = {{
       {&in, "src0"},
@@ -2605,6 +2612,8 @@ void dispatch_cumsum_op(
       s,
       grid,
       {128u, 32u});
+
+  mark_scratch_array_written(s, kCumsumMultipassScratchLane);
 }
 
 void dispatch_mul_mm_op(

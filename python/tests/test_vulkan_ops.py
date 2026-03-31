@@ -487,6 +487,20 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
         gpu_out = self._run_on_device(mx.gpu, run_copy).astype(mx.float32)
         self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
 
+    def test_host_staging_reuse_vulkan_gpu(self):
+        for start in range(4):
+            host_src = self._run_on_device(
+                mx.cpu,
+                lambda start=start: mx.arange(start, start + 4096, dtype=mx.float32),
+            )
+
+            def run_copy(host_src=host_src):
+                return host_src[128:640].astype(mx.float16).astype(mx.float32)
+
+            cpu_out = self._run_on_device(mx.cpu, run_copy)
+            gpu_out = self._run_on_device(mx.gpu, run_copy)
+            self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
+
 
 def _cases():
     return [

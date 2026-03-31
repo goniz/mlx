@@ -3,7 +3,6 @@
 #include "doctest/doctest.h"
 
 #include <cstdlib>
-
 #include "mlx/mlx.h"
 
 using namespace mlx::core;

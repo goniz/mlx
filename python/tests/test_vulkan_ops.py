@@ -501,6 +501,75 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             gpu_out = self._run_on_device(mx.gpu, run_copy)
             self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
 
+    def test_host_staging_arena_growth_and_reuse_vulkan_gpu(self):
+        for cycle in range(3):
+            host_srcs = [
+                self._run_on_device(
+                    mx.cpu,
+                    lambda start=start: mx.arange(
+                        start,
+                        start + 128 * 1024,
+                        dtype=mx.float32,
+                    ),
+                )
+                for start in (cycle, cycle + 1, cycle + 2)
+            ]
+
+            def run_copy(host_srcs=host_srcs):
+                parts = [
+                    host_src[1024:-1024].astype(mx.float16).astype(mx.float32)
+                    for host_src in host_srcs
+                ]
+                return mx.concatenate(parts, axis=0)
+
+            cpu_out = self._run_on_device(mx.cpu, run_copy)
+            gpu_out = self._run_on_device(mx.gpu, run_copy)
+            self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
+
+    def test_host_staging_wrapped_full_ring_regression_vulkan_gpu(self):
+        sizes = [96, 32, 64, 32, 32, 32, 32, 32, 8]
+        host_srcs = [
+            self._run_on_device(
+                mx.cpu,
+                lambda start=start, size=size: mx.arange(
+                    start,
+                    start + size * 1024,
+                    dtype=mx.float32,
+                ),
+            )
+            for start, size in enumerate(sizes)
+        ]
+
+        prev = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            stream = mx.new_stream(mx.gpu)
+
+            def submit(host_src, heavy=False):
+                out = mx.abs(host_src, stream=stream)
+                if heavy:
+                    for _ in range(96):
+                        out = mx.abs(out, stream=stream)
+                mx.async_eval(out)
+                return out
+
+            outs = [submit(host_srcs[0]), submit(host_srcs[1], heavy=True)]
+
+            cpu_burn = host_srcs[0]
+            for _ in range(96):
+                cpu_burn = mx.abs(cpu_burn)
+            mx.eval(cpu_burn)
+
+            for host_src in host_srcs[2:]:
+                outs.append(submit(host_src))
+
+            mx.synchronize(stream)
+        finally:
+            mx.set_default_device(prev)
+
+        for gpu_out, host_src in zip(outs, host_srcs):
+            self._assert_outputs_close(gpu_out, host_src, atol=0.0, rtol=0.0)
+
 
 def _cases():
     return [

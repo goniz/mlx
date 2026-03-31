@@ -7,7 +7,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-
 #include <vector>
 
 #include "mlx/array.h"

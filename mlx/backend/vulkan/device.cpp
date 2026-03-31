@@ -424,9 +424,24 @@ size_t align_up(size_t value, size_t alignment) {
   return remainder == 0 ? value : value + (alignment - remainder);
 }
 
+size_t default_staging_arena_bytes() {
+  if (const char* env = std::getenv("MLX_VULKAN_STAGING_ARENA_BYTES");
+      env != nullptr) {
+    try {
+      const auto parsed = static_cast<size_t>(std::stoull(env));
+      if (parsed > 0) {
+        return parsed;
+      }
+    } catch (...) {
+    }
+  }
+  return kDefaultStagingArenaBytes;
+}
+
 size_t staging_arena_capacity(size_t bytes) {
   return align_up(
-      std::max(bytes, kDefaultStagingArenaBytes), kStagingArenaAlignment);
+      std::max(bytes, default_staging_arena_bytes()),
+      kStagingArenaAlignment);
 }
 
 void retire_staging_arena_allocations(StagingArena& arena) {
@@ -452,6 +467,9 @@ bool try_acquire_staging_from_arena(
     offset = 0;
   } else {
     const size_t oldest_offset = arena->in_flight.front().offset;
+    if (arena->write_offset == oldest_offset) {
+      return false;
+    }
     if (arena->write_offset >= oldest_offset) {
       const size_t tail_bytes = arena->capacity - arena->write_offset;
       if (tail_bytes >= bytes) {

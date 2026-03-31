@@ -1,5 +1,9 @@
 # Copyright © 2026 Apple Inc.
 
+import os
+import subprocess
+import sys
+import textwrap
 import unittest
 
 import mlx.core as mx
@@ -525,6 +529,65 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             cpu_out = self._run_on_device(mx.cpu, run_copy)
             gpu_out = self._run_on_device(mx.gpu, run_copy)
             self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
+
+    def test_host_staging_wrapped_full_ring_regression_vulkan_gpu(self):
+        script = textwrap.dedent(
+            """
+            import mlx.core as mx
+            import numpy as np
+
+            def host_range(start, count):
+                prev = mx.default_device()
+                try:
+                    mx.set_default_device(mx.cpu)
+                    arr = mx.arange(start, start + count, dtype=mx.float32)
+                    mx.eval(arr)
+                    return arr
+                finally:
+                    mx.set_default_device(prev)
+
+            sizes = [384 * 1024, 128 * 1024, 256 * 1024, 128 * 1024, 64 * 1024]
+            hosts = [host_range(i, size) for i, size in enumerate(sizes)]
+
+            mx.set_default_device(mx.gpu)
+            stream = mx.default_stream(mx.gpu)
+
+            outs = []
+            for idx, host in enumerate(hosts):
+                out = mx.abs(host, stream=stream)
+                if idx == 1:
+                    for _ in range(32):
+                        out = mx.abs(out, stream=stream)
+                mx.async_eval(out)
+                outs.append(out)
+
+            mx.synchronize(stream)
+
+            for idx, out in enumerate(outs):
+                got = np.array(out[:16])
+                expected = np.arange(idx, idx + 16, dtype=np.float32)
+                if not np.array_equal(got, expected):
+                    raise SystemExit(
+                        f"output {idx} mismatch: got={got.tolist()} expected={expected.tolist()}"
+                    )
+            """
+        )
+        env = os.environ.copy()
+        env["MLX_VULKAN_STAGING_ARENA_BYTES"] = str(512 * 1024)
+        env["MLX_VULKAN_DEFERRED_SUBMISSION"] = "0"
+        env["MLX_VULKAN_MAX_INFLIGHT_SUBMISSIONS"] = "32"
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}",
+        )
 
 
 def _cases():

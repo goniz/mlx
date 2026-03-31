@@ -1,9 +1,5 @@
 # Copyright © 2026 Apple Inc.
 
-import os
-import subprocess
-import sys
-import textwrap
 import unittest
 
 import mlx.core as mx
@@ -531,63 +527,48 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
 
     def test_host_staging_wrapped_full_ring_regression_vulkan_gpu(self):
-        script = textwrap.dedent(
-            """
-            import mlx.core as mx
-            import numpy as np
+        sizes = [96, 32, 64, 32, 32, 32, 32, 32, 8]
+        host_srcs = [
+            self._run_on_device(
+                mx.cpu,
+                lambda start=start, size=size: mx.arange(
+                    start,
+                    start + size * 1024,
+                    dtype=mx.float32,
+                ),
+            )
+            for start, size in enumerate(sizes)
+        ]
 
-            def host_range(start, count):
-                prev = mx.default_device()
-                try:
-                    mx.set_default_device(mx.cpu)
-                    arr = mx.arange(start, start + count, dtype=mx.float32)
-                    mx.eval(arr)
-                    return arr
-                finally:
-                    mx.set_default_device(prev)
-
-            sizes = [384 * 1024, 128 * 1024, 256 * 1024, 128 * 1024, 64 * 1024]
-            hosts = [host_range(i, size) for i, size in enumerate(sizes)]
-
+        prev = mx.default_device()
+        try:
             mx.set_default_device(mx.gpu)
-            stream = mx.default_stream(mx.gpu)
+            stream = mx.new_stream(mx.gpu)
 
-            outs = []
-            for idx, host in enumerate(hosts):
-                out = mx.abs(host, stream=stream)
-                if idx == 1:
-                    for _ in range(32):
+            def submit(host_src, heavy=False):
+                out = mx.abs(host_src, stream=stream)
+                if heavy:
+                    for _ in range(96):
                         out = mx.abs(out, stream=stream)
                 mx.async_eval(out)
-                outs.append(out)
+                return out
+
+            outs = [submit(host_srcs[0]), submit(host_srcs[1], heavy=True)]
+
+            cpu_burn = host_srcs[0]
+            for _ in range(96):
+                cpu_burn = mx.abs(cpu_burn)
+            mx.eval(cpu_burn)
+
+            for host_src in host_srcs[2:]:
+                outs.append(submit(host_src))
 
             mx.synchronize(stream)
+        finally:
+            mx.set_default_device(prev)
 
-            for idx, out in enumerate(outs):
-                got = np.array(out[:16])
-                expected = np.arange(idx, idx + 16, dtype=np.float32)
-                if not np.array_equal(got, expected):
-                    raise SystemExit(
-                        f"output {idx} mismatch: got={got.tolist()} expected={expected.tolist()}"
-                    )
-            """
-        )
-        env = os.environ.copy()
-        env["MLX_VULKAN_STAGING_ARENA_BYTES"] = str(512 * 1024)
-        env["MLX_VULKAN_DEFERRED_SUBMISSION"] = "0"
-        env["MLX_VULKAN_MAX_INFLIGHT_SUBMISSIONS"] = "32"
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            env=env,
-            capture_output=True,
-            text=True,
-            cwd=os.path.dirname(os.path.dirname(__file__)),
-        )
-        self.assertEqual(
-            result.returncode,
-            0,
-            msg=f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}",
-        )
+        for gpu_out, host_src in zip(outs, host_srcs):
+            self._assert_outputs_close(gpu_out, host_src, atol=0.0, rtol=0.0)
 
 
 def _cases():

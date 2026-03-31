@@ -424,24 +424,9 @@ size_t align_up(size_t value, size_t alignment) {
   return remainder == 0 ? value : value + (alignment - remainder);
 }
 
-size_t default_staging_arena_bytes() {
-  if (const char* env = std::getenv("MLX_VULKAN_STAGING_ARENA_BYTES");
-      env != nullptr) {
-    try {
-      const auto parsed = static_cast<size_t>(std::stoull(env));
-      if (parsed > 0) {
-        return parsed;
-      }
-    } catch (...) {
-    }
-  }
-  return kDefaultStagingArenaBytes;
-}
-
 size_t staging_arena_capacity(size_t bytes) {
   return align_up(
-      std::max(bytes, default_staging_arena_bytes()),
-      kStagingArenaAlignment);
+      std::max(bytes, kDefaultStagingArenaBytes), kStagingArenaAlignment);
 }
 
 void retire_staging_arena_allocations(StagingArena& arena) {

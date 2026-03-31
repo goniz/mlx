@@ -420,6 +420,8 @@ void VulkanContext::init() {
         extensions, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     const bool has_cooperative_matrix_ext = has_device_extension(
         extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    const bool has_shader_integer_dot_product_ext = has_device_extension(
+        extensions, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
     const bool has_shader_bfloat16_ext =
         has_device_extension(extensions, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
 
@@ -644,7 +646,8 @@ void VulkanContext::init() {
       enabled_pipeline_robustness.pipelineRobustness = VK_TRUE;
       pipeline_robustness_supported = true;
     }
-    if (supported_shader_integer_dot_product.shaderIntegerDotProduct) {
+    if (has_shader_integer_dot_product_ext &&
+        supported_shader_integer_dot_product.shaderIntegerDotProduct) {
       enabled_shader_integer_dot_product.shaderIntegerDotProduct = VK_TRUE;
       integer_dot_product_supported = true;
     }
@@ -698,6 +701,10 @@ void VulkanContext::init() {
     }
     if (coopmat_flash_attention_f32acc_supported) {
       device_extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    }
+    if (integer_dot_product_supported) {
+      device_extensions.push_back(
+          VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
     }
     if (shader_bfloat16_supported) {
       device_extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);

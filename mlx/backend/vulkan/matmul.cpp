@@ -842,7 +842,7 @@ bool try_eval_mul_mm_vulkan(
             s,
             reduce_push_constants,
             {
-                round_up_div(batch_stride_d * num_batches, 256u),
+                round_up_div(batch_stride_d * num_batches, 256u * 4u),
                 1u,
                 1u,
             },

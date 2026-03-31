@@ -350,7 +350,7 @@ std::string build_dynamic_general_copy_shader(
       os << "  }\n";
     }
   }
-  os << "  output_buf.data[output_index] = input_buf.data[input_index];\n";
+  os << "  output_buf.data[uint(output_index)] = input_buf.data[uint(input_index)];\n";
   os << "}\n";
   return os.str();
 }

@@ -535,7 +535,8 @@ bool try_dispatch_flash_attention_native_vulkan(
     bool do_causal,
     array& out_storage,
     Stream s,
-    bool use_native_bf16_kv) {
+    bool use_native_bf16_kv,
+    float scale) {
   const uint32_t batch = checked_u32_size(q.shape(0), "flash_attn batch");
   const uint32_t q_heads = checked_u32_size(q.shape(1), "flash_attn q_heads");
   const uint32_t q_len = checked_u32_size(q.shape(2), "flash_attn q_len");
@@ -611,7 +612,7 @@ bool try_dispatch_flash_attention_native_vulkan(
   push_constants.nb21 = v_stride;
   push_constants.nb22 = stride_bytes(v, 1, "flash_attn v_nb22");
   push_constants.nb23 = stride_bytes(v, 0, "flash_attn v_nb23");
-  push_constants.scale = 1.0f;
+  push_constants.scale = scale;
   push_constants.max_bias = 0.0f;
   push_constants.logit_softcap = 0.0f;
   push_constants.mask_n_head_log2 = 0u;
@@ -818,8 +819,6 @@ bool try_eval_flash_attention_vulkan(
   }
 
   q = cast_flash_attention_q_to_f32(q, s);
-  q = multiply(array(scale, float32), q, s);
-  q = cast_flash_attention_q_to_f32(q, s);
 
   auto make_contiguous_zero_offset = [&](array x) {
     if (!x.flags().row_contiguous || x.strides().back() != 1 ||
@@ -868,7 +867,8 @@ bool try_eval_flash_attention_vulkan(
             use_causal_shader,
             out_storage,
             s,
-            use_native_bf16_kv)) {
+            use_native_bf16_kv,
+            scale)) {
       return false;
     }
     vulkan::mark_scratch_array_written(s, kFlashAttnOutScratchLane);

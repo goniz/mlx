@@ -18,6 +18,16 @@ MLX_API bool is_available();
 MLX_API bool is_unified_memory();
 MLX_API int device_count();
 
+enum class GpuArchitecture : uint8_t {
+  Unknown,
+  AmdRdna,
+  AmdCdna,
+  Nvidia,
+  Intel,
+  Apple,
+  Qualcomm,
+};
+
 class VulkanContext {
  public:
   static VulkanContext& get();
@@ -80,11 +90,26 @@ class VulkanContext {
   uint32_t subgroup_max_size() const {
     return subgroup_max_size_;
   }
+  uint32_t subgroup_size() const {
+    return subgroup_size_;
+  }
   bool pipeline_robustness_supported() const {
     return pipeline_robustness_supported_;
   }
+  bool cooperative_matrix_supported() const {
+    return cooperative_matrix_supported_;
+  }
   bool coopmat_flash_attention_f32acc_supported() const {
     return coopmat_flash_attention_f32acc_supported_;
+  }
+  bool integer_dot_product_supported() const {
+    return integer_dot_product_supported_;
+  }
+  uint32_t vendor_id() const {
+    return vendor_id_;
+  }
+  GpuArchitecture architecture() const {
+    return architecture_;
   }
 
   // Find memory type that supports the given properties
@@ -128,8 +153,13 @@ class VulkanContext {
   bool subgroup_require_full_support_{false};
   uint32_t subgroup_min_size_{0};
   uint32_t subgroup_max_size_{0};
+  uint32_t subgroup_size_{0};
   bool pipeline_robustness_supported_{false};
+  bool cooperative_matrix_supported_{false};
   bool coopmat_flash_attention_f32acc_supported_{false};
+  bool integer_dot_product_supported_{false};
+  uint32_t vendor_id_{0};
+  GpuArchitecture architecture_{GpuArchitecture::Unknown};
   vk::PhysicalDeviceMemoryProperties mem_properties_{};
 };
 

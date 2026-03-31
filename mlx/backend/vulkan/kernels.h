@@ -424,6 +424,11 @@ struct MatmulPushConstants {
   uint32_t padded_N;
 };
 
+struct MatmulSplitKReducePushConstants {
+  uint32_t ne;
+  uint32_t k_num;
+};
+
 struct MatVecPushConstants {
   uint32_t ncols;
   uint32_t stride_a;
@@ -725,7 +730,18 @@ void dispatch_mul_mm_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const MatmulPushConstants& push_constants,
-    const std::array<uint32_t, 3>& grid);
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants = {});
+
+void dispatch_matmul_split_k_reduce_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const MatmulSplitKReducePushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants = {});
 
 void dispatch_mul_mat_vec_op(
     const array& matrix,

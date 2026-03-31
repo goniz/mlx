@@ -55,17 +55,18 @@ void hash_combine(size_t& seed, const T& value) {
       std::hash<T>{}(value) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
 }
 
-const std::vector<uint32_t>& matmul_specialization_constants() {
+std::vector<uint32_t> matmul_specialization_constants(
+    const std::vector<uint32_t>& selected_spec) {
   // Conservative matmul tile that avoids relying on device-specific tuning.
   // constant_id mapping in mul_mm.comp:
   //   0: BLOCK_SIZE, 1: BM, 2: BN, 3: BK, 4: WM, 5: WN,
   //   6: WMITER, 7: TM, 8: TN, 9: TK, 10: WARP
   static const std::vector<uint32_t> kDefaultSpec = {
       32, 32, 32, 16, 32, 32, 2, 2, 2, 1, 32};
-  static const std::vector<uint32_t> kSpec = []() {
+  static const std::vector<uint32_t> kEnvSpec = []() {
     const char* env = std::getenv("MLX_VULKAN_MATMUL_SPEC");
     if (env == nullptr || std::strlen(env) == 0) {
-      return kDefaultSpec;
+      return std::vector<uint32_t>{};
     }
 
     std::vector<uint32_t> parsed;
@@ -83,11 +84,17 @@ const std::vector<uint32_t>& matmul_specialization_constants() {
       }
     }
     if (parsed.size() != kDefaultSpec.size()) {
-      return kDefaultSpec;
+      return std::vector<uint32_t>{};
     }
     return parsed;
   }();
-  return kSpec;
+  if (!kEnvSpec.empty()) {
+    return kEnvSpec;
+  }
+  if (selected_spec.size() == kDefaultSpec.size()) {
+    return selected_spec;
+  }
+  return kDefaultSpec;
 }
 
 VkDescriptorSetLayoutBinding make_storage_buffer_binding(uint32_t binding) {
@@ -190,6 +197,13 @@ PipelineCreationOptions pipeline_creation_options(
       options.require_full_subgroups = true;
       options.required_subgroup_size = specialization_constants[8];
     }
+  }
+
+  if (starts_with(shader_name, "matmul_") &&
+      specialization_constants.size() > 10 &&
+      specialization_constants[10] != 0) {
+    options.require_full_subgroups = true;
+    options.required_subgroup_size = specialization_constants[10];
   }
 
   return options;
@@ -313,6 +327,7 @@ enum class KernelSpecId {
   CumsumMultipass,
   MatVec,
   Matmul,
+  MatmulSplitKReduce,
   RandomBits,
   Gather,
   GatherAxis,
@@ -351,7 +366,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 28> kKernelSpecs = {
+const std::array<KernelSpec, 29> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -411,6 +426,10 @@ const std::array<KernelSpec, 28> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(MatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1},
+        sizeof(MatmulSplitKReducePushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1},
@@ -1946,8 +1965,10 @@ void dispatch_norm_op(
     const Stream& s,
     float eps) {
   const uint32_t axis_size = checked_u32(in.shape(in.ndim() - 1), "norm axis");
-  const uint32_t row_count = axis_size == 0 ? 0 : checked_u32(out.size() / axis_size, "norm rows");
-  const auto push_constants = make_generic_push_constants(axis_size, eps, 0.0f, 0.0f, 0.0f);
+  const uint32_t row_count =
+      axis_size == 0 ? 0 : checked_u32(out.size() / axis_size, "norm rows");
+  const auto push_constants =
+      make_generic_push_constants(axis_size, eps, 0.0f, 0.0f, 0.0f);
   const uint32_t grid_x = std::min<uint32_t>(row_count, 512u);
   const uint32_t grid_y = std::min<uint32_t>((row_count + 511u) / 512u, 512u);
   const uint32_t grid_z = (row_count + 262144u - 1u) / 262144u;
@@ -1976,7 +1997,7 @@ void dispatch_layer_norm_affine_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const LayerNormAffinePushConstants& push_constants) {
-    const std::array<BoundArray, 4> bound_arrays = {{
+  const std::array<BoundArray, 4> bound_arrays = {{
       {&x, "src0"},
       {&weight, "src1"},
       {&bias, "src2"},
@@ -2176,24 +2197,28 @@ void dispatch_softmax_back_op(
     return;
   }
 
-  if (grad.ndim() == 0 || grad.shape() != y.shape() || grad.shape() != out.shape()) {
+  if (grad.ndim() == 0 || grad.shape() != y.shape() ||
+      grad.shape() != out.shape()) {
     throw std::runtime_error(
         "[vulkan::kernels] SoftmaxBack requires matching non-scalar shapes.");
   }
 
-  const uint32_t row_width = checked_u32(out.shape(out.ndim() - 1), "softmax_back KX");
+  const uint32_t row_width =
+      checked_u32(out.shape(out.ndim() - 1), "softmax_back KX");
   if (row_width == 0) {
     throw std::runtime_error(
         "[vulkan::kernels] SoftmaxBack requires non-zero KX.");
   }
 
-  const uint32_t total_elements = checked_u32(out.size(), "softmax_back elements");
+  const uint32_t total_elements =
+      checked_u32(out.size(), "softmax_back elements");
   if (total_elements % row_width != 0) {
     throw std::runtime_error(
         "[vulkan::kernels] SoftmaxBack elements are not divisible by KX.");
   }
   const uint32_t row_count = total_elements / row_width;
-  auto push_constants = make_generic_push_constants(row_width, scale, 0.0f, 0.0f, 0.0f);
+  auto push_constants =
+      make_generic_push_constants(row_width, scale, 0.0f, 0.0f, 0.0f);
   push_constants.KY = row_count;
 
   const std::array<BoundArray, 3> bound_arrays = {{
@@ -2624,7 +2649,8 @@ void dispatch_mul_mm_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const MatmulPushConstants& push_constants,
-    const std::array<uint32_t, 3>& grid) {
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants) {
   if (a.ndim() < 2 || b.ndim() < 2 || out.ndim() < 2) {
     throw std::runtime_error(
         "[vulkan::kernels] mul_mm dispatch requires rank >= 2 tensors.");
@@ -2655,7 +2681,38 @@ void dispatch_mul_mm_op(
       cmd_buffer,
       s,
       grid,
-      matmul_specialization_constants());
+      matmul_specialization_constants(specialization_constants));
+}
+
+void dispatch_matmul_split_k_reduce_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const MatmulSplitKReducePushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants) {
+  if (in.nbytes() == 0 || out.nbytes() == 0) {
+    return;
+  }
+
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src"},
+      {&out, "dst"},
+  }};
+  const uint32_t num_elements = checked_mul_u32(
+      push_constants.ne, 1u, "matmul split-k reduce output elements");
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::MatmulSplitKReduce,
+      bound_arrays,
+      push_constants,
+      num_elements,
+      cmd_buffer,
+      s,
+      grid,
+      specialization_constants);
 }
 
 void dispatch_mul_mat_vec_op(
@@ -3194,7 +3251,7 @@ void dispatch_fused_affine_matmul_op(
       cmd_buffer,
       s,
       grid,
-      matmul_specialization_constants());
+      matmul_specialization_constants({}));
 }
 
 } // namespace mlx::core::vulkan

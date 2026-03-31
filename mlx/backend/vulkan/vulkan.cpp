@@ -8,6 +8,7 @@
 #include "mlx/backend/vulkan/kernels.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <mutex>
@@ -22,7 +23,9 @@ namespace {
 
 struct QueueFamilyIndices {
   uint32_t compute_family{0};
+  uint32_t compute_queue_index{0};
   uint32_t transfer_family{0};
+  uint32_t transfer_queue_index{0};
   bool has_separate_transfer{false};
 };
 
@@ -86,10 +89,25 @@ QueueFamilyIndices find_queue_families(vk::PhysicalDevice physical_device) {
 
   QueueFamilyIndices indices;
   indices.compute_family = compute_family;
-  indices.transfer_family = transfer_family;
-  indices.has_separate_transfer = (compute_family != transfer_family) &&
+  indices.transfer_family = compute_family;
+
+  const bool distinct_transfer_family =
+      (compute_family != transfer_family) &&
       (queue_families[transfer_family].queueFlags &
        vk::QueueFlagBits::eTransfer) != vk::QueueFlagBits{};
+  if (distinct_transfer_family) {
+    indices.transfer_family = transfer_family;
+    indices.has_separate_transfer = true;
+    return indices;
+  }
+
+  if ((queue_families[compute_family].queueFlags &
+       vk::QueueFlagBits::eTransfer) != vk::QueueFlagBits{} &&
+      queue_families[compute_family].queueCount > 1) {
+    indices.transfer_family = compute_family;
+    indices.transfer_queue_index = 1;
+    indices.has_separate_transfer = true;
+  }
 
   return indices;
 }
@@ -294,7 +312,9 @@ void VulkanContext::init() {
   vk::Queue compute_queue;
   vk::Queue transfer_queue;
   uint32_t compute_queue_family_index = 0;
+  uint32_t compute_queue_index = 0;
   uint32_t transfer_queue_family_index = 0;
+  uint32_t transfer_queue_index = 0;
   bool has_separate_transfer_queue = false;
   bool is_unified_memory = false;
   bool shader_float16_supported = false;
@@ -344,7 +364,9 @@ void VulkanContext::init() {
         auto indices = find_queue_families(candidate);
         physical_device = candidate;
         compute_queue_family_index = indices.compute_family;
+        compute_queue_index = indices.compute_queue_index;
         transfer_queue_family_index = indices.transfer_family;
+        transfer_queue_index = indices.transfer_queue_index;
         has_separate_transfer_queue = indices.has_separate_transfer;
         found_compute_device = true;
         break;
@@ -389,9 +411,19 @@ void VulkanContext::init() {
     // 4. Create logical device using C++ API
     float queue_priority = 1.0f;
     float queue_priority_low = 0.5f;
+    std::array<float, 2> shared_family_priorities = {
+        queue_priority, queue_priority_low};
     std::vector<vk::DeviceQueueCreateInfo> queue_create_infos;
 
-    if (has_separate_transfer_queue) {
+    if (has_separate_transfer_queue &&
+        compute_queue_family_index == transfer_queue_family_index) {
+      vk::DeviceQueueCreateInfo queue_info(
+          vk::DeviceQueueCreateFlags(),
+          compute_queue_family_index,
+          static_cast<uint32_t>(shared_family_priorities.size()),
+          shared_family_priorities.data());
+      queue_create_infos.push_back(queue_info);
+    } else if (has_separate_transfer_queue) {
       vk::DeviceQueueCreateInfo compute_queue_info(
           vk::DeviceQueueCreateFlags(),
           compute_queue_family_index,
@@ -633,9 +665,10 @@ void VulkanContext::init() {
     device = physical_device.createDevice(device_create_info);
 
     // 5. Get queues and create timeline semaphore
-    compute_queue = device.getQueue(compute_queue_family_index, 0);
+    compute_queue = device.getQueue(compute_queue_family_index, compute_queue_index);
     if (has_separate_transfer_queue) {
-      transfer_queue = device.getQueue(transfer_queue_family_index, 0);
+      transfer_queue =
+          device.getQueue(transfer_queue_family_index, transfer_queue_index);
     } else {
       transfer_queue = compute_queue;
     }

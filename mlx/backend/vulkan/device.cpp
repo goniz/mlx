@@ -19,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -194,6 +195,67 @@ bool trace_sync_enabled() {
     return false;
   }();
   return enabled;
+}
+
+bool decode_batch_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_DECODE_BATCH");
+        env != nullptr) {
+      return std::string(env) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+uint32_t decode_max_recorded_ops() {
+  static const uint32_t value = []() -> uint32_t {
+    if (const char* env = std::getenv("MLX_VULKAN_DECODE_MAX_RECORDED_OPS");
+        env != nullptr) {
+      return std::max<uint32_t>(1u, static_cast<uint32_t>(std::strtoul(env, nullptr, 10)));
+    }
+    return 96u;
+  }();
+  return value;
+}
+
+uint64_t decode_max_total_bytes() {
+  static const uint64_t value = []() -> uint64_t {
+    if (const char* env = std::getenv("MLX_VULKAN_DECODE_MAX_TOTAL_BYTES");
+        env != nullptr) {
+      return std::max<uint64_t>(
+          1ull, static_cast<uint64_t>(std::strtoull(env, nullptr, 10)));
+    }
+    return 128ull << 20;
+  }();
+  return value;
+}
+
+bool trace_batch_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_TRACE_BATCH");
+        env != nullptr) {
+      return std::string(env) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+void trace_batch(const std::string& msg) {
+  if (!trace_batch_enabled()) {
+    return;
+  }
+  using Clock = std::chrono::steady_clock;
+  static const auto start = Clock::now();
+  static std::mutex trace_mutex;
+
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      Clock::now() - start)
+                      .count();
+
+  std::lock_guard<std::mutex> lock(trace_mutex);
+  std::cerr << "[vulkan-batch +" << ms << "ms] " << msg << std::endl;
 }
 
 void trace_sync(const std::string& msg) {
@@ -560,6 +622,8 @@ struct StreamData {
   uint32_t deferred_heavy_ops{0};
   uint32_t submission_count{0};
   bool force_immediate_submit_{false};
+  uint32_t decode_barrier_count{0};
+  uint32_t decode_transfer_submit_count{0};
 };
 
 class VulkanDevice {
@@ -682,6 +746,8 @@ class VulkanDevice {
       stream->recording_completion_callbacks.clear();
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
+      stream->decode_barrier_count = 0;
+      stream->decode_transfer_submit_count = 0;
       clear_scratch_barriers(stream.get());
     }
     trace_sync("sync(all) done");
@@ -774,6 +840,7 @@ class VulkanDevice {
           "' bytes=" + std::to_string(slot.bytes));
       insert_memory_barrier(
           stream->recording_resources->compute_command_buffer);
+      record_decode_barrier(stream, std::string("scratch:") + lane);
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
       slot.needs_barrier = false;
@@ -929,9 +996,65 @@ class VulkanDevice {
     return 1ull << std::min<uint32_t>(submission_count, 2u);
   }
 
+  static bool is_decode_shaping_candidate_name(const std::string& primitive) {
+    return is_heavy_primitive_name(primitive) ||
+        is_compiled_primitive_name(primitive) ||
+        primitive_name_contains(primitive, "RoPE") ||
+        primitive_name_contains(primitive, "KV") ||
+        primitive_name_contains(primitive, "Attention");
+  }
+
+  static bool stream_has_decode_like_work(const StreamData* stream) {
+    if (stream->deferred_heavy_ops > 0 || stream->deferred_compiled_bytes > 0) {
+      return true;
+    }
+    if (stream->recent_primitives.empty()) {
+      return false;
+    }
+    return is_decode_shaping_candidate_name(stream->recent_primitives.back());
+  }
+
+  static bool should_prefer_long_decode_recording(const StreamData* stream) {
+    return decode_batch_enabled() && stream->recording &&
+        !stream->recording_transfer && stream_has_decode_like_work(stream);
+  }
+
+  static bool exceeds_decode_hard_limits(const StreamData* stream) {
+    return stream->recorded_ops >= decode_max_recorded_ops() ||
+        stream->deferred_total_bytes >= decode_max_total_bytes();
+  }
+
+  static void record_decode_barrier(StreamData* stream, std::string_view reason) {
+    if (!should_prefer_long_decode_recording(stream)) {
+      return;
+    }
+    stream->decode_barrier_count++;
+    if (trace_batch_enabled()) {
+      trace_batch(
+          "barrier stream=" + std::to_string(stream->stream_index) +
+          " rec_ops=" + std::to_string(stream->recorded_ops) +
+          " count=" + std::to_string(stream->decode_barrier_count) +
+          " reason=" + std::string(reason));
+    }
+  }
+
   bool should_submit_recording(StreamData* stream, std::string* reason) {
     if (!deferred_submission_enabled() || !stream->recording) {
       return false;
+    }
+
+    if (should_prefer_long_decode_recording(stream) &&
+        !exceeds_decode_hard_limits(stream)) {
+      return false;
+    }
+
+    if (should_prefer_long_decode_recording(stream) && reason != nullptr) {
+      if (stream->recorded_ops >= decode_max_recorded_ops()) {
+        *reason = "decode hard op budget";
+      } else {
+        *reason = "decode hard byte budget";
+      }
+      return true;
     }
 
     const uint64_t scale = adaptive_scale(stream->submission_count);
@@ -1014,17 +1137,21 @@ class VulkanDevice {
       trace_sync(oss.str());
     }
 
-    if (submit_on_hazard_boundary() && stream->recorded_ops > 0) {
+    if (submit_on_hazard_boundary() && stream->recorded_ops > 0 &&
+        !should_prefer_long_decode_recording(stream)) {
       trace_sync(
           "hazard boundary action=submit reason=overlapping-buffer-range");
       submit_commands(stream, "hazard overlap");
       return;
     }
 
-    trace_sync(
-        "hazard boundary action=barrier reason=overlapping-buffer-range");
+    if (trace_sync_enabled() && !should_prefer_long_decode_recording(stream)) {
+      trace_sync(
+          "hazard boundary action=barrier reason=overlapping-buffer-range");
+    }
     trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
     insert_memory_barrier(stream->recording_resources->compute_command_buffer);
+    record_decode_barrier(stream, "overlapping-buffer-range");
     stream->unsynced_reads.clear();
     stream->unsynced_writes.clear();
   }
@@ -1112,6 +1239,8 @@ class VulkanDevice {
       stream->deferred_heavy_bytes = 0;
       stream->deferred_compiled_bytes = 0;
       stream->deferred_heavy_ops = 0;
+      stream->decode_barrier_count = 0;
+      stream->decode_transfer_submit_count = 0;
       if (trace_sync_enabled()) {
         std::ostringstream oss;
         oss << "begin_recording(stream=" << stream_index
@@ -1176,6 +1305,26 @@ class VulkanDevice {
       insert_memory_barrier(
           stream->recording_resources->compute_command_buffer);
       submit_commands(stream, "force immediate");
+      return;
+    }
+
+    if (should_prefer_long_decode_recording(stream) && !transfer) {
+      stream->recorded_ops += 1;
+      if (exceeds_decode_hard_limits(stream)) {
+        std::string submit_reason;
+        (void)should_submit_recording(stream, &submit_reason);
+        submit_commands(stream, submit_reason);
+        return;
+      }
+      if (barrier_between_deferred_ops()) {
+        if (trace_sync_enabled()) {
+          trace_sync(
+              "barrier action=recording-tail reason=decode-region-defer");
+        }
+        insert_memory_barrier(
+            stream->recording_resources->compute_command_buffer);
+        record_decode_barrier(stream, "deferred-op-boundary");
+      }
       return;
     }
 
@@ -1589,6 +1738,7 @@ class VulkanDevice {
     auto resources = std::move(stream->recording_resources);
     const uint64_t submit_rec_epoch = stream->recording_epoch;
     const uint32_t submit_rec_ops = stream->recorded_ops;
+    const uint64_t submit_total_bytes = stream->deferred_total_bytes;
     const size_t submit_recording_refs = stream->recording_refs.size();
     const size_t submit_unsynced_reads = stream->unsynced_reads.size();
     const size_t submit_unsynced_writes = stream->unsynced_writes.size();
@@ -1647,6 +1797,8 @@ class VulkanDevice {
       stream->deferred_heavy_bytes = 0;
       stream->deferred_compiled_bytes = 0;
       stream->deferred_heavy_ops = 0;
+      stream->decode_barrier_count = 0;
+      stream->decode_transfer_submit_count = 0;
       clear_scratch_barriers(stream);
       stream->recent_primitives.clear();
       stream->recording_resources.reset();
@@ -1859,6 +2011,26 @@ class VulkanDevice {
     stream->recent_primitives.clear();
     stream->in_flight_submissions.push_back(std::move(submission));
     stream->recording_transfer = false;
+
+    if (decode_batch_enabled() && submit_to_transfer_queue) {
+      stream->decode_transfer_submit_count++;
+    }
+
+    if (!submit_to_transfer_queue && trace_batch_enabled() && decode_batch_enabled()) {
+      trace_batch(
+          "submit stream=" + std::to_string(stream->stream_index) +
+          " ops=" + std::to_string(submit_rec_ops) +
+          " barriers=" + std::to_string(stream->decode_barrier_count) +
+          " transfer_submits=" +
+          std::to_string(stream->decode_transfer_submit_count) +
+          " total_bytes=" + std::to_string(submit_total_bytes) +
+          " reason='" + stream->in_flight_submissions.back().submit_reason +
+          "'");
+    }
+    if (!submit_to_transfer_queue) {
+      stream->decode_barrier_count = 0;
+      stream->decode_transfer_submit_count = 0;
+    }
 
     for (const auto& data : stream->in_flight_submissions.back().refs) {
       auto* buffer = referenced_vulkan_buffer(data);

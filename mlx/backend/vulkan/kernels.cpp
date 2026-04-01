@@ -23,6 +23,7 @@ namespace {
 constexpr char kSoftmaxLargeMaxScratchLane[] = "softmax.large.tmp_max";
 constexpr char kSoftmaxLargeSumScratchLane[] = "softmax.large.tmp_sum";
 constexpr char kCumsumMultipassScratchLane[] = "cumsum.multipass.tmp";
+constexpr uint32_t kDescriptorSetBatchSize = 32;
 
 bool trace_descriptor_epochs_enabled() {
   static const bool enabled = []() {
@@ -1402,25 +1403,38 @@ vk::DescriptorSet KernelManager::allocate_descriptor_set(
 
   vk::DescriptorSetAllocateInfo allocInfo;
   allocInfo.setDescriptorPool(descriptor_pool_);
-  allocInfo.setSetLayouts(layout);
+  std::vector<vk::DescriptorSetLayout> layouts(kDescriptorSetBatchSize, layout);
+  allocInfo.setSetLayouts(layouts);
 
   try {
     auto descriptor_sets = device.allocateDescriptorSets(allocInfo);
-    vk::DescriptorSet descriptor_set = descriptor_sets[0];
+    if (descriptor_sets.empty()) {
+      throw std::runtime_error("Failed to allocate descriptor set batch.");
+    }
+
+    vk::DescriptorSet descriptor_set = descriptor_sets.back();
+    descriptor_sets.pop_back();
 
     {
       std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+      auto& reusable_sets = reusable_descriptor_sets_[layout];
+      reusable_sets.insert(
+          reusable_sets.end(), descriptor_sets.begin(), descriptor_sets.end());
       descriptor_set_layouts_[descriptor_set] = layout;
+      for (const auto& reusable_set : descriptor_sets) {
+        descriptor_set_layouts_[reusable_set] = layout;
+      }
     }
 
     if (trace_descriptor_epochs_enabled()) {
       std::ostringstream oss;
-      oss << "allocate layout=0x" << std::hex
+      oss << "batch_allocate layout=0x" << std::hex
           << reinterpret_cast<uintptr_t>(
                  static_cast<VkDescriptorSetLayout>(layout))
-          << " set=0x"
+          << " count=" << std::dec << (descriptor_sets.size() + 1)
+          << " set=0x" << std::hex
           << reinterpret_cast<uintptr_t>(
-                 static_cast<VkDescriptorSet>(descriptor_set))
+                  static_cast<VkDescriptorSet>(descriptor_set))
           << std::dec;
       trace_descriptor_epochs(oss.str());
     }

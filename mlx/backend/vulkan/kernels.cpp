@@ -1401,49 +1401,63 @@ vk::DescriptorSet KernelManager::allocate_descriptor_set(
 
   vk::Device device = VulkanContext::get().device();
 
-  vk::DescriptorSetAllocateInfo allocInfo;
-  allocInfo.setDescriptorPool(descriptor_pool_);
-  std::vector<vk::DescriptorSetLayout> layouts(kDescriptorSetBatchSize, layout);
-  allocInfo.setSetLayouts(layouts);
+  std::optional<vk::SystemError> last_error;
+  for (uint32_t batch_size = kDescriptorSetBatchSize; batch_size >= 1;
+       batch_size /= 2) {
+    vk::DescriptorSetAllocateInfo allocInfo;
+    allocInfo.setDescriptorPool(descriptor_pool_);
+    std::vector<vk::DescriptorSetLayout> layouts(batch_size, layout);
+    allocInfo.setSetLayouts(layouts);
 
-  try {
-    auto descriptor_sets = device.allocateDescriptorSets(allocInfo);
-    if (descriptor_sets.empty()) {
-      throw std::runtime_error("Failed to allocate descriptor set batch.");
-    }
+    try {
+      auto descriptor_sets = device.allocateDescriptorSets(allocInfo);
+      if (descriptor_sets.empty()) {
+        throw std::runtime_error("Failed to allocate descriptor set batch.");
+      }
 
-    vk::DescriptorSet descriptor_set = descriptor_sets.back();
-    descriptor_sets.pop_back();
+      vk::DescriptorSet descriptor_set = descriptor_sets.back();
+      descriptor_sets.pop_back();
 
-    {
-      std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
-      auto& reusable_sets = reusable_descriptor_sets_[layout];
-      reusable_sets.insert(
-          reusable_sets.end(), descriptor_sets.begin(), descriptor_sets.end());
-      descriptor_set_layouts_[descriptor_set] = layout;
-      for (const auto& reusable_set : descriptor_sets) {
-        descriptor_set_layouts_[reusable_set] = layout;
+      {
+        std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+        auto& reusable_sets = reusable_descriptor_sets_[layout];
+        reusable_sets.insert(
+            reusable_sets.end(), descriptor_sets.begin(), descriptor_sets.end());
+        descriptor_set_layouts_[descriptor_set] = layout;
+        for (const auto& reusable_set : descriptor_sets) {
+          descriptor_set_layouts_[reusable_set] = layout;
+        }
+      }
+
+      if (trace_descriptor_epochs_enabled()) {
+        std::ostringstream oss;
+        oss << "batch_allocate layout=0x" << std::hex
+            << reinterpret_cast<uintptr_t>(
+                   static_cast<VkDescriptorSetLayout>(layout))
+            << " count=" << std::dec << (descriptor_sets.size() + 1)
+            << " set=0x" << std::hex
+            << reinterpret_cast<uintptr_t>(
+                    static_cast<VkDescriptorSet>(descriptor_set))
+            << std::dec;
+        trace_descriptor_epochs(oss.str());
+      }
+
+      return descriptor_set;
+    } catch (const vk::SystemError& e) {
+      last_error = e;
+      if (batch_size == 1) {
+        break;
       }
     }
-
-    if (trace_descriptor_epochs_enabled()) {
-      std::ostringstream oss;
-      oss << "batch_allocate layout=0x" << std::hex
-          << reinterpret_cast<uintptr_t>(
-                 static_cast<VkDescriptorSetLayout>(layout))
-          << " count=" << std::dec << (descriptor_sets.size() + 1)
-          << " set=0x" << std::hex
-          << reinterpret_cast<uintptr_t>(
-                  static_cast<VkDescriptorSet>(descriptor_set))
-          << std::dec;
-      trace_descriptor_epochs(oss.str());
-    }
-
-    return descriptor_set;
-  } catch (const vk::SystemError& e) {
-    throw std::runtime_error(
-        "Failed to allocate descriptor set: " + std::string(e.what()));
   }
+
+  if (last_error.has_value()) {
+    throw std::runtime_error(
+        "Failed to allocate descriptor set: " +
+        std::string(last_error->what()));
+  }
+
+  throw std::runtime_error("Failed to allocate descriptor set.");
 }
 
 void KernelManager::free_descriptor_set(VkDescriptorSet set) {

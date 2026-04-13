@@ -326,19 +326,22 @@ void main() {
         coopMatLoad(matB, Bsh, 0, Bsh_stride, gl_CooperativeMatrixLayoutRowMajor);
         matC = coopMatMulAdd(matA, matB, matC);
 #elif defined(COOPMAT)
-        // Accumulate via 16x16x16 subgroup-scope cooperative matrix tiles
-        for (uint crs_tile = 0; crs_tile < BS_CRS; crs_tile += PERM_CRS) {
-            coopmat<float16_t, gl_ScopeSubgroup, PERM_K, PERM_CRS, gl_MatrixUseA> matA_tile;
-            coopmat<float16_t, gl_ScopeSubgroup, PERM_CRS, PERM_NPQ, gl_MatrixUseB> matB_tile;
+        if (gl_SubgroupID == 0) {
+            // CM1 cooperative matrix ops are subgroup-scoped. Keep one subgroup as
+            // the owner of the accumulator/output tiles so other subgroups only help
+            // populate shared staging buffers and don't race on shared/global writes.
+            for (uint crs_tile = 0; crs_tile < BS_CRS; crs_tile += PERM_CRS) {
+                coopmat<float16_t, gl_ScopeSubgroup, PERM_K, PERM_CRS, gl_MatrixUseA> matA_tile;
+                coopmat<float16_t, gl_ScopeSubgroup, PERM_CRS, PERM_NPQ, gl_MatrixUseB> matB_tile;
 
-            // Load A tiles: iterate over K and CRS tiles
-            for (uint tk = 0; tk < NB_PERM_K; tk++) {
-                uint row_off = tk * PERM_K;
-                coopMatLoad(matA_tile, Ash, row_off * Ash_stride + crs_tile, Ash_stride, gl_CooperativeMatrixLayoutRowMajor);
-                for (uint tn = 0; tn < NB_PERM_NPQ; tn++) {
-                    uint col_off = tn * PERM_NPQ;
-                    coopMatLoad(matB_tile, Bsh, crs_tile * Bsh_stride + col_off, Bsh_stride, gl_CooperativeMatrixLayoutRowMajor);
-                    matC_arr[tk * NB_PERM_NPQ + tn] = coopMatMulAdd(matA_tile, matB_tile, matC_arr[tk * NB_PERM_NPQ + tn]);
+                for (uint tk = 0; tk < NB_PERM_K; tk++) {
+                    uint row_off = tk * PERM_K;
+                    coopMatLoad(matA_tile, Ash, row_off * Ash_stride + crs_tile, Ash_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    for (uint tn = 0; tn < NB_PERM_NPQ; tn++) {
+                        uint col_off = tn * PERM_NPQ;
+                        coopMatLoad(matB_tile, Bsh, crs_tile * Bsh_stride + col_off, Bsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                        matC_arr[tk * NB_PERM_NPQ + tn] = coopMatMulAdd(matA_tile, matB_tile, matC_arr[tk * NB_PERM_NPQ + tn]);
+                    }
                 }
             }
         }
@@ -367,22 +370,24 @@ void main() {
 #ifdef COOPMAT2
     coopMatPerElementNV(matC, matC, perElemOpStore);
 #elif defined(COOPMAT)
-    for (uint tk = 0; tk < NB_PERM_K; tk++) {
-        for (uint tn = 0; tn < NB_PERM_NPQ; tn++) {
-            uint row_off = tk * PERM_K;
-            uint col_off = tn * PERM_NPQ;
-            coopMatStore(matC_arr[tk * NB_PERM_NPQ + tn], Csh, (row_off * BS_NPQ + col_off), BS_NPQ, gl_CooperativeMatrixLayoutRowMajor);
-            for (uint i = gl_SubgroupInvocationID; i < PERM_K * PERM_NPQ; i += gl_SubgroupSize) {
-                uint local_row = i / PERM_NPQ;
-                uint local_col = i % PERM_NPQ;
-                uint K_idx = B_idx_K * BS_K + row_off + local_row;
-                uint NPQ_idx = B_idx_NPQ * BS_NPQ + col_off + local_col;
-                if (K_idx < K && NPQ_idx < NPQ) {
-                    uint N_idx   = fastdiv(NPQ_idx, p.OWOHmp, p.OWOHL);
-                    uint OH_idx  = fastdiv(NPQ_idx - N_idx * p.OH * p.OW, p.OWmp, p.OWL);
-                    uint OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
-                    uint dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
-                    dst_data[dst_idx] = Csh[(row_off + local_row) * BS_NPQ + col_off + local_col];
+    if (gl_SubgroupID == 0) {
+        for (uint tk = 0; tk < NB_PERM_K; tk++) {
+            for (uint tn = 0; tn < NB_PERM_NPQ; tn++) {
+                uint row_off = tk * PERM_K;
+                uint col_off = tn * PERM_NPQ;
+                coopMatStore(matC_arr[tk * NB_PERM_NPQ + tn], Csh, (row_off * BS_NPQ + col_off), BS_NPQ, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint i = gl_SubgroupInvocationID; i < PERM_K * PERM_NPQ; i += gl_SubgroupSize) {
+                    uint local_row = i / PERM_NPQ;
+                    uint local_col = i % PERM_NPQ;
+                    uint K_idx = B_idx_K * BS_K + row_off + local_row;
+                    uint NPQ_idx = B_idx_NPQ * BS_NPQ + col_off + local_col;
+                    if (K_idx < K && NPQ_idx < NPQ) {
+                        uint N_idx   = fastdiv(NPQ_idx, p.OWOHmp, p.OWOHL);
+                        uint OH_idx  = fastdiv(NPQ_idx - N_idx * p.OH * p.OW, p.OWmp, p.OWL);
+                        uint OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
+                        uint dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
+                        dst_data[dst_idx] = Csh[(row_off + local_row) * BS_NPQ + col_off + local_col];
+                    }
                 }
             }
         }

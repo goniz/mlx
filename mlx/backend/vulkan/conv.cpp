@@ -164,7 +164,9 @@ ConvPipelineConfig select_conv2d_pipeline(
     config.shmem_pad =
         ctx.architecture() == vulkan::GpuArchitecture::AmdCdna ? 1u : 4u;
 
-    if (ctx.cooperative_matrix_supported() && crs >= 64 && cout >= 64) {
+    if (
+        ctx.coopmat_flash_attention_f32acc_supported() && crs >= 64 &&
+        cout >= 64) {
       config.shmem_pad = 0u;
       config.shader_id = weight_dtype == float16
           ? vulkan::StaticShaderId::conv2d_f16_f32_cm1

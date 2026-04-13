@@ -520,6 +520,11 @@ bool try_eval_scores_v_matvec_vulkan(
   if (needs_out_copy) {
     out_work = vulkan::acquire_scratch_array(
         s, kMatvecScoresVOutScratchLane, out.shape(), float32);
+  } else {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  }
+  if (!ensure_vulkan_buffer(out_work, s)) {
+    return false;
   }
 
   const auto matrix_layout = make_tensor_layout_4d(values_t);
@@ -565,6 +570,8 @@ bool try_eval_scores_v_matvec_vulkan(
           dispatched = true;
           break;
         } catch (const std::runtime_error&) {
+          // The subgroup variant is opportunistic; fall back to the scalar
+          // p021 shader if the subgroup pipeline is unsupported on this GPU.
         }
       }
     }
@@ -600,6 +607,8 @@ bool try_eval_scores_v_matvec_vulkan(
   }
 
   if (needs_out_copy) {
+    // Unlike ggml, MLX matmul can target a non-row-contiguous destination view,
+    // so this path stages into scratch and copies back only when needed.
     vulkan::mark_scratch_array_written(s, kMatvecScoresVOutScratchLane);
     copy_gpu(out_work, out, CopyType::General, s);
   }

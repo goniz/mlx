@@ -180,6 +180,41 @@ bool nearly_equal(float a, float b, float atol = 1e-3f) {
   return std::fabs(a - b) <= atol;
 }
 
+uint32_t intel_shader_core_count(uint32_t vendor_id, uint32_t device_id) {
+  if (vendor_id != 0x8086u) {
+    return 0;
+  }
+
+  switch (device_id) {
+    case 0x56A6u: // A310
+      return 6;
+    case 0x5693u: // A370M
+    case 0x56A5u: // A380
+    case 0x56B1u: // Pro A40/A50
+      return 8;
+    case 0x5697u: // A530M
+      return 12;
+    case 0x5692u: // A550M
+    case 0x56B3u: // Pro A60
+    case 0xE212u: // Pro B50
+      return 16;
+    case 0xE20Cu: // B570
+      return 18;
+    case 0xE20Bu: // B580
+      return 20;
+    case 0x56A2u: // A580
+      return 24;
+    case 0x5691u: // A730M
+    case 0x56A1u: // A750
+      return 28;
+    case 0x56A0u: // A770
+    case 0x5690u: // A770M
+      return 32;
+    default:
+      return 0;
+  }
+}
+
 } // namespace
 
 bool VulkanContext::shader_bfloat16_supported() const {
@@ -356,7 +391,9 @@ void VulkanContext::init() {
   bool coopmat2_conv2d_supported = false;
   bool integer_dot_product_supported = false;
   uint32_t vendor_id = 0;
+  uint32_t device_id = 0;
   GpuArchitecture architecture = GpuArchitecture::Unknown;
+  uint32_t shader_core_count = 0;
   vk::PhysicalDeviceMemoryProperties mem_properties;
   vk::Semaphore timeline_semaphore;
   uint64_t timeline_value = 0;
@@ -430,8 +467,10 @@ void VulkanContext::init() {
 
     auto device_properties = physical_device.getProperties();
     vendor_id = device_properties.vendorID;
+    device_id = device_properties.deviceID;
     architecture = classify_gpu_architecture(
         vendor_id, std::string(device_properties.deviceName));
+    shader_core_count = intel_shader_core_count(vendor_id, device_id);
 
     is_unified_memory =
         (device_properties.deviceType ==
@@ -830,7 +869,9 @@ void VulkanContext::init() {
     this->coopmat2_conv2d_supported_ = coopmat2_conv2d_supported;
     this->integer_dot_product_supported_ = integer_dot_product_supported;
     this->vendor_id_ = vendor_id;
+    this->device_id_ = device_id;
     this->architecture_ = architecture;
+    this->shader_core_count_ = shader_core_count;
     initialized_ = true;
   } catch (...) {
     // Clean up partially initialized resources on failure
@@ -891,7 +932,9 @@ void VulkanContext::cleanup() {
   coopmat2_conv2d_supported_ = false;
   integer_dot_product_supported_ = false;
   vendor_id_ = 0;
+  device_id_ = 0;
   architecture_ = GpuArchitecture::Unknown;
+  shader_core_count_ = 0;
 
   // Clear memory properties by creating a default-constructed one
   vk::PhysicalDeviceMemoryProperties empty_props;

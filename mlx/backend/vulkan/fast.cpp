@@ -152,6 +152,7 @@ struct FlashAttentionTuningParams {
   uint32_t row_split;
   uint32_t subgroup_size;
   uint32_t shmem_staging;
+  bool disable_subgroups;
   uint32_t limit_occupancy_shmem;
 };
 
@@ -290,6 +291,17 @@ bool flash_attention_coopmat_shmem_supported(
       max_compute_shared_memory_size();
 }
 
+bool intel_is_battlemage(uint32_t device_id) {
+  switch (device_id) {
+    case 0xE212u:
+    case 0xE20Cu:
+    case 0xE20Bu:
+      return true;
+    default:
+      return false;
+  }
+}
+
 FlashAttentionTuningParams get_flash_attention_tuning_params_scalar(
     uint32_t hsk,
     uint32_t hsv,
@@ -300,10 +312,21 @@ FlashAttentionTuningParams get_flash_attention_tuning_params_scalar(
   const uint32_t subgroup_size = std::max(device_subgroup_size, 1u);
   const bool unified_memory = vulkan::VulkanContext::get().is_unified_memory();
   const uint32_t d = hsk | hsv;
+  const auto architecture = vulkan::VulkanContext::get().architecture();
 
   FlashAttentionTuningParams result{};
   result.path = FlashAttentionTuningParams::Path::Scalar;
-  result.subgroup_size = subgroup_size;
+  result.disable_subgroups = false;
+
+  if (vendor_id == kVendorIdIntel) {
+    result.subgroup_size = 32u;
+    result.disable_subgroups = true;
+  } else if (vendor_id == kVendorIdAmd &&
+             architecture == vulkan::GpuArchitecture::AmdRdna) {
+    result.subgroup_size = n_rows < 4u ? 32u : subgroup_size;
+  } else {
+    result.subgroup_size = subgroup_size;
+  }
 
   uint32_t row_split_max_hsk = 64u;
   if (vendor_id == kVendorIdAmd && !unified_memory) {
@@ -311,11 +334,11 @@ FlashAttentionTuningParams get_flash_attention_tuning_params_scalar(
   }
   result.row_split = (n_rows < 4 || hsk <= row_split_max_hsk) ? 1u : 4u;
 
-  if (subgroup_size > 32u &&
+  if (result.subgroup_size > 32u &&
       (n_rows < 4 || hsk < (result.row_split == 1 ? 128u : 64u))) {
-    result.workgroup_size = subgroup_size * 2u;
+    result.workgroup_size = result.subgroup_size * 2u;
   } else {
-    result.workgroup_size = subgroup_size * 4u;
+    result.workgroup_size = result.subgroup_size * 4u;
   }
   result.workgroup_size = std::clamp(result.workgroup_size, 32u, 256u);
 
@@ -335,7 +358,7 @@ FlashAttentionTuningParams get_flash_attention_tuning_params_scalar(
   }
 
   const uint32_t d_lsb = lowest_set_bit(d);
-  result.d_split = std::min(std::min(subgroup_size, 8u), d_lsb / 4u);
+  result.d_split = std::min(std::min(result.subgroup_size, 8u), d_lsb / 4u);
   result.shmem_staging =
       (vendor_id == kVendorIdNvidia && hsk < 256u && hsv < 256u) ? 1u : 0u;
 
@@ -377,6 +400,7 @@ FlashAttentionTuningParams get_flash_attention_tuning_params_coopmat1(
   result.block_cols = 64u;
   result.row_split = 4u;
   result.subgroup_size = subgroup_size;
+  result.disable_subgroups = false;
   result.workgroup_size = 4u * subgroup_size;
   result.d_split =
       std::min(std::min(subgroup_size, 8u), lowest_set_bit(d) / 4u);
@@ -448,7 +472,15 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
 
   const uint32_t tr = (q_len + tuning.block_rows - 1u) / tuning.block_rows;
   const uint32_t total_wgs_no_split = std::max(tr * q_heads * batch, 1u);
-  const uint32_t target_workgroups = 32u;
+  uint32_t shader_core_count = vulkan::VulkanContext::get().shader_core_count();
+  if (shader_core_count == 0u) {
+    shader_core_count = 16u;
+  }
+  if (vulkan::VulkanContext::get().vendor_id() == kVendorIdIntel &&
+      !intel_is_battlemage(vulkan::VulkanContext::get().device_id())) {
+    shader_core_count *= 2u;
+  }
+  const uint32_t target_workgroups = shader_core_count * 2u;
   uint32_t split_k = total_wgs_no_split < target_workgroups
       ? (target_workgroups + total_wgs_no_split - 1u) / total_wgs_no_split
       : 1u;
@@ -668,7 +700,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       plan.aligned ? 0u : 1u,
       tuning.d_split,
       tuning.row_split,
-      tuning.subgroup_size,
+      tuning.disable_subgroups ? 0u : tuning.subgroup_size,
       tuning.shmem_staging,
       (plan.use_mask_opt ? 1u : 0u) | (has_mask ? 2u : 0u) |
           (do_causal ? 8u : 0u),
@@ -711,7 +743,11 @@ bool try_dispatch_flash_attention_native_vulkan(
           },
           {
               128u,
-              std::max(1u, 128u / std::max(tuning.subgroup_size, 1u)),
+              std::max(
+                  1u,
+                  128u / std::max(
+                             tuning.disable_subgroups ? 32u : tuning.subgroup_size,
+                             1u)),
               tuning.block_rows,
               tuning.block_cols,
           });

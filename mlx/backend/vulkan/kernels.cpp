@@ -167,11 +167,21 @@ bool ends_with(const std::string& str, const char* suffix) {
       str.compare(str.size() - suffix_len, suffix_len, suffix) == 0;
 }
 
+std::optional<StaticShaderId> static_shader_id_by_name(
+    const std::string& shader_name) {
+  for (size_t i = 0; i < static_cast<size_t>(StaticShaderId::Count); ++i) {
+    const auto shader_id = static_cast<StaticShaderId>(i);
+    if (shader_name == static_shader_name(shader_id)) {
+      return shader_id;
+    }
+  }
+  return std::nullopt;
+}
+
 PipelineCreationOptions pipeline_creation_options(
-    StaticShaderId shader_id,
+    const std::string& shader_name,
     const std::vector<uint32_t>& specialization_constants) {
   PipelineCreationOptions options;
-  const std::string shader_name = static_shader_name(shader_id);
 
   if (shader_name == "fa_mask_opt") {
     options.disable_robustness = true;
@@ -210,6 +220,13 @@ PipelineCreationOptions pipeline_creation_options(
   }
 
   return options;
+}
+
+PipelineCreationOptions pipeline_creation_options(
+    StaticShaderId shader_id,
+    const std::vector<uint32_t>& specialization_constants) {
+  return pipeline_creation_options(
+      static_shader_name(shader_id), specialization_constants);
 }
 
 TensorLayout4D make_tensor_layout_4d(
@@ -1008,17 +1025,23 @@ ShaderModule* KernelManager::get_shader(StaticShaderId id) {
 mlx::core::vulkan::ShaderModule* mlx::core::vulkan::KernelManager::get_shader(
     const std::string& name) {
   auto it = dynamic_shaders_.find(name);
-  if (it == dynamic_shaders_.end()) {
+  if (it != dynamic_shaders_.end()) {
+    auto* shader = it->second.get();
+    if (!shader->compiled) {
+      shader->module = compile_shader(shader->spirv_code);
+      shader->compiled = true;
+    }
+
+    return shader;
+  }
+
+  ensure_static_registry_initialized();
+  const auto shader_id = static_shader_id_by_name(name);
+  if (!shader_id.has_value()) {
     return nullptr;
   }
 
-  auto* shader = it->second.get();
-  if (!shader->compiled) {
-    shader->module = compile_shader(shader->spirv_code);
-    shader->compiled = true;
-  }
-
-  return shader;
+  return get_shader(*shader_id);
 }
 
 ComputePipeline* KernelManager::get_pipeline(
@@ -1247,6 +1270,8 @@ ComputePipeline* KernelManager::get_pipeline(
   }
 
   VkDevice device = VulkanContext::get().device();
+  const auto pipeline_options =
+      pipeline_creation_options(shader_name, specialization_constants);
 
   // Get or compile shader
   ShaderModule* shader = get_shader(shader_name);
@@ -1303,6 +1328,11 @@ ComputePipeline* KernelManager::get_pipeline(
   pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   pipelineInfo.stage.sType =
       VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  if (VulkanContext::get().subgroup_require_full_support() &&
+      pipeline_options.require_full_subgroups) {
+    pipelineInfo.stage.flags =
+        VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+  }
   pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   pipelineInfo.stage.module = shader->module;
   pipelineInfo.stage.pName = "main";
@@ -1327,7 +1357,33 @@ ComputePipeline* KernelManager::get_pipeline(
     pipelineInfo.stage.pSpecializationInfo = &specialization_info;
   }
 
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info{};
+  if (VulkanContext::get().subgroup_size_control_supported() &&
+      pipeline_options.required_subgroup_size >=
+          VulkanContext::get().subgroup_min_size() &&
+      pipeline_options.required_subgroup_size <=
+          VulkanContext::get().subgroup_max_size() &&
+      pipeline_options.required_subgroup_size > 0) {
+    subgroup_size_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroup_size_info.requiredSubgroupSize =
+        pipeline_options.required_subgroup_size;
+    pipelineInfo.stage.pNext = &subgroup_size_info;
+  }
+
   pipelineInfo.layout = pipeline_layout;
+
+  VkPipelineRobustnessCreateInfoEXT pipeline_robustness_info{};
+  if (VulkanContext::get().pipeline_robustness_supported() &&
+      pipeline_options.disable_robustness) {
+    pipeline_robustness_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT;
+    pipeline_robustness_info.storageBuffers =
+        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+    pipeline_robustness_info.uniformBuffers =
+        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+    pipelineInfo.pNext = &pipeline_robustness_info;
+  }
 
   VkPipeline pipeline;
   if (vkCreateComputePipelines(

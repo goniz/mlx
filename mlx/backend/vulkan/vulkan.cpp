@@ -353,6 +353,7 @@ void VulkanContext::init() {
   bool pipeline_robustness_supported = false;
   bool cooperative_matrix_supported = false;
   bool coopmat_flash_attention_f32acc_supported = false;
+  bool coopmat2_conv2d_supported = false;
   bool integer_dot_product_supported = false;
   uint32_t vendor_id = 0;
   GpuArchitecture architecture = GpuArchitecture::Unknown;
@@ -420,6 +421,8 @@ void VulkanContext::init() {
         extensions, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     const bool has_cooperative_matrix_ext = has_device_extension(
         extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    const bool has_nv_cooperative_matrix2_ext = has_device_extension(
+        extensions, "VK_NV_cooperative_matrix2");
     const bool has_shader_integer_dot_product_ext = has_device_extension(
         extensions, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
     const bool has_shader_bfloat16_ext =
@@ -657,7 +660,6 @@ void VulkanContext::init() {
       cooperative_matrix_supported = true;
       coopmat_flash_attention_f32acc_supported = false;
 
-      // Check for flash attention support
       auto get_coopmat_props = reinterpret_cast<
           PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
           vkGetInstanceProcAddr(
@@ -691,6 +693,10 @@ void VulkanContext::init() {
       }
     }
 
+    if (has_nv_cooperative_matrix2_ext && cooperative_matrix_supported) {
+      coopmat2_conv2d_supported = true;
+    }
+
     std::vector<const char*> device_extensions;
     device_extensions.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
     if (subgroup_size_control_supported || subgroup_require_full_support) {
@@ -699,7 +705,7 @@ void VulkanContext::init() {
     if (pipeline_robustness_supported) {
       device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     }
-    if (coopmat_flash_attention_f32acc_supported) {
+    if (cooperative_matrix_supported) {
       device_extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     }
     if (integer_dot_product_supported) {
@@ -770,6 +776,7 @@ void VulkanContext::init() {
     this->coopmat_flash_attention_f32acc_supported_ =
         coopmat_flash_attention_f32acc_supported &&
         subgroup_require_full_support;
+    this->coopmat2_conv2d_supported_ = coopmat2_conv2d_supported;
     this->integer_dot_product_supported_ = integer_dot_product_supported;
     this->vendor_id_ = vendor_id;
     this->architecture_ = architecture;
@@ -830,6 +837,7 @@ void VulkanContext::cleanup() {
   pipeline_robustness_supported_ = false;
   cooperative_matrix_supported_ = false;
   coopmat_flash_attention_f32acc_supported_ = false;
+  coopmat2_conv2d_supported_ = false;
   integer_dot_product_supported_ = false;
   vendor_id_ = 0;
   architecture_ = GpuArchitecture::Unknown;

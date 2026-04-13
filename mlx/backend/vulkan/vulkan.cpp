@@ -185,6 +185,8 @@ uint32_t intel_shader_core_count(uint32_t vendor_id, uint32_t device_id) {
     return 0;
   }
 
+  // Vulkan does not expose a generic Intel Xe core-count property, so keep a
+  // conservative device-ID lookup and fall back to heuristics when unknown.
   switch (device_id) {
     case 0x56A6u: // A310
       return 6;

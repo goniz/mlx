@@ -711,6 +711,8 @@ bool try_dispatch_flash_attention_native_vulkan(
     auto command_buffer = vulkan::begin_command_recording(s.index);
 
     if (plan.use_mask_opt) {
+      const uint32_t mask_opt_subgroup_size =
+          std::max(vulkan::VulkanContext::get().subgroup_size(), 1u);
       vulkan::FlashAttentionMaskOptPushConstants mask_opt_push_constants{};
       mask_opt_push_constants.nem0 = kv_len;
       mask_opt_push_constants.nem1 = push_constants.nem1;
@@ -743,11 +745,7 @@ bool try_dispatch_flash_attention_native_vulkan(
           },
           {
               128u,
-              std::max(
-                  1u,
-                  128u / std::max(
-                             tuning.disable_subgroups ? 32u : tuning.subgroup_size,
-                             1u)),
+              std::max(1u, 128u / mask_opt_subgroup_size),
               tuning.block_rows,
               tuning.block_cols,
           });

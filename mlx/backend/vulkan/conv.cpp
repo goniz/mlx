@@ -242,8 +242,15 @@ bool try_eval_conv2d_vulkan(
   const uint32_t crs = checked_mul_u32(cin, checked_mul_u32(kh, kw, "kernel area"), "crs");
   const uint32_t npq = checked_mul_u32(batch, checked_mul_u32(oh, ow, "output pixels"), "npq");
   if (cout == 0 || cin == 0 || kh == 0 || kw == 0 || oh == 0 || ow == 0 ||
-      npq == 0) {
+      npq == 0 || crs == 0) {
     out.set_data(vulkan::allocator().malloc(out.nbytes()));
+    if (out.nbytes() > 0) {
+      auto out_buf = static_cast<const vulkan::VulkanBuffer*>(out.buffer().ptr());
+      vulkan::record_primitive_for_stream(s, "conv2d.zero_fill");
+      auto cmd_buffer = vulkan::begin_command_recording(s.index);
+      vkCmdFillBuffer(cmd_buffer, out_buf->buffer, 0, out.nbytes(), 0);
+      vulkan::end_command_recording(s.index);
+    }
     return true;
   }
 

@@ -111,8 +111,14 @@ class VulkanContext {
   uint32_t vendor_id() const {
     return vendor_id_;
   }
+  uint32_t device_id() const {
+    return device_id_;
+  }
   GpuArchitecture architecture() const {
     return architecture_;
+  }
+  uint32_t shader_core_count() const {
+    return shader_core_count_;
   }
 
   // Find memory type that supports the given properties
@@ -163,7 +169,9 @@ class VulkanContext {
   bool coopmat2_conv2d_supported_{false};
   bool integer_dot_product_supported_{false};
   uint32_t vendor_id_{0};
+  uint32_t device_id_{0};
   GpuArchitecture architecture_{GpuArchitecture::Unknown};
+  uint32_t shader_core_count_{0};
   vk::PhysicalDeviceMemoryProperties mem_properties_{};
 };
 

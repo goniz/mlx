@@ -25,6 +25,7 @@ namespace mlx::core {
 namespace {
 
 constexpr uint32_t kMaxGridZ = 65535;
+constexpr uint32_t kMaxMulMatVecCols = 8;
 constexpr char kMatvecMatrixCastScratchLane[] = "matvec.matrix_f16";
 constexpr char kMatvecVectorCastScratchLane[] = "matvec.vec_f16";
 constexpr char kMatvecOutScratchLane[] = "matvec.out_work";
@@ -71,7 +72,7 @@ bool matvec_enabled() {
   static const bool enabled = []() {
     const char* env = std::getenv("MLX_VULKAN_ENABLE_MATVEC");
     if (env == nullptr) {
-      return false;
+      return true;
     }
     return std::string(env) != "0";
   }();
@@ -487,7 +488,7 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  bool a_is_vec = (a.shape(0) == 1);
+  bool a_is_vec = (a.shape(0) >= 2 && a.shape(0) <= kMaxMulMatVecCols);
   bool b_is_vec = (b.shape(1) == 1);
   bool is_matvec = a_is_vec || b_is_vec;
 

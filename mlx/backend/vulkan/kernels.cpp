@@ -18,6 +18,8 @@
 
 namespace mlx::core::vulkan {
 
+constexpr uint32_t kMaxMulMatVecCols = 8;
+
 namespace {
 
 constexpr char kSoftmaxLargeMaxScratchLane[] = "softmax.large.tmp_max";
@@ -2754,11 +2756,12 @@ void dispatch_mul_mat_vec_op(
     throw std::runtime_error(
         "[vulkan::kernels] Mat-vec dispatch requires rank-2 tensors.");
   }
-  if (vec.shape(0) != 1 || out.shape(0) != 1) {
+  if (vec.shape(0) != out.shape(0)) {
     throw std::runtime_error(
-        "[vulkan::kernels] Mat-vec dispatch expects a single input row.");
+        "[vulkan::kernels] Mat-vec dispatch expects matching batch rows.");
   }
 
+  const uint32_t batch_rows = checked_u32(vec.shape(0), "matvec batch rows");
   const uint32_t ncols = checked_u32(vec.shape(1), "matvec ncols");
   const uint32_t nrows = checked_u32(out.shape(1), "matvec nrows");
   if (checked_u32(matrix.shape(0), "matvec matrix K") != ncols ||
@@ -2777,7 +2780,6 @@ void dispatch_mul_mat_vec_op(
   push_constants.batch_stride_b = ncols;
   push_constants.batch_stride_d = nrows;
   push_constants.fusion_flags = 0;
-  push_constants.base_work_group_y = 0;
   push_constants.ne02 = 1;
   push_constants.ne12 = 1;
   push_constants.broadcast2 = 1;
@@ -2794,17 +2796,30 @@ void dispatch_mul_mat_vec_op(
   constexpr uint32_t kMaxWorkgroupsX = 65535u;
   const uint32_t groups_z = (nrows + kMaxWorkgroupsX - 1u) / kMaxWorkgroupsX;
   const uint32_t groups_x = (nrows + groups_z - 1u) / groups_z;
-  const std::array<uint32_t, 3> grid = {groups_x, 1u, groups_z};
 
-  dispatch_with_spec(
-      shader_id,
-      KernelSpecId::MatVec,
-      bound_arrays,
-      push_constants,
-      nrows,
-      cmd_buffer,
-      s,
-      grid);
+  for (uint32_t base_work_group_y = 0; base_work_group_y < batch_rows;
+       base_work_group_y += kMaxMulMatVecCols) {
+    push_constants.base_work_group_y = base_work_group_y;
+    const uint32_t num_cols =
+        std::min(kMaxMulMatVecCols, batch_rows - base_work_group_y);
+    const std::array<uint32_t, 3> grid = {groups_x, 1u, groups_z};
+    const std::vector<uint32_t> specialization_constants = {
+        32u,
+        1u,
+        num_cols,
+    };
+
+    dispatch_with_spec(
+        shader_id,
+        KernelSpecId::MatVec,
+        bound_arrays,
+        push_constants,
+        nrows,
+        cmd_buffer,
+        s,
+        grid,
+        specialization_constants);
+  }
 }
 
 void dispatch_random_bits_op(

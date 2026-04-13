@@ -445,6 +445,32 @@ struct MatVecPushConstants {
   uint32_t broadcast3;
 };
 
+struct MatVecP021PushConstants {
+  uint32_t ncols_x;
+  uint32_t nrows_x;
+  uint32_t nchannels_x;
+  uint32_t nchannels_y;
+  uint32_t b_offset;
+  uint32_t d_offset;
+  uint32_t fusion_flags;
+};
+
+struct MatVecNcPushConstants {
+  uint32_t ncols_x;
+  uint32_t nrows_x;
+  uint32_t row_stride_x;
+  uint32_t channel_stride_x;
+  uint32_t channel_stride_y;
+  uint32_t channel_x_divisor;
+  uint32_t ne12;
+  uint32_t b_offset;
+  uint32_t d_offset;
+  uint32_t nb03;
+  uint32_t nb13;
+  uint32_t nb23;
+  uint32_t fusion_flags;
+};
+
 struct RandomBitsPushConstants {
   uint32_t num_keys;
   uint32_t bytes_per_key;
@@ -750,6 +776,27 @@ void dispatch_mul_mat_vec_op(
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
     const Stream& s);
+
+void dispatch_mul_mat_vec_p021_op(
+    const array& matrix,
+    const array& vec,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const MatVecP021PushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants);
+
+void dispatch_mul_mat_vec_nc_op(
+    const array& matrix,
+    const array& vec,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const MatVecNcPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
 
 void dispatch_random_bits_op(
     const array& keys,

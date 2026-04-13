@@ -329,6 +329,8 @@ enum class KernelSpecId {
   DiagMaskInf,
   CumsumMultipass,
   MatVec,
+  MatVecP021,
+  MatVecNc,
   Matmul,
   MatmulSplitKReduce,
   RandomBits,
@@ -369,7 +371,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 29> kKernelSpecs = {
+const std::array<KernelSpec, 31> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -425,6 +427,14 @@ const std::array<KernelSpec, 29> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4},
         sizeof(MatVecPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4},
+        sizeof(MatVecP021PushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4},
+        sizeof(MatVecNcPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1, 2},
@@ -2820,6 +2830,62 @@ void dispatch_mul_mat_vec_op(
         grid,
         specialization_constants);
   }
+}
+
+void dispatch_mul_mat_vec_p021_op(
+    const array& matrix,
+    const array& vec,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const MatVecP021PushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants) {
+  const std::array<BoundArray, 5> bound_arrays = {{
+      {&matrix, "src0"},
+      {&vec, "src1"},
+      {&out, "dst"},
+      {&out, "fuse0"},
+      {&out, "fuse1"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::MatVecP021,
+      bound_arrays,
+      push_constants,
+      checked_u32(out.size(), "mul_mat_vec_p021 output elements"),
+      cmd_buffer,
+      s,
+      grid,
+      specialization_constants);
+}
+
+void dispatch_mul_mat_vec_nc_op(
+    const array& matrix,
+    const array& vec,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const MatVecNcPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 5> bound_arrays = {{
+      {&matrix, "src0"},
+      {&vec, "src1"},
+      {&out, "dst"},
+      {&out, "fuse0"},
+      {&out, "fuse1"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::MatVecNc,
+      bound_arrays,
+      push_constants,
+      checked_u32(out.size(), "mul_mat_vec_nc output elements"),
+      cmd_buffer,
+      s,
+      grid);
 }
 
 void dispatch_random_bits_op(

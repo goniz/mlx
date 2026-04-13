@@ -29,6 +29,7 @@ constexpr uint32_t kMaxMulMatVecCols = 8;
 constexpr char kMatvecMatrixCastScratchLane[] = "matvec.matrix_f16";
 constexpr char kMatvecVectorCastScratchLane[] = "matvec.vec_f16";
 constexpr char kMatvecOutScratchLane[] = "matvec.out_work";
+constexpr char kMatvecScoresVOutScratchLane[] = "matvec.scores_v.out_work";
 constexpr char kMulMmACastScratchLane[] = "mul_mm.a_f16";
 constexpr char kMulMmBCastScratchLane[] = "mul_mm.b_f16";
 constexpr char kMulMmOutScratchLane[] = "mul_mm.out_t";
@@ -420,6 +421,36 @@ bool is_row_contiguous_zero_offset(const array& arr) {
       arr.strides(-1) == 1;
 }
 
+struct TensorLayout4D {
+  uint32_t ne00{1};
+  uint32_t ne01{1};
+  uint32_t ne02{1};
+  uint32_t ne03{1};
+};
+
+TensorLayout4D make_tensor_layout_4d(const array& arr) {
+  TensorLayout4D layout;
+  for (size_t i = 0; i < arr.ndim() && i < 4; ++i) {
+    const int src_dim = static_cast<int>(arr.ndim() - 1 - i);
+    const uint32_t dim = static_cast<uint32_t>(arr.shape(src_dim));
+    switch (i) {
+      case 0:
+        layout.ne00 = dim;
+        break;
+      case 1:
+        layout.ne01 = dim;
+        break;
+      case 2:
+        layout.ne02 = dim;
+        break;
+      case 3:
+        layout.ne03 = dim;
+        break;
+    }
+  }
+  return layout;
+}
+
 bool has_vulkan_buffer(const array& arr) {
   auto data = arr.data_shared_ptr();
   return data != nullptr && data->buffer.ptr() != nullptr;
@@ -430,6 +461,149 @@ array cast_to_float16_scratch(const array& arr, Stream s, const char* lane) {
   copy_gpu(arr, out, CopyType::General, s);
   vulkan::mark_scratch_array_written(s, lane);
   return out;
+}
+
+bool ensure_vulkan_buffer(array& arr, Stream s);
+
+bool try_eval_scores_v_matvec_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 2) {
+    return false;
+  }
+
+  array scores = inputs[0];
+  array values = inputs[1];
+  if (scores.dtype() != float32 || values.dtype() != float16 ||
+      out.dtype() != float32) {
+    return false;
+  }
+  if (scores.ndim() != 4 || values.ndim() != 4 || out.ndim() != 4) {
+    return false;
+  }
+  if (scores.shape(-2) != 1 || out.shape(-2) != 1) {
+    return false;
+  }
+  if (scores.shape(-1) != values.shape(-2) ||
+      out.shape(-1) != values.shape(-1)) {
+    return false;
+  }
+  if (scores.shape(0) != values.shape(0) || scores.shape(0) != out.shape(0)) {
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer(scores, s) || !ensure_vulkan_buffer(values, s)) {
+    return false;
+  }
+
+  if (!is_row_contiguous_zero_offset(scores)) {
+    scores = contiguous_copy_gpu(scores, s);
+  }
+  if (!is_row_contiguous_zero_offset(scores)) {
+    return false;
+  }
+
+  array values_t = swapaxes_in_eval(values, -1, -2);
+  if (!ensure_vulkan_buffer(values_t, s)) {
+    return false;
+  }
+  if (!is_row_contiguous_zero_offset(values_t)) {
+    values_t = contiguous_copy_gpu(values_t, s);
+  }
+  if (!is_row_contiguous_zero_offset(values_t)) {
+    return false;
+  }
+
+  array out_work = out;
+  const bool needs_out_copy = !is_row_contiguous_zero_offset(out_work);
+  if (needs_out_copy) {
+    out_work = vulkan::acquire_scratch_array(
+        s, kMatvecScoresVOutScratchLane, out.shape(), float32);
+  }
+
+  const auto matrix_layout = make_tensor_layout_4d(values_t);
+  const auto vec_layout = make_tensor_layout_4d(scores);
+  const uint32_t kv_heads = matrix_layout.ne02;
+  const uint32_t q_heads = vec_layout.ne02;
+  if (kv_heads == 0 || q_heads == 0 || (q_heads % kv_heads) != 0) {
+    return false;
+  }
+  const uint32_t gqa_ratio = q_heads / kv_heads;
+  if (gqa_ratio == 0 || gqa_ratio > 8) {
+    return false;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    bool dispatched = false;
+    if (matrix_layout.ne03 == 1 && gqa_ratio > 1) {
+      for (auto shader_id : {
+               vulkan::StaticShaderId::mul_mat_vec_p021_f16_f32_subgroup_add,
+               vulkan::StaticShaderId::mul_mat_vec_p021_f16_f32,
+           }) {
+        try {
+          vulkan::dispatch_mul_mat_vec_p021_op(
+              values_t,
+              scores,
+              out_work,
+              shader_id,
+              command_buffer,
+              s,
+              {
+                  matrix_layout.ne00,
+                  matrix_layout.ne01,
+                  matrix_layout.ne02,
+                  vec_layout.ne02,
+                  0,
+                  0,
+                  0,
+              },
+              {1u, matrix_layout.ne01, kv_heads},
+              {std::max(vulkan::VulkanContext::get().subgroup_size(), 32u),
+               gqa_ratio});
+          dispatched = true;
+          break;
+        } catch (const std::runtime_error&) {
+        }
+      }
+    }
+
+    if (!dispatched) {
+      vulkan::dispatch_mul_mat_vec_nc_op(
+          values_t,
+          scores,
+          out_work,
+          vulkan::StaticShaderId::mul_mat_vec_nc_f16_f32,
+          command_buffer,
+          s,
+          {
+              matrix_layout.ne00,
+              matrix_layout.ne01,
+              static_cast<uint32_t>(values_t.strides(-2)),
+              static_cast<uint32_t>(values_t.strides(-3)),
+              static_cast<uint32_t>(scores.strides(-3)),
+              gqa_ratio,
+              vec_layout.ne02,
+              0,
+              0,
+              static_cast<uint32_t>(values_t.strides(-4)),
+              static_cast<uint32_t>(scores.strides(-4)),
+              static_cast<uint32_t>(out_work.strides(-4)),
+              0,
+          },
+          {matrix_layout.ne03, matrix_layout.ne01, vec_layout.ne02});
+    }
+    vulkan::end_command_recording(s.index);
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+
+  if (needs_out_copy) {
+    vulkan::mark_scratch_array_written(s, kMatvecScoresVOutScratchLane);
+    copy_gpu(out_work, out, CopyType::General, s);
+  }
+  return true;
 }
 
 bool ensure_vulkan_buffer(array& arr, Stream s) {
@@ -613,6 +787,10 @@ bool try_eval_mul_mm_vulkan(
       !is_supported_matmul_dtype(b.dtype()) ||
       !is_supported_matmul_dtype(out.dtype())) {
     return false;
+  }
+
+  if (try_eval_scores_v_matvec_vulkan(inputs, out, s)) {
+    return true;
   }
 
   if (a.ndim() != b.ndim() || a.ndim() != out.ndim()) {

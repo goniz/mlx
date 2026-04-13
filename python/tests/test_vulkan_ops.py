@@ -199,6 +199,28 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             rtol=5e-2,
         )
 
+    def test_softmax_decode_shape_regressions(self):
+        cases = (
+            (mx.float32, (2, 20, 64), 1e-5, 1e-5),
+            (mx.float32, (3, 4, 5, 256), 1e-5, 1e-5),
+            (mx.float16, (1, 8, 1, 1025), 5e-3, 5e-3),
+        )
+
+        def fn(shape, dtype):
+            size = int(np.prod(shape))
+            x = mx.arange(size, dtype=mx.float32).reshape(shape)
+            x = (x - size / 2) / shape[-1]
+            x = x.astype(dtype)
+            return mx.softmax(x, axis=-1).astype(mx.float32)
+
+        for dtype, shape, atol, rtol in cases:
+            with self.subTest(dtype=str(dtype), shape=shape):
+                self._assert_cpu_gpu_same(
+                    lambda shape=shape, dtype=dtype: fn(shape, dtype),
+                    atol=atol,
+                    rtol=rtol,
+                )
+
     def test_list_getitem_regression(self):
         def fn():
             a = mx.arange(16, dtype=mx.float32).reshape(4, 4)

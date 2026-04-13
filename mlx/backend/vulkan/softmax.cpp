@@ -96,6 +96,8 @@ bool try_eval_softmax_vulkan(
   set_unary_output_data(in, softmax_out_storage);
 
   array out_work = softmax_out_storage;
+  array in_kernel = collapse_softmax_leading_dims(in, s);
+  array out_kernel = collapse_softmax_leading_dims(out_work, s);
 
   if (in.shape() != out_work.shape()) {
     trace_softmax_failure("input_output_shape_mismatch");
@@ -130,8 +132,8 @@ bool try_eval_softmax_vulkan(
     auto command_buffer = vulkan::begin_command_recording(s.index);
     if (use_large_softmax) {
       vulkan::dispatch_softmax_large_op(
-          in,
-          out_work,
+          in_kernel,
+          out_kernel,
           use_f16_variant ? vulkan::StaticShaderId::soft_max_large1_f32_f16
                           : vulkan::StaticShaderId::soft_max_large1_f32,
           use_f16_variant ? vulkan::StaticShaderId::soft_max_large2_f32_f16
@@ -142,8 +144,8 @@ bool try_eval_softmax_vulkan(
           s);
     } else {
       vulkan::dispatch_softmax_op(
-          in,
-          out_work,
+          in_kernel,
+          out_kernel,
           use_f16_variant ? vulkan::StaticShaderId::soft_max_f32_f16
                           : vulkan::StaticShaderId::soft_max_f32,
           command_buffer,

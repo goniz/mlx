@@ -353,6 +353,7 @@ void VulkanContext::init() {
   bool pipeline_robustness_supported = false;
   bool cooperative_matrix_supported = false;
   bool coopmat_flash_attention_f32acc_supported = false;
+  bool coopmat2_conv2d_supported = false;
   bool integer_dot_product_supported = false;
   uint32_t vendor_id = 0;
   GpuArchitecture architecture = GpuArchitecture::Unknown;
@@ -420,6 +421,8 @@ void VulkanContext::init() {
         extensions, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     const bool has_cooperative_matrix_ext = has_device_extension(
         extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    const bool has_nv_cooperative_matrix2_ext = has_device_extension(
+        extensions, "VK_NV_cooperative_matrix2");
     const bool has_shader_integer_dot_product_ext = has_device_extension(
         extensions, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
     const bool has_shader_bfloat16_ext =
@@ -570,6 +573,7 @@ void VulkanContext::init() {
     vk::PhysicalDevicePipelineRobustnessFeaturesEXT
         enabled_pipeline_robustness{};
     vk::PhysicalDeviceCooperativeMatrixFeaturesKHR enabled_cooperative_matrix{};
+    VkPhysicalDeviceCooperativeMatrix2FeaturesNV enabled_cooperative_matrix2{};
     vk::PhysicalDeviceShaderBfloat16FeaturesKHR enabled_shader_bfloat16{};
 
     // Link enabled feature chain (same pattern as supported features)
@@ -657,7 +661,6 @@ void VulkanContext::init() {
       cooperative_matrix_supported = true;
       coopmat_flash_attention_f32acc_supported = false;
 
-      // Check for flash attention support
       auto get_coopmat_props = reinterpret_cast<
           PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
           vkGetInstanceProcAddr(
@@ -691,6 +694,57 @@ void VulkanContext::init() {
       }
     }
 
+    if (has_nv_cooperative_matrix2_ext && cooperative_matrix_supported) {
+      // Query NV_cooperative_matrix2 properties and features
+      VkPhysicalDeviceCooperativeMatrix2PropertiesNV cm2_props{};
+      cm2_props.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_PROPERTIES_NV;
+      VkPhysicalDeviceCooperativeMatrix2FeaturesNV cm2_features{};
+      cm2_features.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV;
+
+      // Append cm2 properties to the properties chain
+      VkBaseOutStructure* prop_tail =
+          reinterpret_cast<VkBaseOutStructure*>(&props2);
+      while (prop_tail->pNext != nullptr) {
+        prop_tail = prop_tail->pNext;
+      }
+      prop_tail->pNext =
+          reinterpret_cast<VkBaseOutStructure*>(&cm2_props);
+
+      // Append cm2 supported features to the features chain
+      VkBaseOutStructure* feat_tail =
+          reinterpret_cast<VkBaseOutStructure*>(&supported_features);
+      while (feat_tail->pNext != nullptr) {
+        feat_tail = feat_tail->pNext;
+      }
+      feat_tail->pNext =
+          reinterpret_cast<VkBaseOutStructure*>(&cm2_features);
+
+      // Re-query with the extended chains
+      physical_device.getFeatures2(&supported_features);
+      physical_device.getProperties2(&props2);
+
+      if (cm2_features.cooperativeMatrixWorkgroupScope &&
+          cm2_features.cooperativeMatrixFlexibleDimensions &&
+          cm2_props.cooperativeMatrixFlexibleDimensionsMaxDimension >= 512) {
+        coopmat2_conv2d_supported = true;
+      }
+    }
+
+    if (coopmat2_conv2d_supported) {
+      enabled_cooperative_matrix2.cooperativeMatrixWorkgroupScope = VK_TRUE;
+      enabled_cooperative_matrix2.cooperativeMatrixFlexibleDimensions = VK_TRUE;
+      // Append to enabled feature chain
+      VkBaseOutStructure* enabled_feat_tail =
+          reinterpret_cast<VkBaseOutStructure*>(&enabled_features);
+      while (enabled_feat_tail->pNext != nullptr) {
+        enabled_feat_tail = enabled_feat_tail->pNext;
+      }
+      enabled_feat_tail->pNext =
+          reinterpret_cast<VkBaseOutStructure*>(&enabled_cooperative_matrix2);
+    }
+
     std::vector<const char*> device_extensions;
     device_extensions.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
     if (subgroup_size_control_supported || subgroup_require_full_support) {
@@ -699,7 +753,7 @@ void VulkanContext::init() {
     if (pipeline_robustness_supported) {
       device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     }
-    if (coopmat_flash_attention_f32acc_supported) {
+    if (cooperative_matrix_supported) {
       device_extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     }
     if (integer_dot_product_supported) {
@@ -708,6 +762,9 @@ void VulkanContext::init() {
     }
     if (shader_bfloat16_supported) {
       device_extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+    }
+    if (coopmat2_conv2d_supported) {
+      device_extensions.push_back(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
     }
 
     vk::DeviceCreateInfo device_create_info;
@@ -770,6 +827,7 @@ void VulkanContext::init() {
     this->coopmat_flash_attention_f32acc_supported_ =
         coopmat_flash_attention_f32acc_supported &&
         subgroup_require_full_support;
+    this->coopmat2_conv2d_supported_ = coopmat2_conv2d_supported;
     this->integer_dot_product_supported_ = integer_dot_product_supported;
     this->vendor_id_ = vendor_id;
     this->architecture_ = architecture;
@@ -830,6 +888,7 @@ void VulkanContext::cleanup() {
   pipeline_robustness_supported_ = false;
   cooperative_matrix_supported_ = false;
   coopmat_flash_attention_f32acc_supported_ = false;
+  coopmat2_conv2d_supported_ = false;
   integer_dot_product_supported_ = false;
   vendor_id_ = 0;
   architecture_ = GpuArchitecture::Unknown;

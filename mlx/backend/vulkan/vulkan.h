@@ -102,6 +102,9 @@ class VulkanContext {
   bool coopmat_flash_attention_f32acc_supported() const {
     return coopmat_flash_attention_f32acc_supported_;
   }
+  bool coopmat2_conv2d_supported() const {
+    return coopmat2_conv2d_supported_;
+  }
   bool integer_dot_product_supported() const {
     return integer_dot_product_supported_;
   }
@@ -157,6 +160,7 @@ class VulkanContext {
   bool pipeline_robustness_supported_{false};
   bool cooperative_matrix_supported_{false};
   bool coopmat_flash_attention_f32acc_supported_{false};
+  bool coopmat2_conv2d_supported_{false};
   bool integer_dot_product_supported_{false};
   uint32_t vendor_id_{0};
   GpuArchitecture architecture_{GpuArchitecture::Unknown};

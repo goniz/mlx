@@ -2505,8 +2505,16 @@ void process_shaders() {
         if (unroll) {
           defines["COOPMAT2"] = "1";
           string_to_spv(name, "conv2d_mm.comp", defines, true, false, true);
+          defines.erase("COOPMAT2");
         }
 #endif
+        if (unroll) {
+          auto coopmat_defines = defines;
+          coopmat_defines["COOPMAT"] = "1";
+         coopmat_defines.erase("COOPMAT2");
+          string_to_spv(
+              name + "_cm1", "conv2d_mm.comp", coopmat_defines);
+        }
       }
     }
   }

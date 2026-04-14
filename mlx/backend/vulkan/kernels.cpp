@@ -26,6 +26,9 @@ constexpr char kSoftmaxLargeMaxScratchLane[] = "softmax.large.tmp_max";
 constexpr char kSoftmaxLargeSumScratchLane[] = "softmax.large.tmp_sum";
 constexpr char kCumsumMultipassScratchLane[] = "cumsum.multipass.tmp";
 constexpr uint32_t kDescriptorSetBatchSize = 32;
+constexpr uint32_t kVendorIdAmd = 0x1002u;
+constexpr uint32_t kVendorIdIntel = 0x8086u;
+constexpr uint32_t kVendorIdNvidia = 0x10DEu;
 
 bool trace_descriptor_epochs_enabled() {
   static const bool enabled = []() {
@@ -182,6 +185,12 @@ PipelineCreationOptions pipeline_creation_options(
     const std::string& shader_name,
     const std::vector<uint32_t>& specialization_constants) {
   PipelineCreationOptions options;
+
+  if ((shader_name == "soft_max_f32" || shader_name == "soft_max_f32_f16") &&
+      !specialization_constants.empty()) {
+    options.required_subgroup_size = specialization_constants[0];
+    return options;
+  }
 
   if (shader_name == "fa_mask_opt") {
     options.disable_robustness = true;
@@ -706,6 +715,31 @@ make_sum_rows_push_constants(const array& in, const array& out, float weight) {
       push_constants.ne01, push_constants.ne0_1mp, push_constants.ne0_1L);
 
   return push_constants;
+}
+
+uint32_t select_softmax_block_size(uint32_t row_width) {
+  if (row_width > 1024u) {
+    return 512u;
+  }
+
+  const auto& context = VulkanContext::get();
+  const uint32_t subgroup_size = std::max(context.subgroup_size(), 1u);
+
+  switch (context.vendor_id()) {
+    case kVendorIdAmd:
+      if (context.subgroup_size_control_supported() &&
+          context.subgroup_min_size() <= 64u &&
+          context.subgroup_max_size() >= 64u) {
+        return 64u;
+      }
+      return std::min(64u, subgroup_size);
+    case kVendorIdNvidia:
+      return 32u;
+    case kVendorIdIntel:
+      return row_width <= 64u ? 8u : 16u;
+    default:
+      return std::min(32u, subgroup_size);
+  }
 }
 
 SoftmaxPushConstants make_softmax_push_constants(
@@ -2260,6 +2294,7 @@ void dispatch_softmax_op(
         "[vulkan::kernels] Softmax elements are not divisible by KX.");
   }
   const uint32_t row_count = total_elements / row_width;
+  const uint32_t block_size = select_softmax_block_size(row_width);
   const auto push_constants =
       make_softmax_push_constants(in, row_width, row_count);
 
@@ -2278,7 +2313,7 @@ void dispatch_softmax_op(
       cmd_buffer,
       s,
       std::nullopt,
-      {32u});
+      {block_size});
 }
 
 void dispatch_softmax_back_op(

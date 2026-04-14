@@ -1,6 +1,8 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout (push_constant) uniform parameter
 {
@@ -34,6 +36,48 @@ layout (binding = 2) readonly buffer Z {float data_c[];};
 layout (binding = 3) buffer D {D_TYPE data_d[];};
 
 shared FLOAT_TYPE vals[BLOCK_SIZE];
+
+bool use_subgroup_reduction() {
+    return gl_NumSubgroups == 1;
+}
+
+FLOAT_TYPE reduce_max(FLOAT_TYPE value, uint tid) {
+    if (use_subgroup_reduction()) {
+        return subgroupMax(value);
+    }
+
+    vals[tid] = value;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            vals[tid] = max(vals[tid], vals[tid + s]);
+        }
+        barrier();
+    }
+
+    value = vals[0];
+    barrier();
+    return value;
+}
+
+FLOAT_TYPE reduce_sum(FLOAT_TYPE value, uint tid) {
+    if (use_subgroup_reduction()) {
+        return subgroupAdd(value);
+    }
+
+    vals[tid] = value;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            vals[tid] += vals[tid + s];
+        }
+        barrier();
+    }
+
+    value = vals[0];
+    barrier();
+    return value;
+}
 
 // num_iters is the number of BLOCK_SIZE loop iterations we need to iterate
 // over all the columns. The main function tries to pass a constant here,
@@ -99,18 +143,7 @@ void soft_max(uint num_iters) {
         }
     }
 
-    // reduce across the workgroup
-    vals[tid] = max_val;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] = max(vals[tid], vals[tid + s]);
-        }
-        barrier();
-    }
-
-    max_val = vals[0];
-    barrier();
+    max_val = reduce_max(max_val, tid);
 
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
 
@@ -139,16 +172,7 @@ void soft_max(uint num_iters) {
         }
     }
 
-    // reduce across the workgroup
-    vals[tid] = sum;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] += vals[tid + s];
-        }
-        barrier();
-    }
-    sum = vals[0];
+    sum = reduce_sum(sum, tid);
 
     if (p.has_sinks != 0) {
         sum += FLOAT_TYPE(exp(FLOAT_TYPE(data_c[i02]) - max_val));

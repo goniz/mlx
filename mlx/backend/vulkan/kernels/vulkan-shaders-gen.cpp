@@ -572,6 +572,69 @@ void matmul_shaders(
       coopmat2,
       f16acc);
 
+  if (matmul_id_type == MatMulIdType::NONE) {
+    string_to_spv(
+        "matmul_direct_f16",
+        source_name,
+        merge_maps(
+            merge_maps(base_dict, float_type_dict_f16),
+            {{"DATA_A_F16", "1"},
+             {"B_TYPE", "float16_t"},
+             {"D_TYPE", "float16_t"},
+             {"D_MANUAL_COOPMAT_STORE", "1"}}),
+        fp16,
+        coopmat,
+        coopmat2,
+        f16acc);
+    string_to_spv(
+        "matmul_direct_f16_bf16",
+        source_name,
+        merge_maps(
+            merge_maps(base_dict, float_type_dict_f16),
+            {{"DATA_A_F16", "1"},
+             {"B_TYPE", "float16_t"},
+             {"D_TYPE", "uint16_t"},
+             {"D_IS_BF16", "1"},
+             {"D_MANUAL_COOPMAT_STORE", "1"}}),
+        fp16,
+        coopmat,
+        coopmat2,
+        f16acc);
+    string_to_spv(
+        "matmul_direct_f16_aligned",
+        source_name,
+        merge_maps(
+            merge_maps(base_dict, float_type_dict_f16),
+            {{"DATA_A_F16", "1"},
+             {"LOAD_VEC_A", load_vec},
+             {"LOAD_VEC_B", load_vec},
+             {"B_TYPE", aligned_b_type_f16},
+             {"D_TYPE", "float16_t"},
+             {"D_MANUAL_COOPMAT_STORE", "1"},
+             {"ALIGNED", "1"}}),
+        fp16,
+        coopmat,
+        coopmat2,
+        f16acc);
+    string_to_spv(
+        "matmul_direct_f16_bf16_aligned",
+        source_name,
+        merge_maps(
+            merge_maps(base_dict, float_type_dict_f16),
+            {{"DATA_A_F16", "1"},
+             {"LOAD_VEC_A", load_vec},
+             {"LOAD_VEC_B", load_vec},
+             {"B_TYPE", aligned_b_type_f16},
+             {"D_TYPE", "uint16_t"},
+             {"D_IS_BF16", "1"},
+             {"D_MANUAL_COOPMAT_STORE", "1"},
+             {"ALIGNED", "1"}}),
+        fp16,
+        coopmat,
+        coopmat2,
+        f16acc);
+  }
+
   // bf16
   {
     // For aligned matmul loads
@@ -626,6 +689,46 @@ void matmul_shaders(
           coopmat,
           coopmat2,
           f16acc);
+
+      if (matmul_id_type == MatMulIdType::NONE) {
+        string_to_spv(
+            "matmul_direct_bf16",
+            source_name,
+            merge_maps(
+                merge_maps(base_dict, float_type_dict_bf16),
+                {{"TO_FLOAT_TYPE", to_float_type},
+                 {"DATA_A_BF16", "1"},
+                 {"B_TYPE", coopmat2 ? "bfloat16_t" : "uint16_t"},
+                 {"D_TYPE", "uint16_t"},
+                 {"D_IS_BF16", "1"},
+                 {"D_MANUAL_COOPMAT_STORE", "1"},
+                 {"B_IS_FLOAT", "1"},
+                 {"DATA_B_BF16", "1"}}),
+            fp16,
+            coopmat,
+            coopmat2,
+            f16acc);
+        string_to_spv(
+            "matmul_direct_bf16_aligned",
+            source_name,
+            merge_maps(
+                merge_maps(base_dict, float_type_dict_bf16),
+                {{"TO_FLOAT_TYPE", to_float_type},
+                 {"DATA_A_BF16", "1"},
+                 {"LOAD_VEC_A", load_vec_a},
+                 {"LOAD_VEC_B", "4"},
+                 {"B_TYPE", coopmat2 ? "bfloat16_t" : "u16vec4"},
+                 {"D_TYPE", "uint16_t"},
+                 {"D_IS_BF16", "1"},
+                 {"D_MANUAL_COOPMAT_STORE", "1"},
+                 {"B_IS_FLOAT", "1"},
+                 {"DATA_B_BF16", "1"},
+                 {"ALIGNED", "1"}}),
+            fp16,
+            coopmat,
+            coopmat2,
+            f16acc);
+      }
     }
   }
 
@@ -1718,6 +1821,16 @@ void process_shaders() {
        {"FLOAT_TYPE", "float"}});
 
   string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
+  string_to_spv(
+      "split_k_reduce_f16",
+      "mul_mat_split_k_reduce.comp",
+      {{"D_TYPE", "float16_t"}, {"D_MANUAL_VEC_STORE", "1"}});
+  string_to_spv(
+      "split_k_reduce_bf16",
+      "mul_mat_split_k_reduce.comp",
+      {{"D_TYPE", "uint16_t"},
+       {"D_IS_BF16", "1"},
+       {"D_MANUAL_VEC_STORE", "1"}});
   string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
   string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});

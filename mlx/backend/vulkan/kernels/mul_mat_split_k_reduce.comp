@@ -2,12 +2,31 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 
+#include "types.glsl"
+
+#if !defined(D_TYPE)
+#define D_TYPE float
+#endif
+
+#if defined(D_IS_BF16)
+D_TYPE to_d_type(float value) {
+    return D_TYPE(fp32_to_bf16(value));
+}
+#else
+D_TYPE to_d_type(float value) {
+    return D_TYPE(value);
+}
+#endif
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 0) readonly buffer A4 {vec4 data_a4[];};
-layout (binding = 1) writeonly buffer D {float data_d[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+#if !defined(D_MANUAL_VEC_STORE)
 layout (binding = 1) writeonly buffer D4 {vec4 data_d4[];};
+#endif
 
 layout (push_constant) uniform parameter {
     uint ne;
@@ -24,6 +43,7 @@ void main() {
 
     // Check if all four components are in bounds and aligned,
     // then use vector loads
+#if !defined(D_MANUAL_VEC_STORE)
     if (idx + 3 < p.ne && (p.ne % 4) == 0) {
         vec4 result = vec4(0.0f);
 
@@ -33,6 +53,7 @@ void main() {
 
         data_d4[idx / 4] = result;
     } else {
+#endif
         [[unroll]] for (uint j = 0; j < 4; ++j) {
             if (idx + j < p.ne) {
                 float result = 0.0f;
@@ -41,8 +62,10 @@ void main() {
                     result += data_a[i * p.ne + idx + j];
                 }
 
-                data_d[idx + j] = result;
+                data_d[idx + j] = to_d_type(result);
             }
         }
+#if !defined(D_MANUAL_VEC_STORE)
     }
+#endif
 }

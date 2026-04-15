@@ -34,6 +34,24 @@
 
 namespace mlx::core::vulkan {
 
+ScopedPrimitiveTracking::ScopedPrimitiveTracking(
+    const Stream& s,
+    std::vector<array> inputs,
+    std::vector<array> outputs)
+    : s_(s), inputs_(std::move(inputs)), outputs_(std::move(outputs)) {
+  if (inputs_.empty() && outputs_.empty()) {
+    return;
+  }
+  begin_primitive_tracking(s_, inputs_, outputs_);
+  active_ = true;
+}
+
+ScopedPrimitiveTracking::~ScopedPrimitiveTracking() {
+  if (active_) {
+    end_primitive_tracking(s_, inputs_, outputs_);
+  }
+}
+
 namespace {
 
 bool deferred_submission_enabled() {

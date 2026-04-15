@@ -496,6 +496,132 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
         gpu_out = self._run_on_device(mx.gpu, run_copy).astype(mx.float32)
         self._assert_outputs_close(gpu_out, cpu_out, atol=1e-2, rtol=1e-2)
 
+    def test_cached_prefill_parity_regression(self):
+        class TinyKVCache:
+            def __init__(self):
+                self.keys = None
+                self.values = None
+                self.offset = 0
+
+            def update_and_fetch(self, keys, values):
+                prev = self.offset
+                if self.keys is None:
+                    batch, n_kv_heads, steps, head_dim = keys.shape
+                    value_dim = values.shape[-1]
+                    alloc_steps = max(steps, 16)
+                    self.keys = mx.zeros(
+                        (batch, n_kv_heads, alloc_steps, head_dim), dtype=keys.dtype
+                    )
+                    self.values = mx.zeros(
+                        (batch, n_kv_heads, alloc_steps, value_dim), dtype=values.dtype
+                    )
+                self.offset += keys.shape[2]
+                self.keys[..., prev : self.offset, :] = keys
+                self.values[..., prev : self.offset, :] = values
+                return (
+                    self.keys[..., : self.offset, :],
+                    self.values[..., : self.offset, :],
+                )
+
+        def run(dtype=mx.bfloat16):
+            batch = 1
+            prompt_len = 13
+            dim = 64
+            n_heads = 4
+            n_kv_heads = 2
+            head_dim = 16
+            vocab = 97
+
+            tokens = mx.arange(prompt_len, dtype=mx.uint32)[None]
+            embed = (
+                mx.arange(vocab * dim, dtype=mx.float32).reshape(vocab, dim) / 97.0
+            ).astype(dtype)
+            w_q = (
+                mx.arange(dim * (n_heads * head_dim), dtype=mx.float32).reshape(
+                    dim, n_heads * head_dim
+                )
+                / 211.0
+            ).astype(dtype)
+            w_k = (
+                mx.arange(dim * (n_kv_heads * head_dim), dtype=mx.float32).reshape(
+                    dim, n_kv_heads * head_dim
+                )
+                / 173.0
+            ).astype(dtype)
+            w_v = (
+                mx.arange(dim * (n_kv_heads * head_dim), dtype=mx.float32).reshape(
+                    dim, n_kv_heads * head_dim
+                )
+                / 157.0
+            ).astype(dtype)
+            w_o = (
+                mx.arange((n_heads * head_dim) * dim, dtype=mx.float32).reshape(
+                    n_heads * head_dim, dim
+                )
+                / 193.0
+            ).astype(dtype)
+            lm_head = (
+                mx.arange(dim * vocab, dtype=mx.float32).reshape(dim, vocab) / 181.0
+            ).astype(dtype)
+
+            def rms_norm(x, eps=1e-5):
+                x_f32 = x.astype(mx.float32)
+                scale = mx.rsqrt(
+                    mx.mean(mx.square(x_f32), axis=-1, keepdims=True) + eps
+                )
+                return (x_f32 * scale).astype(dtype)
+
+            def attention(x, cache=None):
+                q = mx.matmul(x, w_q).reshape(batch, prompt_len, n_heads, head_dim)
+                k = mx.matmul(x, w_k).reshape(batch, prompt_len, n_kv_heads, head_dim)
+                v = mx.matmul(x, w_v).reshape(batch, prompt_len, n_kv_heads, head_dim)
+                q = rms_norm(q).transpose(0, 2, 1, 3)
+                k = rms_norm(k).transpose(0, 2, 1, 3)
+                v = v.transpose(0, 2, 1, 3)
+                if cache is not None:
+                    k, v = cache.update_and_fetch(k, v)
+                out = mx.fast.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=head_dim**-0.5,
+                    mask="causal",
+                )
+                out = out.transpose(0, 2, 1, 3).reshape(batch, prompt_len, dim)
+                return mx.matmul(out, w_o)
+
+            x = embed[tokens]
+            layer_no_cache = attention(rms_norm(x), cache=None)
+            layer_cached = attention(rms_norm(x), cache=TinyKVCache())
+            logits_no_cache = mx.matmul(layer_no_cache, lm_head)[:, -1, :].astype(
+                mx.float32
+            )
+            logits_cached = mx.matmul(layer_cached, lm_head)[:, -1, :].astype(
+                mx.float32
+            )
+            return (
+                layer_no_cache[:, -1, :].astype(mx.float32),
+                layer_cached[:, -1, :].astype(mx.float32),
+                logits_no_cache,
+                logits_cached,
+            )
+
+        cpu_layer_no, cpu_layer_cached, cpu_logits_no, cpu_logits_cached = (
+            self._run_on_device(mx.cpu, run)
+        )
+        gpu_layer_no, gpu_layer_cached, gpu_logits_no, gpu_logits_cached = (
+            self._run_on_device(mx.gpu, run)
+        )
+
+        self._assert_outputs_close(cpu_layer_cached, cpu_layer_no, atol=1e-2, rtol=1e-2)
+        self._assert_outputs_close(
+            cpu_logits_cached, cpu_logits_no, atol=1e-2, rtol=1e-2
+        )
+        self._assert_outputs_close(gpu_layer_cached, gpu_layer_no, atol=1e-2, rtol=1e-2)
+        self._assert_outputs_close(
+            gpu_logits_cached, gpu_logits_no, atol=1e-2, rtol=1e-2
+        )
+
     def test_host_source_slice_cast_copy_vulkan_gpu(self):
         host_src = self._run_on_device(
             mx.cpu,

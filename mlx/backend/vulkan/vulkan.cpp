@@ -286,8 +286,7 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
 
     array a = make_array({2, 3}, bfloat16);
     array b_t = make_array({2, 3}, bfloat16);
-    array out_t = make_array({2, 2}, float32);
-    array out = make_array({2, 2}, float32);
+    array out = make_array({2, 2}, bfloat16);
 
     auto* a_ptr = a.data<bfloat16_t>();
     a_ptr[0] = 1.0f;
@@ -311,7 +310,7 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
     push_constants.K = 3;
     push_constants.stride_a = static_cast<uint32_t>(a.strides(-2));
     push_constants.stride_b = static_cast<uint32_t>(b_t.strides(-2));
-    push_constants.stride_d = static_cast<uint32_t>(out_t.strides(-2));
+    push_constants.stride_d = static_cast<uint32_t>(out.strides(-2));
     push_constants.batch_stride_a = 6;
     push_constants.batch_stride_b = 6;
     push_constants.batch_stride_d = 4;
@@ -334,7 +333,7 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
         dispatch_mul_mm_op(
             a,
             b_t,
-            out_t,
+            out,
             shader_id,
             command_buffer,
             s,
@@ -352,12 +351,13 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
       return false;
     }
 
-    copy_gpu(swapaxes_in_eval(out_t, -1, -2), out, CopyType::General, s);
     synchronize_stream(s);
 
-    const auto* out_ptr = out.data<float>();
-    return nearly_equal(out_ptr[0], 4.0f) && nearly_equal(out_ptr[1], -1.0f) &&
-        nearly_equal(out_ptr[2], 10.0f) && nearly_equal(out_ptr[3], -1.0f);
+    const auto* out_ptr = out.data<bfloat16_t>();
+    return nearly_equal(static_cast<float>(out_ptr[0]), 4.0f) &&
+        nearly_equal(static_cast<float>(out_ptr[1]), -1.0f) &&
+        nearly_equal(static_cast<float>(out_ptr[2]), 10.0f) &&
+        nearly_equal(static_cast<float>(out_ptr[3]), -1.0f);
   } catch (const std::runtime_error&) {
     return false;
   }

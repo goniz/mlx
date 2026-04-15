@@ -2787,8 +2787,8 @@ void dispatch_mul_mm_op(
         "[vulkan::kernels] mul_mm dispatch requires rank >= 2 tensors.");
   }
 
-  const uint32_t m = checked_u32(out.shape(-1), "mul_mm M");
-  const uint32_t n = checked_u32(out.shape(-2), "mul_mm N");
+  const uint32_t m = checked_u32(out.shape(-2), "mul_mm M");
+  const uint32_t n = checked_u32(out.shape(-1), "mul_mm N");
   const uint32_t k = checked_u32(a.shape(-1), "mul_mm K");
   if (checked_u32(a.shape(-2), "mul_mm A M") != m ||
       checked_u32(b.shape(-2), "mul_mm B N") != n ||

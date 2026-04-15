@@ -746,22 +746,22 @@ bool try_eval_matvec_vulkan(
       return false;
     }
     vec = a;
-    matrix = b;
+    matrix = swapaxes_in_eval(b, -1, -2);
   } else if (a_is_vec) {
     if (a.shape(1) != b.shape(0)) {
       return false;
     }
     vec = a;
-    matrix = b;
+    matrix = swapaxes_in_eval(b, -1, -2);
   } else {
     if (b.shape(1) != a.shape(0)) {
       return false;
     }
-    vec = b;
+    vec = swapaxes_in_eval(b, -1, -2);
     matrix = a;
   }
 
-  if (out.shape(0) != vec.shape(0) || out.shape(1) != matrix.shape(1)) {
+  if (out.shape(0) != vec.shape(0) || out.shape(1) != matrix.shape(0)) {
     return false;
   }
 

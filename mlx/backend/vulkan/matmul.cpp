@@ -731,7 +731,7 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  bool a_is_vec = (a.shape(0) >= 2 && a.shape(0) <= kMaxMulMatVecCols);
+  bool a_is_vec = (a.shape(0) >= 1 && a.shape(0) <= kMaxMulMatVecCols);
   bool b_is_vec = (b.shape(1) == 1);
   bool is_matvec = a_is_vec || b_is_vec;
 

@@ -51,8 +51,9 @@ void* Buffer::raw_ptr() {
               << " alloc=" << buf->allocation_size << " flags=0x" << std::hex
               << flags << std::dec << "\n";
   }
-  
-  vulkan::synchronize_all();
+
+  vulkan::synchronize_buffer_for_host_access(buf);
+
   return buf->mapped_ptr;
 }
 

@@ -14,6 +14,8 @@
 
 namespace mlx::core::vulkan {
 
+struct VulkanBuffer;
+
 class ScopedSyncLabel {
  public:
   explicit ScopedSyncLabel(std::string label);
@@ -70,5 +72,6 @@ void finalize_stream(Stream s);
 void synchronize_stream(Stream s);
 void set_force_immediate_submit(Stream s);
 void synchronize_all();
+void synchronize_buffer_for_host_access(VulkanBuffer* buffer);
 
 } // namespace mlx::core::vulkan

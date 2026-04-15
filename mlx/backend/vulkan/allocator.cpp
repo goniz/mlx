@@ -4,13 +4,11 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
-#include <thread>
 #include <vector>
 
 #include "mlx/backend/gpu/device_info.h"
@@ -34,39 +32,6 @@ bool trace_cpu_access_enabled() {
   return enabled;
 }
 
-bool trace_sync_enabled() {
-  const char* env = std::getenv("MLX_VULKAN_TRACE_SYNC");
-  return env != nullptr && std::string(env) != "0";
-}
-
-void trace_raw_ptr_sync(
-    const vulkan::VulkanBuffer& buf,
-    const char* action,
-    vk::Semaphore semaphore,
-    uint64_t timeline_value) {
-  if (!trace_sync_enabled()) {
-    return;
-  }
-
-  using Clock = std::chrono::steady_clock;
-  static const auto start = Clock::now();
-  static std::mutex trace_mutex;
-
-  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      Clock::now() - start)
-                      .count();
-
-  std::lock_guard<std::mutex> lock(trace_mutex);
-  std::cerr << "[vulkan-trace +" << ms
-            << "ms tid=" << std::this_thread::get_id() << "] raw_ptr action="
-            << action << " buffer=" << buf.buffer << " mapped=" << buf.mapped_ptr
-            << " size=" << buf.size;
-  if (semaphore && timeline_value != 0) {
-    std::cerr << " timeline_value=" << timeline_value;
-  }
-  std::cerr << std::endl;
-}
-
 } // namespace
 
 Allocator& allocator() {
@@ -87,40 +52,7 @@ void* Buffer::raw_ptr() {
               << flags << std::dec << "\n";
   }
 
-  vk::Semaphore wait_semaphore;
-  uint64_t wait_timeline_value = 0;
-  {
-    std::lock_guard<std::mutex> affinity_lock(buf->queue_affinity_mutex);
-    wait_semaphore = buf->last_semaphore;
-    wait_timeline_value = buf->last_timeline_value;
-  }
-
-  if (wait_semaphore && wait_timeline_value != 0) {
-    trace_raw_ptr_sync(*buf, "wait-buffer", wait_semaphore, wait_timeline_value);
-
-    vk::SemaphoreWaitInfo wait_info;
-    wait_info.semaphoreCount = 1;
-    wait_info.pSemaphores = &wait_semaphore;
-    wait_info.pValues = &wait_timeline_value;
-
-    auto result = vulkan::VulkanContext::get().device().waitSemaphores(
-        wait_info, UINT64_MAX);
-    if (result != vk::Result::eSuccess) {
-      vulkan::throw_if_vk_error(
-          static_cast<VkResult>(result),
-          "[vulkan::raw_ptr] Failed waiting for buffer timeline");
-    }
-
-    std::lock_guard<std::mutex> affinity_lock(buf->queue_affinity_mutex);
-    if (buf->last_semaphore == wait_semaphore &&
-        buf->last_timeline_value == wait_timeline_value) {
-      buf->last_semaphore = vk::Semaphore();
-      buf->last_timeline_value = 0;
-      buf->queue_affinity = vulkan::VulkanBuffer::QueueAffinity::None;
-    }
-  } else {
-    trace_raw_ptr_sync(*buf, "skip-sync", wait_semaphore, wait_timeline_value);
-  }
+  vulkan::synchronize_buffer_for_host_access(buf);
 
   return buf->mapped_ptr;
 }

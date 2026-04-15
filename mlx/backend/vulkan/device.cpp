@@ -803,6 +803,73 @@ class VulkanDevice {
     trace_sync("sync(all) done");
   }
 
+  void synchronize_buffer_for_host_access(VulkanBuffer* buffer) {
+    if (buffer == nullptr) {
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto& [_, stream] : streams_) {
+        if (!stream->recording ||
+            !stream_has_pending_host_write(stream.get(), buffer)) {
+          continue;
+        }
+
+        submit_commands(
+            stream.get(),
+            "raw_ptr host access",
+            {},
+            {},
+            stream->recording_transfer);
+      }
+    }
+
+    vk::Semaphore wait_semaphore;
+    uint64_t wait_timeline_value = 0;
+    {
+      std::lock_guard<std::mutex> affinity_lock(buffer->queue_affinity_mutex);
+      wait_semaphore = buffer->last_semaphore;
+      wait_timeline_value = buffer->last_timeline_value;
+    }
+
+    std::ostringstream oss;
+    oss << "raw_ptr action="
+        << ((wait_semaphore && wait_timeline_value != 0) ? "wait-buffer"
+                                                         : "skip-sync")
+        << " buffer=" << buffer->buffer << " mapped=" << buffer->mapped_ptr
+        << " size=" << buffer->size;
+    if (wait_semaphore && wait_timeline_value != 0) {
+      oss << " timeline_value=" << wait_timeline_value;
+    }
+    trace_sync(oss.str());
+
+    if (!wait_semaphore || wait_timeline_value == 0) {
+      return;
+    }
+
+    vk::SemaphoreWaitInfo wait_info;
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores = &wait_semaphore;
+    wait_info.pValues = &wait_timeline_value;
+
+    auto result = VulkanContext::get().device().waitSemaphores(
+        wait_info, UINT64_MAX);
+    if (result != vk::Result::eSuccess) {
+      throw_if_vk_error(
+          static_cast<VkResult>(result),
+          "[vulkan::raw_ptr] Failed waiting for buffer timeline");
+    }
+
+    std::lock_guard<std::mutex> affinity_lock(buffer->queue_affinity_mutex);
+    if (buffer->last_semaphore == wait_semaphore &&
+        buffer->last_timeline_value == wait_timeline_value) {
+      buffer->last_semaphore = vk::Semaphore();
+      buffer->last_timeline_value = 0;
+      buffer->queue_affinity = VulkanBuffer::QueueAffinity::None;
+    }
+  }
+
   void retain_array(int stream_index, const array& arr) {
     auto* stream = get_stream(stream_index);
     auto data = arr.data_shared_ptr();
@@ -1598,6 +1665,18 @@ class VulkanDevice {
 
   static bool overlaps(const BufferAccessRange& a, const BufferAccessRange& b) {
     return a.buffer == b.buffer && a.begin < b.end && b.begin < a.end;
+  }
+
+  static bool stream_has_pending_host_write(
+      const StreamData* stream,
+      const VulkanBuffer* buffer) {
+    for (const auto& write : stream->unsynced_writes) {
+      if (write.storage == buffer) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   static bool has_access_hazard(
@@ -2420,6 +2499,10 @@ void set_force_immediate_submit(Stream s) {
 
 void synchronize_all() {
   VulkanDevice::get().synchronize();
+}
+
+void synchronize_buffer_for_host_access(VulkanBuffer* buffer) {
+  VulkanDevice::get().synchronize_buffer_for_host_access(buffer);
 }
 
 } // namespace mlx::core::vulkan

@@ -433,6 +433,12 @@ uint32_t round_up_div(uint32_t value, uint32_t divisor) {
 
 uint32_t
 choose_split_k(uint32_t k, uint32_t num_batches, uint32_t split_k_threshold) {
+  // Latency-sensitive decode/prefill paths on current Vulkan targets perform
+  // better without split-K for the common K<=4096 regime.
+  if (num_batches == 1u && k <= 4096u) {
+    return 1u;
+  }
+
   if (split_k_threshold == 0 || k < split_k_threshold || num_batches > 2u) {
     return 1u;
   }

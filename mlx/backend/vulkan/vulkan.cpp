@@ -286,7 +286,8 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
 
     array a = make_array({2, 3}, bfloat16);
     array b_t = make_array({2, 3}, bfloat16);
-    array out = make_array({2, 2}, bfloat16);
+    array out_t = make_array({2, 2}, float32);
+    array out = make_array({2, 2}, float32);
 
     auto* a_ptr = a.data<bfloat16_t>();
     a_ptr[0] = 1.0f;
@@ -304,60 +305,90 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
     b_ptr[4] = 1.0f;
     b_ptr[5] = -1.0f;
 
-    MatmulPushConstants push_constants{};
-    push_constants.M = 2;
-    push_constants.N = 2;
-    push_constants.K = 3;
-    push_constants.stride_a = static_cast<uint32_t>(a.strides(-2));
-    push_constants.stride_b = static_cast<uint32_t>(b_t.strides(-2));
-    push_constants.stride_d = static_cast<uint32_t>(out.strides(-2));
-    push_constants.batch_stride_a = 6;
-    push_constants.batch_stride_b = 6;
-    push_constants.batch_stride_d = 4;
-    push_constants.num_batches = 1;
-    push_constants.k_split = 3;
-    push_constants.ne02 = 1;
-    push_constants.ne12 = 1;
-    push_constants.broadcast2 = 1;
-    push_constants.broadcast3 = 1;
-    push_constants.padded_N = 2;
-    push_constants.base_work_group_z = 0;
+    auto verify_fp32 = [](const array& out_arr) {
+      const auto* out_ptr = out_arr.data<float>();
+      return nearly_equal(out_ptr[0], 4.0f) &&
+          nearly_equal(out_ptr[1], -1.0f) &&
+          nearly_equal(out_ptr[2], 10.0f) &&
+          nearly_equal(out_ptr[3], -1.0f);
+    };
 
-    bool dispatched = false;
+    auto verify_bf16 = [](const array& out_arr) {
+      const auto* out_ptr = out_arr.data<bfloat16_t>();
+      return nearly_equal(static_cast<float>(out_ptr[0]), 4.0f) &&
+          nearly_equal(static_cast<float>(out_ptr[1]), -1.0f) &&
+          nearly_equal(static_cast<float>(out_ptr[2]), 10.0f) &&
+          nearly_equal(static_cast<float>(out_ptr[3]), -1.0f);
+    };
+
+    auto dispatch_probe = [&](StaticShaderId shader_id, array& dst) {
+      MatmulPushConstants push_constants{};
+      push_constants.M = 2;
+      push_constants.N = 2;
+      push_constants.K = 3;
+      push_constants.stride_a = static_cast<uint32_t>(a.strides(-2));
+      push_constants.stride_b = static_cast<uint32_t>(b_t.strides(-2));
+      push_constants.stride_d = static_cast<uint32_t>(dst.strides(-2));
+      push_constants.batch_stride_a = 6;
+      push_constants.batch_stride_b = 6;
+      push_constants.batch_stride_d =
+          static_cast<uint32_t>(dst.shape(-2) * dst.shape(-1));
+      push_constants.num_batches = 1;
+      push_constants.k_split = 3;
+      push_constants.ne02 = 1;
+      push_constants.ne12 = 1;
+      push_constants.broadcast2 = 1;
+      push_constants.broadcast3 = 1;
+      push_constants.padded_N = 2;
+      push_constants.base_work_group_z = 0;
+
+      auto command_buffer = begin_command_recording(s.index);
+      dispatch_mul_mm_op(
+          a,
+          b_t,
+          dst,
+          shader_id,
+          command_buffer,
+          s,
+          push_constants,
+          {1u, 1u, 1u});
+      end_command_recording(s.index);
+    };
+
     for (auto shader_id : {
-             StaticShaderId::matmul_bf16,
-             StaticShaderId::matmul_bf16_fp32,
+             StaticShaderId::matmul_direct_bf16,
+             StaticShaderId::matmul_direct_bf16_f16acc,
          }) {
       try {
-        auto command_buffer = begin_command_recording(s.index);
-        dispatch_mul_mm_op(
-            a,
-            b_t,
-            out,
-            shader_id,
-            command_buffer,
-            s,
-            push_constants,
-            {1u, 1u, 1u});
-        end_command_recording(s.index);
-        dispatched = true;
-        break;
+        array out_direct = make_array({2, 2}, bfloat16);
+        dispatch_probe(shader_id, out_direct);
+        synchronize_stream(s);
+        if (verify_bf16(out_direct)) {
+          return true;
+        }
       } catch (const std::runtime_error&) {
       }
     }
 
-    if (!dispatched) {
-      synchronize_stream(s);
-      return false;
+    for (auto shader_id : {
+             StaticShaderId::matmul_bf16_fp32,
+             StaticShaderId::matmul_bf16,
+         }) {
+      try {
+        array out_t = make_array({2, 2}, float32);
+        array out = make_array({2, 2}, float32);
+        dispatch_probe(shader_id, out_t);
+        copy_gpu(swapaxes_in_eval(out_t, -1, -2), out, CopyType::General, s);
+        synchronize_stream(s);
+        if (verify_fp32(out)) {
+          return true;
+        }
+      } catch (const std::runtime_error&) {
+      }
     }
 
     synchronize_stream(s);
-
-    const auto* out_ptr = out.data<bfloat16_t>();
-    return nearly_equal(static_cast<float>(out_ptr[0]), 4.0f) &&
-        nearly_equal(static_cast<float>(out_ptr[1]), -1.0f) &&
-        nearly_equal(static_cast<float>(out_ptr[2]), 10.0f) &&
-        nearly_equal(static_cast<float>(out_ptr[3]), -1.0f);
+    return false;
   } catch (const std::runtime_error&) {
     return false;
   }

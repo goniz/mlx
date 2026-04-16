@@ -1203,6 +1203,17 @@ void copy_gpu_inplace(
   auto out_view = make_copy_view(
       out, dispatch_shape, dispatch_o_strides, resolved_o_offset);
 
+  std::vector<array> tracking_inputs;
+  std::vector<array> tracking_outputs;
+  if (vulkan::is_vulkan_buffer(in_view.buffer())) {
+    tracking_inputs.push_back(in_view);
+  }
+  if (vulkan::is_vulkan_buffer(out_view.buffer())) {
+    tracking_outputs.push_back(out_view);
+  }
+  vulkan::ScopedPrimitiveTracking tracking_scope(
+      s, std::move(tracking_inputs), std::move(tracking_outputs));
+
   const bool same_dtype = source->dtype() == out.dtype();
   const bool raw_buffer_copy = same_dtype && ctype == CopyType::Vector;
 

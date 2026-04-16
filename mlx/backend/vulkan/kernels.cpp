@@ -2787,8 +2787,8 @@ void dispatch_mul_mm_op(
         "[vulkan::kernels] mul_mm dispatch requires rank >= 2 tensors.");
   }
 
-  const uint32_t m = checked_u32(out.shape(-1), "mul_mm M");
-  const uint32_t n = checked_u32(out.shape(-2), "mul_mm N");
+  const uint32_t m = checked_u32(out.shape(-2), "mul_mm M");
+  const uint32_t n = checked_u32(out.shape(-1), "mul_mm N");
   const uint32_t k = checked_u32(a.shape(-1), "mul_mm K");
   if (checked_u32(a.shape(-2), "mul_mm A M") != m ||
       checked_u32(b.shape(-2), "mul_mm B N") != n ||
@@ -2865,8 +2865,8 @@ void dispatch_mul_mat_vec_op(
   const uint32_t batch_rows = checked_u32(vec.shape(0), "matvec batch rows");
   const uint32_t ncols = checked_u32(vec.shape(1), "matvec ncols");
   const uint32_t nrows = checked_u32(out.shape(1), "matvec nrows");
-  if (checked_u32(matrix.shape(0), "matvec matrix K") != ncols ||
-      checked_u32(matrix.shape(1), "matvec matrix N") != nrows) {
+  if (checked_u32(matrix.shape(0), "matvec matrix N") != nrows ||
+      checked_u32(matrix.shape(1), "matvec matrix K") != ncols) {
     throw std::runtime_error(
         "[vulkan::kernels] Mat-vec dispatch received incompatible shapes.");
   }

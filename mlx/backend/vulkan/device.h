@@ -25,6 +25,24 @@ class ScopedSyncLabel {
   bool active_{false};
 };
 
+class ScopedPrimitiveTracking {
+ public:
+  ScopedPrimitiveTracking(
+      const Stream& s,
+      std::vector<array> inputs,
+      std::vector<array> outputs);
+  ~ScopedPrimitiveTracking();
+
+  ScopedPrimitiveTracking(const ScopedPrimitiveTracking&) = delete;
+  ScopedPrimitiveTracking& operator=(const ScopedPrimitiveTracking&) = delete;
+
+ private:
+  Stream s_;
+  std::vector<array> inputs_;
+  std::vector<array> outputs_;
+  bool active_{false};
+};
+
 // Command buffer management - Use C++ API types
 vk::CommandBuffer begin_command_recording(int stream_index);
 void end_command_recording(int stream_index);

@@ -32,7 +32,7 @@ constexpr char kMatvecOutScratchLane[] = "matvec.out_work";
 constexpr char kMatvecScoresVOutScratchLane[] = "matvec.scores_v.out_work";
 constexpr char kMulMmACastScratchLane[] = "mul_mm.a_f16";
 constexpr char kMulMmBCastScratchLane[] = "mul_mm.b_f16";
-constexpr char kMulMmOutScratchLane[] = "mul_mm.out_t";
+constexpr char kMulMmOutScratchLane[] = "mul_mm.out_work";
 constexpr char kMulMmSplitKScratchLane[] = "mul_mm.split_k";
 
 bool is_supported_matmul_dtype(Dtype dtype) {
@@ -93,17 +93,6 @@ bool mul_mm_enabled() {
     const char* env = std::getenv("MLX_VULKAN_ENABLE_MUL_MM");
     if (env == nullptr) {
       return true;
-    }
-    return std::string(env) != "0";
-  }();
-  return enabled;
-}
-
-bool mul_mm_batch_sync_enabled() {
-  static const bool enabled = []() {
-    const char* env = std::getenv("MLX_VULKAN_MUL_MM_BATCH_SYNC");
-    if (env == nullptr) {
-      return false;
     }
     return std::string(env) != "0";
   }();
@@ -283,6 +272,77 @@ std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(
   }
 }
 
+std::vector<vulkan::StaticShaderId> mul_mm_direct_shader_candidates(
+    Dtype input_dtype,
+    Dtype output_dtype,
+    bool prefer_fp32_accum) {
+  switch (input_dtype) {
+    case float16:
+      switch (output_dtype) {
+        case float16:
+          return prefer_fp32_accum
+              ? std::vector<vulkan::StaticShaderId>{
+                    vulkan::StaticShaderId::matmul_direct_f16,
+                    vulkan::StaticShaderId::matmul_direct_f16_f16acc,
+                }
+              : std::vector<vulkan::StaticShaderId>{
+                    vulkan::StaticShaderId::matmul_direct_f16_f16acc,
+                    vulkan::StaticShaderId::matmul_direct_f16,
+                };
+        case bfloat16:
+          return prefer_fp32_accum
+              ? std::vector<vulkan::StaticShaderId>{
+                    vulkan::StaticShaderId::matmul_direct_f16_bf16,
+                    vulkan::StaticShaderId::matmul_direct_f16_bf16_f16acc,
+                }
+              : std::vector<vulkan::StaticShaderId>{
+                    vulkan::StaticShaderId::matmul_direct_f16_bf16_f16acc,
+                    vulkan::StaticShaderId::matmul_direct_f16_bf16,
+                };
+        case float32:
+          return mul_mm_shader_candidates(input_dtype, prefer_fp32_accum);
+        default:
+          return {};
+      }
+    case bfloat16:
+      if (!vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+        return {};
+      }
+      if (output_dtype != bfloat16) {
+        return output_dtype == float32
+            ? mul_mm_shader_candidates(input_dtype, prefer_fp32_accum)
+            : std::vector<vulkan::StaticShaderId>{};
+      }
+      return prefer_fp32_accum
+          ? std::vector<vulkan::StaticShaderId>{
+                vulkan::StaticShaderId::matmul_direct_bf16,
+                vulkan::StaticShaderId::matmul_direct_bf16_f16acc,
+            }
+          : std::vector<vulkan::StaticShaderId>{
+                vulkan::StaticShaderId::matmul_direct_bf16_f16acc,
+                vulkan::StaticShaderId::matmul_direct_bf16,
+            };
+    case float32:
+      return output_dtype == float32
+          ? mul_mm_shader_candidates(input_dtype, prefer_fp32_accum)
+          : std::vector<vulkan::StaticShaderId>{};
+    default:
+      return {};
+  }
+}
+
+vulkan::StaticShaderId split_k_reduce_shader_id(Dtype out_dtype) {
+  switch (out_dtype) {
+    case float16:
+      return vulkan::StaticShaderId::split_k_reduce_f16;
+    case bfloat16:
+      return vulkan::StaticShaderId::split_k_reduce_bf16;
+    case float32:
+    default:
+      return vulkan::StaticShaderId::split_k_reduce;
+  }
+}
+
 const char* matmul_family_name(MatmulFamily family) {
   switch (family) {
     case MatmulFamily::Small:
@@ -373,6 +433,12 @@ uint32_t round_up_div(uint32_t value, uint32_t divisor) {
 
 uint32_t
 choose_split_k(uint32_t k, uint32_t num_batches, uint32_t split_k_threshold) {
+  // Latency-sensitive decode/prefill paths on current Vulkan targets perform
+  // better without split-K for the common K<=4096 regime.
+  if (num_batches == 1u && k <= 4096u) {
+    return 1u;
+  }
+
   if (split_k_threshold == 0 || k < split_k_threshold || num_batches > 2u) {
     return 1u;
   }
@@ -671,7 +737,7 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  bool a_is_vec = (a.shape(0) >= 2 && a.shape(0) <= kMaxMulMatVecCols);
+  bool a_is_vec = (a.shape(0) >= 1 && a.shape(0) <= kMaxMulMatVecCols);
   bool b_is_vec = (b.shape(1) == 1);
   bool is_matvec = a_is_vec || b_is_vec;
 
@@ -686,22 +752,22 @@ bool try_eval_matvec_vulkan(
       return false;
     }
     vec = a;
-    matrix = b;
+    matrix = swapaxes_in_eval(b, -1, -2);
   } else if (a_is_vec) {
     if (a.shape(1) != b.shape(0)) {
       return false;
     }
     vec = a;
-    matrix = b;
+    matrix = swapaxes_in_eval(b, -1, -2);
   } else {
     if (b.shape(1) != a.shape(0)) {
       return false;
     }
-    vec = b;
+    vec = swapaxes_in_eval(b, -1, -2);
     matrix = a;
   }
 
-  if (out.shape(0) != vec.shape(0) || out.shape(1) != matrix.shape(1)) {
+  if (out.shape(0) != vec.shape(0) || out.shape(1) != matrix.shape(0)) {
     return false;
   }
 
@@ -868,22 +934,14 @@ bool try_eval_mul_mm_vulkan(
     return false;
   }
 
-  Shape out_t_shape = out.shape();
-  std::swap(
-      out_t_shape[out_t_shape.size() - 1], out_t_shape[out_t_shape.size() - 2]);
-  array out_t = vulkan::acquire_scratch_array(
-      s, kMulMmOutScratchLane, out_t_shape, float32);
-
-  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b_t, s) ||
-      !ensure_vulkan_buffer(out_t, s)) {
+  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b_t, s)) {
     if (matmul_debug_enabled()) {
       std::cerr << "[vulkan::mul_mm] missing buffer"
                 << " a=" << has_vulkan_buffer(a) << " a_status=" << a.status()
                 << " a_has_primitive=" << a.has_primitive()
                 << " b_t=" << has_vulkan_buffer(b_t)
                 << " b_t_status=" << b_t.status()
-                << " b_t_has_primitive=" << b_t.has_primitive()
-                << " out_t=" << has_vulkan_buffer(out_t) << "\n";
+                << " b_t_has_primitive=" << b_t.has_primitive() << "\n";
     }
     return false;
   }
@@ -892,26 +950,15 @@ bool try_eval_mul_mm_vulkan(
   const uint32_t n = static_cast<uint32_t>(out.shape(-1));
   const uint32_t k = static_cast<uint32_t>(a.shape(-1));
   auto tuning = select_matmul_dispatch_tuning(a.dtype(), m, n, k);
-  auto shader_candidates =
-      mul_mm_shader_candidates(a.dtype(), tuning.prefer_fp32_accum);
-  if (shader_candidates.empty()) {
-    return false;
-  }
 
   const uint32_t batch_stride_a =
       static_cast<uint32_t>(a.shape(-2) * a.shape(-1));
   const uint32_t batch_stride_b =
       static_cast<uint32_t>(b_t.shape(-2) * b_t.shape(-1));
-  const uint32_t batch_stride_d =
-      static_cast<uint32_t>(out_t.shape(-2) * out_t.shape(-1));
 
   uint64_t num_batches_u64 = 1;
   for (int i = 0; i < static_cast<int>(out.ndim()) - 2; ++i) {
     num_batches_u64 *= static_cast<uint64_t>(out.shape(i));
-  }
-  if (num_batches_u64 == 0) {
-    copy_gpu(swapaxes_in_eval(out_t, -1, -2), out, CopyType::General, s);
-    return true;
   }
   if (num_batches_u64 > std::numeric_limits<uint32_t>::max()) {
     return false;
@@ -919,50 +966,6 @@ bool try_eval_mul_mm_vulkan(
   const uint32_t num_batches = static_cast<uint32_t>(num_batches_u64);
   const uint32_t split_k =
       choose_split_k(k, num_batches, tuning.split_k_threshold);
-
-  std::optional<array> split_k_out;
-  if (split_k > 1u) {
-    const uint64_t split_k_elems = static_cast<uint64_t>(batch_stride_d) *
-        static_cast<uint64_t>(num_batches) * static_cast<uint64_t>(split_k);
-    if (split_k_elems >
-        static_cast<uint64_t>(std::numeric_limits<int>::max())) {
-      return false;
-    }
-    split_k_out = vulkan::acquire_scratch_array(
-        s,
-        kMulMmSplitKScratchLane,
-        {
-            static_cast<int>(split_k * num_batches),
-            static_cast<int>(n),
-            static_cast<int>(m),
-        },
-        float32);
-    if (!ensure_vulkan_buffer(*split_k_out, s)) {
-      return false;
-    }
-  }
-
-  if (num_batches > 1) {
-    ::mlx::core::gpu::synchronize(s);
-  }
-
-  vulkan::MatmulPushConstants push_constants{};
-  push_constants.M = m;
-  push_constants.N = n;
-  push_constants.K = k;
-  push_constants.stride_a = static_cast<uint32_t>(a.strides(-2));
-  push_constants.stride_b = static_cast<uint32_t>(b_t.strides(-2));
-  push_constants.stride_d = static_cast<uint32_t>(out_t.strides(-2));
-  push_constants.batch_stride_a = batch_stride_a;
-  push_constants.batch_stride_b = batch_stride_b;
-  push_constants.batch_stride_d = batch_stride_d;
-  push_constants.num_batches = num_batches;
-  push_constants.k_split = round_up_div(k, split_k);
-  push_constants.ne02 = num_batches;
-  push_constants.ne12 = num_batches;
-  push_constants.broadcast2 = 1;
-  push_constants.broadcast3 = 1;
-  push_constants.padded_N = n;
 
   const uint32_t tile_m = tuning.specialization_constants.size() > 1
       ? tuning.specialization_constants[1]
@@ -973,124 +976,210 @@ bool try_eval_mul_mm_vulkan(
   const uint32_t blocks_m = (m + tile_m - 1) / tile_m;
   const uint32_t blocks_n = (n + tile_n - 1) / tile_n;
 
-  if (matmul_debug_enabled()) {
-    std::cerr << "[vulkan::mul_mm] a_shape=" << a.shape()
-              << " a_strides=" << a.strides() << " b_t_shape=" << b_t.shape()
-              << " b_t_strides=" << b_t.strides()
-              << " out_t_shape=" << out_t.shape()
-              << " out_t_strides=" << out_t.strides() << " pc(M,N,K)=" << m
-              << "," << n << "," << k
-              << " stride(a,b,d)=" << push_constants.stride_a << ","
-              << push_constants.stride_b << "," << push_constants.stride_d
-              << " batch=" << num_batches
-              << " family=" << matmul_family_name(tuning.family)
-              << " aligned=" << tuning.aligned
-              << " subgroup=" << tuning.specialization_constants[10]
-              << " fp32_accum=" << tuning.prefer_fp32_accum
-              << " split_k_threshold=" << tuning.split_k_threshold
-              << " split_k=" << split_k << "\n";
-  }
-
-  for (const auto shader_id : shader_candidates) {
-    bool dispatched = true;
-    bool should_recover_stream = false;
-    try {
-      auto command_buffer = vulkan::begin_command_recording(s.index);
-      for (uint32_t base_z = 0; base_z < num_batches; base_z += kMaxGridZ) {
-        const uint32_t chunk_z = std::min(kMaxGridZ, num_batches - base_z);
-        push_constants.base_work_group_z = base_z;
-        const std::array<uint32_t, 3> grid = {
-            blocks_m * split_k,
-            blocks_n,
-            chunk_z,
-        };
-
-        vulkan::dispatch_mul_mm_op(
-            a,
-            b_t,
-            split_k_out.has_value() ? *split_k_out : out_t,
-            shader_id,
-            command_buffer,
-            s,
-            push_constants,
-            grid,
-            tuning.specialization_constants);
-      }
-
-      if (split_k_out.has_value()) {
-        insert_compute_barrier(command_buffer);
-        vulkan::MatmulSplitKReducePushConstants reduce_push_constants{};
-        reduce_push_constants.ne = batch_stride_d * num_batches;
-        reduce_push_constants.k_num = split_k;
-        vulkan::dispatch_matmul_split_k_reduce_op(
-            *split_k_out,
-            out_t,
-            vulkan::StaticShaderId::split_k_reduce,
-            command_buffer,
-            s,
-            reduce_push_constants,
-            {
-                round_up_div(batch_stride_d * num_batches, 256u * 4u),
-                1u,
-                1u,
-            },
-            {});
-        vulkan::mark_scratch_array_written(s, kMulMmSplitKScratchLane);
-      }
-
-      vulkan::end_command_recording(s.index);
-    } catch (const std::runtime_error& e) {
-      if (matmul_debug_enabled()) {
-        std::cerr << "[vulkan::mul_mm] shader="
-                  << vulkan::static_shader_name(shader_id)
-                  << " failed: " << e.what() << "\n";
-      }
-      const std::string message = e.what();
-      if (message.find("[vulkan::submit_commands]") != std::string::npos ||
-          message.find("VkResult=") != std::string::npos) {
-        should_recover_stream = true;
-      }
-      dispatched = false;
+  auto try_dispatch = [&](const std::vector<vulkan::StaticShaderId>& shader_candidates,
+                          array& out_work,
+                          bool needs_out_copy) {
+    if (shader_candidates.empty()) {
+      return false;
     }
 
-    if (dispatched) {
-      if (matmul_debug_enabled()) {
-        std::cerr << "[vulkan::mul_mm] shader="
-                  << vulkan::static_shader_name(shader_id) << " dispatched\n";
+    const uint32_t batch_stride_d =
+        static_cast<uint32_t>(out_work.shape(-2) * out_work.shape(-1));
+
+    if (num_batches_u64 == 0) {
+      if (needs_out_copy) {
+        vulkan::mark_scratch_array_written(s, kMulMmOutScratchLane);
+        copy_gpu(out_work, out, CopyType::General, s);
       }
-      vulkan::mark_scratch_array_written(s, kMulMmOutScratchLane);
-      try {
-        if (matmul_debug_enabled()) {
-          std::cerr << "[vulkan::mul_mm] begin output copy\n";
-        }
-        copy_gpu(swapaxes_in_eval(out_t, -1, -2), out, CopyType::General, s);
-        if (matmul_debug_enabled()) {
-          std::cerr << "[vulkan::mul_mm] end output copy\n";
-        }
-        if (num_batches > 1) {
-          ::mlx::core::gpu::synchronize(s);
-          if (matmul_debug_enabled()) {
-            std::cerr << "[vulkan::mul_mm] post-copy synchronize done\n";
-          }
-        }
-        return true;
-      } catch (const std::runtime_error& e) {
-        if (matmul_debug_enabled()) {
-          std::cerr << "[vulkan::mul_mm] output copy failed: " << e.what()
-                    << "\n";
-        }
-        disable_mul_mm_runtime(e.what());
+      return true;
+    }
+
+    std::optional<array> split_k_out;
+    if (split_k > 1u) {
+      const uint64_t split_k_elems = static_cast<uint64_t>(batch_stride_d) *
+          static_cast<uint64_t>(num_batches) * static_cast<uint64_t>(split_k);
+      if (split_k_elems >
+          static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        return false;
+      }
+      split_k_out = vulkan::acquire_scratch_array(
+          s,
+          kMulMmSplitKScratchLane,
+          {
+              static_cast<int>(split_k * num_batches),
+              static_cast<int>(m),
+              static_cast<int>(n),
+          },
+          float32);
+      if (!ensure_vulkan_buffer(*split_k_out, s)) {
         return false;
       }
     }
 
-    if (should_recover_stream) {
-      disable_mul_mm_runtime("submit failure");
-      return false;
+    vulkan::MatmulPushConstants push_constants{};
+    push_constants.M = m;
+    push_constants.N = n;
+    push_constants.K = k;
+    push_constants.stride_a = static_cast<uint32_t>(a.strides(-2));
+    push_constants.stride_b = static_cast<uint32_t>(b_t.strides(-2));
+    push_constants.stride_d = static_cast<uint32_t>(out_work.strides(-2));
+    push_constants.batch_stride_a = batch_stride_a;
+    push_constants.batch_stride_b = batch_stride_b;
+    push_constants.batch_stride_d = batch_stride_d;
+    push_constants.num_batches = num_batches;
+    push_constants.k_split = round_up_div(k, split_k);
+    push_constants.ne02 = num_batches;
+    push_constants.ne12 = num_batches;
+    push_constants.broadcast2 = 1;
+    push_constants.broadcast3 = 1;
+    push_constants.padded_N = n;
+
+    if (matmul_debug_enabled()) {
+      std::cerr << "[vulkan::mul_mm] a_shape=" << a.shape()
+                << " a_strides=" << a.strides() << " b_t_shape=" << b_t.shape()
+                << " b_t_strides=" << b_t.strides()
+                << " out_shape=" << out_work.shape()
+                << " out_strides=" << out_work.strides() << " pc(M,N,K)=" << m
+                << "," << n << "," << k
+                << " stride(a,b,d)=" << push_constants.stride_a << ","
+                << push_constants.stride_b << "," << push_constants.stride_d
+                << " batch=" << num_batches
+                << " family=" << matmul_family_name(tuning.family)
+                << " aligned=" << tuning.aligned
+                << " subgroup=" << tuning.specialization_constants[10]
+                << " fp32_accum=" << tuning.prefer_fp32_accum
+                << " split_k_threshold=" << tuning.split_k_threshold
+                << " split_k=" << split_k << "\n";
+    }
+
+    for (const auto shader_id : shader_candidates) {
+      bool dispatched = true;
+      bool should_recover_stream = false;
+      try {
+        auto command_buffer = vulkan::begin_command_recording(s.index);
+        for (uint32_t base_z = 0; base_z < num_batches; base_z += kMaxGridZ) {
+          const uint32_t chunk_z = std::min(kMaxGridZ, num_batches - base_z);
+          push_constants.base_work_group_z = base_z;
+          const std::array<uint32_t, 3> grid = {
+              blocks_m * split_k,
+              blocks_n,
+              chunk_z,
+          };
+
+          vulkan::dispatch_mul_mm_op(
+              a,
+              b_t,
+              split_k_out.has_value() ? *split_k_out : out_work,
+              shader_id,
+              command_buffer,
+              s,
+              push_constants,
+              grid,
+              tuning.specialization_constants);
+        }
+
+        if (split_k_out.has_value()) {
+          insert_compute_barrier(command_buffer);
+          vulkan::MatmulSplitKReducePushConstants reduce_push_constants{};
+          reduce_push_constants.ne = batch_stride_d * num_batches;
+          reduce_push_constants.k_num = split_k;
+          vulkan::dispatch_matmul_split_k_reduce_op(
+              *split_k_out,
+              out_work,
+              split_k_reduce_shader_id(out_work.dtype()),
+              command_buffer,
+              s,
+              reduce_push_constants,
+              {
+                  round_up_div(batch_stride_d * num_batches, 256u * 4u),
+                  1u,
+                  1u,
+              },
+              {});
+          vulkan::mark_scratch_array_written(s, kMulMmSplitKScratchLane);
+        }
+
+        vulkan::end_command_recording(s.index);
+      } catch (const std::runtime_error& e) {
+        if (matmul_debug_enabled()) {
+          std::cerr << "[vulkan::mul_mm] shader="
+                    << vulkan::static_shader_name(shader_id)
+                    << " failed: " << e.what() << "\n";
+        }
+        const std::string message = e.what();
+        if (message.find("[vulkan::submit_commands]") != std::string::npos ||
+            message.find("VkResult=") != std::string::npos) {
+          should_recover_stream = true;
+        }
+        dispatched = false;
+      }
+
+      if (dispatched) {
+        if (matmul_debug_enabled()) {
+          std::cerr << "[vulkan::mul_mm] shader="
+                    << vulkan::static_shader_name(shader_id) << " dispatched\n";
+        }
+        try {
+          if (needs_out_copy) {
+            vulkan::mark_scratch_array_written(s, kMulMmOutScratchLane);
+            if (matmul_debug_enabled()) {
+              std::cerr << "[vulkan::mul_mm] begin output copy\n";
+            }
+            copy_gpu(out_work, out, CopyType::General, s);
+            if (matmul_debug_enabled()) {
+              std::cerr << "[vulkan::mul_mm] end output copy\n";
+            }
+          }
+          return true;
+        } catch (const std::runtime_error& e) {
+          if (matmul_debug_enabled()) {
+            std::cerr << "[vulkan::mul_mm] output copy failed: " << e.what()
+                      << "\n";
+          }
+          disable_mul_mm_runtime(e.what());
+          return false;
+        }
+      }
+
+      if (should_recover_stream) {
+        disable_mul_mm_runtime("submit failure");
+        return false;
+      }
+    }
+
+    return false;
+  };
+
+  const bool can_direct_write = split_k == 1u && is_row_contiguous_zero_offset(out);
+  if (can_direct_write) {
+    auto direct_candidates = mul_mm_direct_shader_candidates(
+        a.dtype(), out.dtype(), tuning.prefer_fp32_accum);
+    array out_direct = out;
+    out_direct.set_data(allocator::malloc(out_direct.nbytes()));
+    if (ensure_vulkan_buffer(out_direct, s) &&
+        try_dispatch(direct_candidates, out_direct, false)) {
+      return true;
     }
   }
 
-  return false;
+  auto shader_candidates =
+      mul_mm_shader_candidates(a.dtype(), tuning.prefer_fp32_accum);
+  array out_work = out;
+  const bool can_direct_split_k_reduce =
+      split_k > 1u && is_row_contiguous_zero_offset(out_work);
+  const bool needs_out_copy =
+      !is_row_contiguous_zero_offset(out_work) ||
+      (split_k == 1u && out.dtype() != float32);
+  if (needs_out_copy) {
+    out_work = vulkan::acquire_scratch_array(
+        s, kMulMmOutScratchLane, out.shape(), float32);
+  } else {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  }
+  if (!ensure_vulkan_buffer(out_work, s)) {
+    return false;
+  }
+  return try_dispatch(shader_candidates, out_work, needs_out_copy);
 }
 
 } // namespace

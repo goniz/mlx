@@ -12,6 +12,8 @@
 #include "mlx/stream.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -20,6 +22,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "mlx/backend/vulkan/shader_compiler.h"
 
@@ -788,6 +791,8 @@ bool try_host_vector_cast_copy(
   auto in_keepalive = in;
   auto out_keepalive = out;
   auto stream = s;
+  auto upload_enqueued = std::make_shared<std::atomic<bool>>(false);
+  auto callback_error = std::make_shared<std::exception_ptr>();
 
   mlx::core::vulkan::enqueue_owned_staging_readback(
       stream,
@@ -798,32 +803,55 @@ bool try_host_vector_cast_copy(
        in_dtype,
        out_dtype,
        upload_offset,
+       upload_enqueued,
+       callback_error,
        in_keepalive = std::move(in_keepalive),
        out_keepalive = std::move(out_keepalive),
        stream](const void* ptr, size_t /*nbytes*/) mutable {
-        std::vector<char> host_out(size * size_of(out_dtype));
-        host_cast_copy_dispatch_src(
-            ptr, in_dtype, host_out.data(), size, out_dtype);
+        try {
+          std::vector<char> host_out(size * size_of(out_dtype));
+          host_cast_copy_dispatch_src(
+              ptr, in_dtype, host_out.data(), size, out_dtype);
 
-        auto* callback_out_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
-            out_keepalive.buffer().ptr());
-        if (mlx::core::vulkan::VulkanContext::get().is_unified_memory() &&
-            callback_out_buf->mapped_ptr != nullptr) {
-          auto* dst_ptr = static_cast<char*>(callback_out_buf->mapped_ptr) +
-              upload_offset;
-          std::memcpy(dst_ptr, host_out.data(), host_out.size());
-          return;
+          auto* callback_out_buf =
+              static_cast<mlx::core::vulkan::VulkanBuffer*>(
+                  out_keepalive.buffer().ptr());
+          if (mlx::core::vulkan::VulkanContext::get().is_unified_memory() &&
+              callback_out_buf->mapped_ptr != nullptr) {
+            auto* dst_ptr = static_cast<char*>(callback_out_buf->mapped_ptr) +
+                upload_offset;
+            std::memcpy(dst_ptr, host_out.data(), host_out.size());
+            upload_enqueued->store(true, std::memory_order_release);
+            return;
+          }
+
+          mlx::core::vulkan::enqueue_owned_staging_upload(
+              stream,
+              host_out.data(),
+              host_out.size(),
+              callback_out_buf->buffer,
+              upload_offset);
+          mlx::core::vulkan::retain_array_for_stream(stream, in_keepalive);
+          mlx::core::vulkan::retain_array_for_stream(stream, out_keepalive);
+        } catch (...) {
+          *callback_error = std::current_exception();
         }
-
-        mlx::core::vulkan::enqueue_owned_staging_upload(
-            stream,
-            host_out.data(),
-            host_out.size(),
-            callback_out_buf->buffer,
-            upload_offset);
-        mlx::core::vulkan::retain_array_for_stream(stream, in_keepalive);
-        mlx::core::vulkan::retain_array_for_stream(stream, out_keepalive);
+        upload_enqueued->store(true, std::memory_order_release);
       });
+
+  const auto timeout_at =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!upload_enqueued->load(std::memory_order_acquire)) {
+    if (std::chrono::steady_clock::now() >= timeout_at) {
+      throw std::runtime_error(
+          "Timed out waiting for Vulkan cast-copy fallback readback completion.");
+    }
+    mlx::core::vulkan::finalize_stream(stream);
+    std::this_thread::yield();
+  }
+  if (*callback_error) {
+    std::rethrow_exception(*callback_error);
+  }
   return true;
 }
 

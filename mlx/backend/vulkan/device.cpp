@@ -1510,9 +1510,26 @@ class VulkanDevice {
     }
 
     if (barrier_between_deferred_ops()) {
-      trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
-      insert_memory_barrier(
-          stream->recording_resources->compute_command_buffer);
+      if (stream->last_decode_resource_summary.safe_to_skip_tail_barrier()) {
+        if (trace_batch_enabled()) {
+          std::ostringstream oss;
+          oss << "decode-tail action=skip stream=" << stream->stream_index
+              << " rec_ops=" << stream->recorded_ops << " weights="
+              << stream->last_decode_resource_summary.read_only_weights
+              << " kv_writes="
+              << stream->last_decode_resource_summary.append_only_kv_writes
+              << " scratch="
+              << stream->last_decode_resource_summary.token_scratch
+              << " persistent="
+              << stream->last_decode_resource_summary.persistent_outputs
+              << " generic=" << stream->last_decode_resource_summary.generic;
+          trace_batch(oss.str());
+        }
+      } else {
+        trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
+        insert_memory_barrier(
+            stream->recording_resources->compute_command_buffer);
+      }
     }
   }
 
@@ -1701,6 +1718,8 @@ class VulkanDevice {
       StreamData* stream,
       const std::vector<BufferAccessRange>& reads,
       const std::vector<BufferAccessRange>& writes) {
+    const bool decode_mode = should_prefer_long_decode_recording(stream);
+
     for (const auto& w : writes) {
       for (const auto& prev_w : stream->unsynced_writes) {
         if (overlaps(w, prev_w)) {
@@ -1724,15 +1743,28 @@ class VulkanDevice {
       }
     }
 
-    for (const auto& r : reads) {
-      for (const auto& prev_w : stream->unsynced_writes) {
-        if (overlaps(r, prev_w)) {
-          if (trace_sync_enabled()) {
+    if (!decode_mode) {
+      for (const auto& r : reads) {
+        for (const auto& prev_w : stream->unsynced_writes) {
+          if (overlaps(r, prev_w)) {
+            if (trace_sync_enabled()) {
+              trace_sync(
+                  "hazard raw current=" + format_access_range(r) +
+                  " previous=" + format_access_range(prev_w));
+            }
+            return true;
+          }
+        }
+      }
+    } else if (trace_sync_enabled()) {
+      for (const auto& r : reads) {
+        for (const auto& prev_w : stream->unsynced_writes) {
+          if (overlaps(r, prev_w)) {
             trace_sync(
-                "hazard raw current=" + format_access_range(r) +
+                "hazard raw skipped (decode) current=" +
+                format_access_range(r) +
                 " previous=" + format_access_range(prev_w));
           }
-          return true;
         }
       }
     }

@@ -422,8 +422,7 @@ bf16_cast_expr(const std::string& expr, Dtype in_dtype, Dtype out_dtype) {
   if (in_is_bf16 && !out_is_bf16) {
     std::string as_float = "bf16_to_fp32(uint(" + expr + "))";
     if (out_dtype == mlx::core::bool_) {
-      return "(" + as_float + " != " + zero_literal_for_dtype(out_dtype) +
-          " ? uint8_t(1) : uint8_t(0))";
+      return "(" + as_float + " != 0.0 ? uint8_t(1) : uint8_t(0))";
     }
     return dtype_to_glsl_storage_type(out_dtype) + "(" + as_float + ")";
   }

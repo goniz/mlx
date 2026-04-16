@@ -114,6 +114,7 @@ array cast_flash_attention_kv_to_f16(
     const array& x,
     const char* scratch_lane,
     Stream s) {
+  // Early exit: if already float16, return as-is
   if (x.dtype() == float16) {
     return x;
   }
@@ -841,10 +842,17 @@ bool try_eval_flash_attention_vulkan(
   const uint32_t kv_heads = checked_u32_size(k.shape(1), "flash_attn kv_heads");
   const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
   const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
+  // Use native bf16 KV when:
+  // 1. bf16 is supported by the shader
+  // 2. K and V are already bf16 (no cast needed)
+  // 3. Either:
+  //    a. Prefill mode: causal mask with q_len > 1 and q_len == kv_len
+  //    b. Decode mode: q_len == 1 (K/V are appended during decode, so kv_len >= 1)
   const bool use_native_bf16_kv =
-      vulkan::VulkanContext::get().shader_bfloat16_supported() && do_causal &&
-      q_len > 1 && q_len == kv_len && k.dtype() == bfloat16 &&
-      v.dtype() == bfloat16;
+      vulkan::VulkanContext::get().shader_bfloat16_supported() &&
+      k.dtype() == bfloat16 && v.dtype() == bfloat16 &&
+      ((do_causal && q_len > 1 && q_len == kv_len) ||
+       (do_causal && q_len == 1));
 
   if (batch == 0 || q_heads == 0 || q_len == 0 || hsk == 0 || kv_heads == 0 ||
       kv_len == 0 || hsv == 0 || hsk % 4 != 0 || hsv % 4 != 0 ||
@@ -854,7 +862,9 @@ bool try_eval_flash_attention_vulkan(
 
   q = cast_flash_attention_q_to_f32(q, s);
 
-  auto make_contiguous_zero_offset = [&](array x) {
+  // After casting, arrays are already row_contiguous with offset 0.
+  // Only check layout for k and v which haven't been cast yet.
+  auto ensure_contiguous_zero_offset = [&](array x) {
     if (!x.flags().row_contiguous || x.strides().back() != 1 ||
         x.offset() != 0) {
       x = contiguous_copy_gpu(x, s);
@@ -862,9 +872,13 @@ bool try_eval_flash_attention_vulkan(
     return x;
   };
 
-  q = make_contiguous_zero_offset(q);
-  k = make_contiguous_zero_offset(k);
-  v = make_contiguous_zero_offset(v);
+  // Note: q is already processed by cast_flash_attention_q_to_f32 which
+  // ensures proper layout. Only k and v need layout enforcement here.
+  k = ensure_contiguous_zero_offset(k);
+  v = ensure_contiguous_zero_offset(v);
+
+  // Cast K/V to appropriate dtype if needed. When use_native_bf16_kv is true,
+  // we skip casting since K/V are already bfloat16.
   if (!use_native_bf16_kv) {
     k = cast_flash_attention_kv_to_f16(k, kFlashAttnKCastScratchLane, s);
     v = cast_flash_attention_kv_to_f16(v, kFlashAttnVCastScratchLane, s);

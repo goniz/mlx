@@ -263,6 +263,7 @@ std::optional<vulkan::StaticShaderId> unary_shader_id(
   MLX_VK_UNARY_CASE(ErfInv, float32, erfinv_f32);
   MLX_VK_UNARY_CASE(Log, float32, log_f32);
   MLX_VK_UNARY_CASE(Log, float16, log_f16_rte);
+  MLX_VK_UNARY_CASE(Log, bfloat16, log_f32);
   MLX_VK_UNARY_CASE(Sin, float32, sin_f32);
   MLX_VK_UNARY_CASE(Square, float32, sqr_f32);
   MLX_VK_UNARY_CASE(Square, float16, sqr_f16);

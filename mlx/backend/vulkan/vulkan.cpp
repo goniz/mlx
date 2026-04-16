@@ -918,7 +918,10 @@ void VulkanContext::init() {
         subgroup_require_full_support;
     this->coopmat2_conv2d_supported_ = coopmat2_conv2d_supported;
     this->integer_dot_product_supported_ = integer_dot_product_supported;
-    this->push_descriptor_supported_ = has_push_descriptor_ext;
+    // Only enable push descriptor support if both extension is present AND
+    // function pointer was successfully resolved (avoid descriptor unbound issues)
+    this->push_descriptor_supported_ =
+        has_push_descriptor_ext && push_descriptor_fn != nullptr;
     this->push_descriptor_fn_ = push_descriptor_fn;
     this->vendor_id_ = vendor_id;
     this->device_id_ = device_id;

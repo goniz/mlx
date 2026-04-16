@@ -838,9 +838,6 @@ void dispatch_with_spec(
   if (pipeline->supports_push_descriptor) {
     // Use push descriptors: avoid allocation, update, and bind
     // vkCmdPushDescriptorSetKHR combines update and bind in one call
-    if (trace_descriptor_epochs_enabled()) {
-      trace_descriptor_epochs("using push descriptors");
-    }
     auto push_fn = VulkanContext::get().push_descriptor_fn();
     if (push_fn != nullptr) {
       push_fn(

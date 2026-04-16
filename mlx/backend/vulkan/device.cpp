@@ -491,8 +491,13 @@ struct DecodeResourceSummary {
     }
   }
 
+  // Vulkan submission order keeps commands ordered, but RAW/WAW hazards still
+  // need an explicit memory dependency for availability and visibility. Only
+  // skip the deferred tail barrier when the recorded decode op touched no
+  // scratch storage and produced no generic or persistent outputs.
   bool safe_to_skip_tail_barrier() const {
-    return seen_resource && persistent_outputs == 0 && generic == 0;
+    return seen_resource && token_scratch == 0 && persistent_outputs == 0 &&
+        generic == 0;
   }
 
   void reset() {
@@ -1718,6 +1723,9 @@ class VulkanDevice {
       StreamData* stream,
       const std::vector<BufferAccessRange>& reads,
       const std::vector<BufferAccessRange>& writes) {
+    // Commands recorded to the same queue have a defined submission order, but
+    // that order alone is not a memory dependency. Keep RAW/WAW overlap checks
+    // conservative so shader writes become visible to later reads/writes.
     for (const auto& w : writes) {
       for (const auto& prev_w : stream->unsynced_writes) {
         if (overlaps(w, prev_w)) {

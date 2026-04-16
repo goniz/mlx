@@ -1718,8 +1718,6 @@ class VulkanDevice {
       StreamData* stream,
       const std::vector<BufferAccessRange>& reads,
       const std::vector<BufferAccessRange>& writes) {
-    const bool decode_mode = should_prefer_long_decode_recording(stream);
-
     for (const auto& w : writes) {
       for (const auto& prev_w : stream->unsynced_writes) {
         if (overlaps(w, prev_w)) {
@@ -1743,28 +1741,15 @@ class VulkanDevice {
       }
     }
 
-    if (!decode_mode) {
-      for (const auto& r : reads) {
-        for (const auto& prev_w : stream->unsynced_writes) {
-          if (overlaps(r, prev_w)) {
-            if (trace_sync_enabled()) {
-              trace_sync(
-                  "hazard raw current=" + format_access_range(r) +
-                  " previous=" + format_access_range(prev_w));
-            }
-            return true;
-          }
-        }
-      }
-    } else if (trace_sync_enabled()) {
-      for (const auto& r : reads) {
-        for (const auto& prev_w : stream->unsynced_writes) {
-          if (overlaps(r, prev_w)) {
+    for (const auto& r : reads) {
+      for (const auto& prev_w : stream->unsynced_writes) {
+        if (overlaps(r, prev_w)) {
+          if (trace_sync_enabled()) {
             trace_sync(
-                "hazard raw skipped (decode) current=" +
-                format_access_range(r) +
+                "hazard raw current=" + format_access_range(r) +
                 " previous=" + format_access_range(prev_w));
           }
+          return true;
         }
       }
     }

@@ -352,9 +352,11 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
           s,
           push_constants,
           {1u, 1u, 1u});
+      set_force_immediate_submit(s);
       end_command_recording(s.index);
     };
 
+    std::vector<std::pair<StaticShaderId, array>> direct_probe_outputs;
     for (auto shader_id : {
              StaticShaderId::matmul_direct_bf16,
              StaticShaderId::matmul_direct_bf16_f16acc,
@@ -362,32 +364,35 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
       try {
         array out_direct = make_array({2, 2}, bfloat16);
         dispatch_probe(shader_id, out_direct);
-        synchronize_stream(s);
-        if (verify_bf16(out_direct)) {
-          return true;
-        }
+        direct_probe_outputs.emplace_back(shader_id, std::move(out_direct));
       } catch (const std::runtime_error&) {
       }
     }
 
+    std::vector<std::pair<StaticShaderId, array>> legacy_probe_outputs;
     for (auto shader_id : {
              StaticShaderId::matmul_bf16_fp32,
              StaticShaderId::matmul_bf16,
          }) {
       try {
-        array out_t = make_array({2, 2}, float32);
         array out = make_array({2, 2}, float32);
-        dispatch_probe(shader_id, out_t);
-        copy_gpu(swapaxes_in_eval(out_t, -1, -2), out, CopyType::General, s);
-        synchronize_stream(s);
-        if (verify_fp32(out)) {
-          return true;
-        }
+        dispatch_probe(shader_id, out);
+        legacy_probe_outputs.emplace_back(shader_id, std::move(out));
       } catch (const std::runtime_error&) {
       }
     }
 
-    synchronize_stream(s);
+    for (const auto& output : direct_probe_outputs) {
+      if (verify_bf16(output.second)) {
+        return true;
+      }
+    }
+    for (const auto& output : legacy_probe_outputs) {
+      if (verify_fp32(output.second)) {
+        return true;
+      }
+    }
+
     return false;
   } catch (const std::runtime_error&) {
     return false;

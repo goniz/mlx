@@ -30,6 +30,11 @@ using mlx::core::Shape;
 using mlx::core::Strides;
 namespace vulkan = mlx::core::vulkan;
 
+using vulkan::cast_expr_for_dtype;
+using vulkan::dtype_to_glsl_storage_type;
+using vulkan::emit_dynamic_shader_preamble;
+using vulkan::is_vulkan_storage_array;
+
 constexpr size_t kMinTransferQueueCopyBytes = 256 * 1024;
 
 std::string copy_dtype_suffix(Dtype dtype);
@@ -130,75 +135,23 @@ size_t num_elements(const Shape& shape) {
       shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
 }
 
-std::string dtype_to_glsl_storage_type(Dtype dtype) {
+bool supports_dynamic_gpu_cast_dtype(Dtype dtype) {
   switch (dtype) {
-    case mlx::core::float32:
-      return "float";
-    case mlx::core::float16:
-      return "float16_t";
-    case mlx::core::bfloat16:
-      return "uint16_t";
     case mlx::core::bool_:
-      return "uint8_t";
-    case mlx::core::uint16:
-      return "uint16_t";
     case mlx::core::uint8:
-      return "uint8_t";
-    case mlx::core::int8:
-      return "int8_t";
-    case mlx::core::int16:
-      return "int16_t";
-    case mlx::core::int32:
-      return "int";
+    case mlx::core::uint16:
     case mlx::core::uint32:
-      return "uint";
     case mlx::core::uint64:
-      return "uint64_t";
+    case mlx::core::int8:
+    case mlx::core::int16:
+    case mlx::core::int32:
     case mlx::core::int64:
-      return "int64_t";
-    case mlx::core::complex64:
-      return "vec2";
+    case mlx::core::float16:
+    case mlx::core::float32:
+      return true;
     default:
-      throw std::runtime_error(
-          "Unsupported dtype for Vulkan dynamic shader generation.");
+      return false;
   }
-}
-
-bool uses_float16_extension(Dtype dtype) {
-  return dtype == mlx::core::float16;
-}
-
-bool uses_16bit_storage(Dtype dtype) {
-  return dtype == mlx::core::float16 || dtype == mlx::core::bfloat16 ||
-      dtype == mlx::core::int16 || dtype == mlx::core::uint16;
-}
-
-bool uses_8bit_storage(Dtype dtype) {
-  return dtype == mlx::core::bool_ || dtype == mlx::core::int8 ||
-      dtype == mlx::core::uint8;
-}
-
-std::string emit_dynamic_shader_preamble(Dtype dtype, bool needs_int64_output) {
-  std::ostringstream os;
-  os << "#version 450\n";
-  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
-  if (needs_int64_output || dtype == mlx::core::int64 ||
-      dtype == mlx::core::uint64) {
-    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
-  }
-  if (uses_float16_extension(dtype)) {
-    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
-  }
-  if (uses_16bit_storage(dtype)) {
-    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
-    os << "#extension GL_EXT_shader_16bit_storage : require\n";
-  }
-  if (uses_8bit_storage(dtype)) {
-    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
-    os << "#extension GL_EXT_shader_8bit_storage : require\n";
-  }
-  os << "\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
-  return os.str();
 }
 
 void append_layout_key(std::ostringstream& os, const Shape& shape) {
@@ -222,51 +175,6 @@ void validate_dynamic_offset_array(
     throw std::runtime_error(
         "Dynamic Vulkan copy offsets must be int64 scalars.");
   }
-}
-
-bool is_vulkan_storage_array(const mlx::core::array& arr) {
-  return arr.data_shared_ptr() != nullptr &&
-      mlx::core::vulkan::is_vulkan_buffer(arr.buffer());
-}
-
-void write_descriptor_binding(
-    std::vector<VkDescriptorSetLayoutBinding>& bindings,
-    uint32_t binding) {
-  bindings.push_back(
-      {binding,
-       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-       1,
-       VK_SHADER_STAGE_COMPUTE_BIT,
-       nullptr});
-}
-
-void write_descriptor_buffer(
-    const mlx::core::array& arr,
-    uint32_t binding,
-    VkDescriptorSet descriptor_set,
-    std::vector<VkDescriptorBufferInfo>& infos,
-    std::vector<VkWriteDescriptorSet>& writes) {
-  auto* vulkan_buffer = static_cast<const vulkan::VulkanBuffer*>(
-      static_cast<const void*>(arr.buffer().ptr()));
-  if (vulkan_buffer == nullptr || vulkan_buffer->buffer == VK_NULL_HANDLE) {
-    throw std::runtime_error("Missing Vulkan buffer for dynamic copy shader.");
-  }
-
-  VkDescriptorBufferInfo info{};
-  info.buffer = vulkan_buffer->buffer;
-  info.offset = 0;
-  info.range = VK_WHOLE_SIZE;
-  infos.push_back(info);
-
-  VkWriteDescriptorSet write{};
-  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  write.dstSet = descriptor_set;
-  write.dstBinding = binding;
-  write.dstArrayElement = 0;
-  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  write.descriptorCount = 1;
-  write.pBufferInfo = &infos.back();
-  writes.push_back(write);
 }
 
 std::string build_dynamic_offset_shader(
@@ -355,19 +263,6 @@ std::string build_dynamic_general_copy_shader(
   return os.str();
 }
 
-void ensure_dynamic_shader_registered(
-    const std::string& shader_name,
-    const std::string& glsl_source) {
-  auto& manager = vulkan::KernelManager::get();
-  if (manager.get_shader(shader_name) != nullptr) {
-    return;
-  }
-
-  auto spirv = vulkan::compile_glsl_to_spirv(glsl_source, shader_name);
-  manager.register_shader(
-      shader_name, spirv.data(), spirv.size() * sizeof(uint32_t));
-}
-
 void dispatch_dynamic_offset_kernel(
     const mlx::core::array& indices,
     mlx::core::array& offset,
@@ -388,54 +283,15 @@ void dispatch_dynamic_offset_kernel(
       copy_dtype_suffix(indices.dtype()) + "_" +
       std::to_string(std::hash<std::string>{}(layout_key.str()));
 
-  ensure_dynamic_shader_registered(
-      shader_name,
-      build_dynamic_offset_shader(
-          indices.dtype(), indices_base_offset, stride_terms));
+  const std::string glsl_source = build_dynamic_offset_shader(
+      indices.dtype(), indices_base_offset, stride_terms);
 
-  std::vector<VkDescriptorSetLayoutBinding> bindings;
-  write_descriptor_binding(bindings, 0);
-  write_descriptor_binding(bindings, 1);
-
-  auto& manager = vulkan::KernelManager::get();
-  auto* pipeline = manager.get_pipeline(shader_name, bindings, 0);
-  auto command_buffer = vulkan::begin_command_recording(s.index);
-  const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
-  vk::DescriptorSet descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
-
-  std::vector<VkDescriptorBufferInfo> infos;
-  std::vector<VkWriteDescriptorSet> writes;
-  infos.reserve(2);
-  writes.reserve(2);
-  write_descriptor_buffer(indices, 0, descriptor_set, infos, writes);
-  write_descriptor_buffer(offset, 1, descriptor_set, infos, writes);
-  vkUpdateDescriptorSets(
-      vulkan::VulkanContext::get().device(),
-      static_cast<uint32_t>(writes.size()),
-      writes.data(),
-      0,
-      nullptr);
-
-  vkCmdBindPipeline(
-      command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  VkDescriptorSet vk_descriptor_set =
-      static_cast<VkDescriptorSet>(descriptor_set);
-  vkCmdBindDescriptorSets(
-      command_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &vk_descriptor_set,
-      0,
-      nullptr);
-  vkCmdDispatch(command_buffer, 1, 1, 1);
-
-  vulkan::retain_array_for_stream(s, indices);
-  vulkan::retain_array_for_stream(s, offset);
-  vulkan::end_command_recording(s.index);
+  vulkan::DynamicArrayRef arrays[] = {
+      {&indices, 0},
+      {&offset, 1},
+  };
+  vulkan::dispatch_dynamic_compute(
+      shader_name, glsl_source, 2, arrays, 1, 1, 1, s);
 }
 
 bool dispatch_dynamic_general_copy(
@@ -496,88 +352,132 @@ bool dispatch_dynamic_general_copy(
       copy_dtype_suffix(in.dtype()) + "_" +
       std::to_string(std::hash<std::string>{}(layout_key.str()));
 
-  ensure_dynamic_shader_registered(
-      shader_name,
-      build_dynamic_general_copy_shader(
-          in.dtype(),
-          shape,
-          i_strides,
-          o_strides,
-          in_base_offset,
-          out_base_offset,
-          i_offset,
-          o_offset,
-          dynamic_i_base_offset,
-          dynamic_o_base_offset,
-          dynamic_i_offset.has_value(),
-          dynamic_o_offset.has_value(),
-          total_elements));
+  const std::string glsl_source = build_dynamic_general_copy_shader(
+      in.dtype(),
+      shape,
+      i_strides,
+      o_strides,
+      in_base_offset,
+      out_base_offset,
+      i_offset,
+      o_offset,
+      dynamic_i_base_offset,
+      dynamic_o_base_offset,
+      dynamic_i_offset.has_value(),
+      dynamic_o_offset.has_value(),
+      total_elements);
 
-  std::vector<VkDescriptorSetLayoutBinding> bindings;
-  write_descriptor_binding(bindings, 0);
-  write_descriptor_binding(bindings, 1);
+  std::vector<vulkan::DynamicArrayRef> arrays;
+  arrays.push_back({&in, 0});
+  arrays.push_back({&out, 1});
   if (dynamic_i_offset.has_value()) {
-    write_descriptor_binding(bindings, 2);
+    arrays.push_back({&*dynamic_i_offset, 2});
   }
   if (dynamic_o_offset.has_value()) {
-    write_descriptor_binding(bindings, 3);
+    arrays.push_back({&*dynamic_o_offset, 3});
   }
-
-  auto& manager = vulkan::KernelManager::get();
-  auto* pipeline = manager.get_pipeline(shader_name, bindings, 0);
-  auto command_buffer = vulkan::begin_command_recording(s.index);
-  const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
-  vk::DescriptorSet descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
-
-  std::vector<VkDescriptorBufferInfo> infos;
-  std::vector<VkWriteDescriptorSet> writes;
-  infos.reserve(4);
-  writes.reserve(4);
-  write_descriptor_buffer(in, 0, descriptor_set, infos, writes);
-  write_descriptor_buffer(out, 1, descriptor_set, infos, writes);
-  if (dynamic_i_offset.has_value()) {
-    write_descriptor_buffer(
-        *dynamic_i_offset, 2, descriptor_set, infos, writes);
-  }
-  if (dynamic_o_offset.has_value()) {
-    write_descriptor_buffer(
-        *dynamic_o_offset, 3, descriptor_set, infos, writes);
-  }
-  vkUpdateDescriptorSets(
-      vulkan::VulkanContext::get().device(),
-      static_cast<uint32_t>(writes.size()),
-      writes.data(),
-      0,
-      nullptr);
-
-  vkCmdBindPipeline(
-      command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  VkDescriptorSet vk_descriptor_set =
-      static_cast<VkDescriptorSet>(descriptor_set);
-  vkCmdBindDescriptorSets(
-      command_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &vk_descriptor_set,
-      0,
-      nullptr);
 
   const uint32_t workgroups = std::max<uint32_t>(
       (static_cast<uint32_t>(total_elements) + 255u) / 256u, 1u);
-  vkCmdDispatch(command_buffer, workgroups, 1, 1);
+  vulkan::dispatch_dynamic_compute(
+      shader_name,
+      glsl_source,
+      static_cast<uint32_t>(arrays.size()),
+      arrays.data(),
+      workgroups,
+      1,
+      1,
+      s);
+  return true;
+}
+
+std::string build_dynamic_vector_cast_shader(Dtype in_dtype, Dtype out_dtype) {
+  std::ostringstream os;
+  os << emit_dynamic_shader_preamble(in_dtype, out_dtype, false);
+  os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
+     << dtype_to_glsl_storage_type(in_dtype) << " data[];} input_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
+     << dtype_to_glsl_storage_type(out_dtype) << " data[];} output_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (linear_idx >= pc.total_elements) {\n";
+  os << "    return;\n";
+  os << "  }\n";
+  os << "  uint input_index = linear_idx + pc.in_offset;\n";
+  os << "  uint output_index = linear_idx + pc.out_offset;\n";
+  os << "  output_buf.data[output_index] = "
+     << cast_expr_for_dtype("input_buf.data[input_index]", in_dtype, out_dtype)
+     << ";\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool dispatch_dynamic_vector_cast_copy(
+    const mlx::core::array& in,
+    mlx::core::array& out,
+    size_t size,
+    int64_t in_offset,
+    int64_t out_offset,
+    const mlx::core::Stream& s) {
+  if (!is_vulkan_storage_array(in) || !is_vulkan_storage_array(out)) {
+    return false;
+  }
+  if (!supports_dynamic_gpu_cast_dtype(in.dtype()) ||
+      !supports_dynamic_gpu_cast_dtype(out.dtype())) {
+    return false;
+  }
+  if (size == 0) {
+    return true;
+  }
+  if (size > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  const int64_t in_base_offset = in_offset;
+  const int64_t out_base_offset = out_offset;
+  if (in_base_offset < 0 || out_base_offset < 0) {
+    return false;
+  }
+
+  const std::string shader_name = "dynamic_vector_cast_copy_" +
+      copy_dtype_suffix(in.dtype()) + "_" + copy_dtype_suffix(out.dtype());
+
+  const std::string glsl_source =
+      build_dynamic_vector_cast_shader(in.dtype(), out.dtype());
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&in, 0},
+      {&out, 1},
+  };
+
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 3;
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      shader_name, glsl_source, 2, arrays, kPushConstantSize, s);
+
+  struct PushConstants {
+    uint32_t in_off;
+    uint32_t out_off;
+    uint32_t total;
+  };
+  PushConstants pc{};
+  pc.in_off = static_cast<uint32_t>(in_base_offset);
+  pc.out_off = static_cast<uint32_t>(out_base_offset);
+  pc.total = static_cast<uint32_t>(size);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+
+  const uint32_t workgroups =
+      std::max<uint32_t>((static_cast<uint32_t>(size) + 255u) / 256u, 1u);
+  vkCmdDispatch(dispatch.command_buffer, workgroups, 1, 1);
 
   vulkan::retain_array_for_stream(s, in);
   vulkan::retain_array_for_stream(s, out);
-  if (dynamic_i_offset.has_value()) {
-    vulkan::retain_array_for_stream(s, *dynamic_i_offset);
-  }
-  if (dynamic_o_offset.has_value()) {
-    vulkan::retain_array_for_stream(s, *dynamic_o_offset);
-  }
   vulkan::end_command_recording(s.index);
   return true;
 }
@@ -736,10 +636,6 @@ bool try_host_vector_cast_copy(
     int64_t out_offset,
     const mlx::core::Stream& s) {
   const bool in_is_vulkan = mlx::core::vulkan::is_vulkan_buffer(in.buffer());
-  auto* in_buf = in_is_vulkan
-      ? static_cast<mlx::core::vulkan::VulkanBuffer*>(
-            const_cast<void*>(static_cast<const void*>(in.buffer().ptr())))
-      : nullptr;
   auto* out_buf =
       static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
 
@@ -773,31 +669,16 @@ bool try_host_vector_cast_copy(
     return true;
   }
 
-  if (in_buf->mapped_ptr != nullptr) {
-    auto* src_ptr = static_cast<const char*>(in_buf->mapped_ptr) +
-        in_offset * size_of(in.dtype());
-    convert_and_store(src_ptr);
+  if (dispatch_dynamic_vector_cast_copy(
+          in, out, size, in_offset, out_offset, s)) {
     return true;
   }
 
-  auto host_in =
-      std::make_shared<std::vector<char>>(size * size_of(in.dtype()));
-  auto readback_done = std::make_shared<bool>(false);
-  mlx::core::vulkan::enqueue_owned_staging_readback(
-      s,
-      in_buf->buffer,
-      in_offset * size_of(in.dtype()),
-      host_in->size(),
-      [host_in, readback_done](const void* ptr, size_t nbytes) {
-        std::memcpy(host_in->data(), ptr, nbytes);
-        *readback_done = true;
-      });
-  mlx::core::vulkan::synchronize_stream(s);
-  if (!*readback_done) {
-    throw std::runtime_error("Vulkan readback did not complete for cast copy.");
-  }
-  convert_and_store(host_in->data());
-  return true;
+  std::ostringstream oss;
+  oss << "Vulkan cast-copy fallback is not implemented for dtype pair in="
+      << static_cast<int>(in.dtype().val())
+      << " out=" << static_cast<int>(out.dtype().val());
+  throw std::runtime_error(oss.str());
 }
 
 std::string copy_dtype_suffix(Dtype dtype) {
@@ -1400,7 +1281,8 @@ void copy_gpu_inplace(
   // Small copies, especially decode-time KV cache updates, are latency
   // sensitive and do better when they stay in the current compute submission.
   const bool use_transfer_queue =
-      (raw_buffer_copy || contiguous_large_rank_copy || segmented_buffer_copy) &&
+      (raw_buffer_copy || contiguous_large_rank_copy ||
+       segmented_buffer_copy) &&
       should_use_transfer_queue_for_copy(copy_bytes);
   vk::CommandBuffer cmd_buffer = use_transfer_queue
       ? vulkan::begin_transfer_command_recording(s.index)

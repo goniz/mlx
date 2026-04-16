@@ -491,8 +491,13 @@ struct DecodeResourceSummary {
     }
   }
 
+  // Vulkan submission order keeps commands ordered, but RAW/WAW hazards still
+  // need an explicit memory dependency for availability and visibility. Only
+  // skip the deferred tail barrier when the recorded decode op touched no
+  // scratch storage and produced no generic or persistent outputs.
   bool safe_to_skip_tail_barrier() const {
-    return seen_resource && persistent_outputs == 0 && generic == 0;
+    return seen_resource && token_scratch == 0 && persistent_outputs == 0 &&
+        generic == 0;
   }
 
   void reset() {
@@ -1510,9 +1515,26 @@ class VulkanDevice {
     }
 
     if (barrier_between_deferred_ops()) {
-      trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
-      insert_memory_barrier(
-          stream->recording_resources->compute_command_buffer);
+      if (stream->last_decode_resource_summary.safe_to_skip_tail_barrier()) {
+        if (trace_batch_enabled()) {
+          std::ostringstream oss;
+          oss << "decode-tail action=skip stream=" << stream->stream_index
+              << " rec_ops=" << stream->recorded_ops << " weights="
+              << stream->last_decode_resource_summary.read_only_weights
+              << " kv_writes="
+              << stream->last_decode_resource_summary.append_only_kv_writes
+              << " scratch="
+              << stream->last_decode_resource_summary.token_scratch
+              << " persistent="
+              << stream->last_decode_resource_summary.persistent_outputs
+              << " generic=" << stream->last_decode_resource_summary.generic;
+          trace_batch(oss.str());
+        }
+      } else {
+        trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
+        insert_memory_barrier(
+            stream->recording_resources->compute_command_buffer);
+      }
     }
   }
 
@@ -1701,6 +1723,9 @@ class VulkanDevice {
       StreamData* stream,
       const std::vector<BufferAccessRange>& reads,
       const std::vector<BufferAccessRange>& writes) {
+    // Commands recorded to the same queue have a defined submission order, but
+    // that order alone is not a memory dependency. Keep RAW/WAW overlap checks
+    // conservative so shader writes become visible to later reads/writes.
     for (const auto& w : writes) {
       for (const auto& prev_w : stream->unsynced_writes) {
         if (overlaps(w, prev_w)) {

@@ -780,23 +780,50 @@ bool try_host_vector_cast_copy(
     return true;
   }
 
-  auto host_in =
-      std::make_shared<std::vector<char>>(size * size_of(in.dtype()));
-  auto readback_done = std::make_shared<bool>(false);
+  const auto readback_bytes = size * size_of(in.dtype());
+  const auto upload_offset = out_offset * size_of(out.dtype());
+  const auto in_dtype = in.dtype();
+  const auto out_dtype = out.dtype();
+
+  auto in_keepalive = in;
+  auto out_keepalive = out;
+  auto stream = s;
+
   mlx::core::vulkan::enqueue_owned_staging_readback(
-      s,
+      stream,
       in_buf->buffer,
       in_offset * size_of(in.dtype()),
-      host_in->size(),
-      [host_in, readback_done](const void* ptr, size_t nbytes) {
-        std::memcpy(host_in->data(), ptr, nbytes);
-        *readback_done = true;
+      readback_bytes,
+      [size,
+       in_dtype,
+       out_dtype,
+       upload_offset,
+       in_keepalive = std::move(in_keepalive),
+       out_keepalive = std::move(out_keepalive),
+       stream](const void* ptr, size_t /*nbytes*/) mutable {
+        std::vector<char> host_out(size * size_of(out_dtype));
+        host_cast_copy_dispatch_src(
+            ptr, in_dtype, host_out.data(), size, out_dtype);
+
+        auto* callback_out_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
+            out_keepalive.buffer().ptr());
+        if (mlx::core::vulkan::VulkanContext::get().is_unified_memory() &&
+            callback_out_buf->mapped_ptr != nullptr) {
+          auto* dst_ptr = static_cast<char*>(callback_out_buf->mapped_ptr) +
+              upload_offset;
+          std::memcpy(dst_ptr, host_out.data(), host_out.size());
+          return;
+        }
+
+        mlx::core::vulkan::enqueue_owned_staging_upload(
+            stream,
+            host_out.data(),
+            host_out.size(),
+            callback_out_buf->buffer,
+            upload_offset);
+        mlx::core::vulkan::retain_array_for_stream(stream, in_keepalive);
+        mlx::core::vulkan::retain_array_for_stream(stream, out_keepalive);
       });
-  mlx::core::vulkan::synchronize_stream(s);
-  if (!*readback_done) {
-    throw std::runtime_error("Vulkan readback did not complete for cast copy.");
-  }
-  convert_and_store(host_in->data());
   return true;
 }
 

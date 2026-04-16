@@ -34,6 +34,7 @@ using vulkan::cast_expr_for_dtype;
 using vulkan::dtype_to_glsl_storage_type;
 using vulkan::emit_dynamic_shader_preamble;
 using vulkan::is_vulkan_storage_array;
+using vulkan::zero_literal_for_dtype;
 
 constexpr size_t kMinTransferQueueCopyBytes = 256 * 1024;
 
@@ -148,6 +149,7 @@ bool supports_dynamic_gpu_cast_dtype(Dtype dtype) {
     case mlx::core::int64:
     case mlx::core::float16:
     case mlx::core::float32:
+    case mlx::core::bfloat16:
       return true;
     default:
       return false;
@@ -391,9 +393,62 @@ bool dispatch_dynamic_general_copy(
   return true;
 }
 
+bool needs_bf16_helpers(Dtype in_dtype, Dtype out_dtype) {
+  return in_dtype == mlx::core::bfloat16 || out_dtype == mlx::core::bfloat16;
+}
+
+std::string emit_bf16_conversion_helpers() {
+  std::ostringstream os;
+  os << "uint fp32_to_bf16(float f) {\n";
+  os << "  uint u = floatBitsToUint(f);\n";
+  os << "  u = (u + (0x7fffu + ((u >> 16) & 1u))) >> 16;\n";
+  os << "  return u;\n";
+  os << "}\n\n";
+  os << "float bf16_to_fp32(uint u) {\n";
+  os << "  return uintBitsToFloat(u << 16);\n";
+  os << "}\n\n";
+  return os.str();
+}
+
+std::string
+bf16_cast_expr(const std::string& expr, Dtype in_dtype, Dtype out_dtype) {
+  const bool in_is_bf16 = in_dtype == mlx::core::bfloat16;
+  const bool out_is_bf16 = out_dtype == mlx::core::bfloat16;
+
+  if (in_is_bf16 && out_is_bf16) {
+    return expr;
+  }
+
+  if (in_is_bf16 && !out_is_bf16) {
+    std::string as_float = "bf16_to_fp32(uint(" + expr + "))";
+    if (out_dtype == mlx::core::bool_) {
+      return "(" + as_float + " != " + zero_literal_for_dtype(out_dtype) +
+          " ? uint8_t(1) : uint8_t(0))";
+    }
+    return dtype_to_glsl_storage_type(out_dtype) + "(" + as_float + ")";
+  }
+
+  if (!in_is_bf16 && out_is_bf16) {
+    std::string intermediate;
+    if (in_dtype == mlx::core::bool_) {
+      intermediate = "float(" + expr + ")";
+    } else {
+      intermediate = "float(" + expr + ")";
+    }
+    return "uint16_t(fp32_to_bf16(" + intermediate + "))";
+  }
+
+  return {};
+}
+
 std::string build_dynamic_vector_cast_shader(Dtype in_dtype, Dtype out_dtype) {
   std::ostringstream os;
   os << emit_dynamic_shader_preamble(in_dtype, out_dtype, false);
+
+  if (needs_bf16_helpers(in_dtype, out_dtype)) {
+    os << emit_bf16_conversion_helpers();
+  }
+
   os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
   os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
      << dtype_to_glsl_storage_type(in_dtype) << " data[];} input_buf;\n";
@@ -406,9 +461,17 @@ std::string build_dynamic_vector_cast_shader(Dtype in_dtype, Dtype out_dtype) {
   os << "  }\n";
   os << "  uint input_index = linear_idx + pc.in_offset;\n";
   os << "  uint output_index = linear_idx + pc.out_offset;\n";
-  os << "  output_buf.data[output_index] = "
-     << cast_expr_for_dtype("input_buf.data[input_index]", in_dtype, out_dtype)
-     << ";\n";
+
+  std::string cast_expr;
+  if (needs_bf16_helpers(in_dtype, out_dtype)) {
+    cast_expr =
+        bf16_cast_expr("input_buf.data[input_index]", in_dtype, out_dtype);
+  } else {
+    cast_expr =
+        cast_expr_for_dtype("input_buf.data[input_index]", in_dtype, out_dtype);
+  }
+
+  os << "  output_buf.data[output_index] = " << cast_expr << ";\n";
   os << "}\n";
   return os.str();
 }
@@ -628,6 +691,14 @@ void host_cast_copy_dispatch_src(
   }
 }
 
+bool trace_copy_fallback_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_TRACE_COPY_FALLBACK");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
 bool try_host_vector_cast_copy(
     const mlx::core::array& in,
     mlx::core::array& out,
@@ -636,6 +707,16 @@ bool try_host_vector_cast_copy(
     int64_t out_offset,
     const mlx::core::Stream& s) {
   const bool in_is_vulkan = mlx::core::vulkan::is_vulkan_buffer(in.buffer());
+
+  if (trace_copy_fallback_enabled() && in_is_vulkan) {
+    std::cerr << "[MLX_VULKAN_COPY_FALLBACK] cast-copy fallback triggered: "
+              << "in_dtype=" << copy_dtype_suffix(in.dtype()) << " "
+              << "out_dtype=" << copy_dtype_suffix(out.dtype()) << " "
+              << "size=" << size << " "
+              << "in_offset=" << in_offset << " "
+              << "out_offset=" << out_offset << std::endl;
+  }
+
   auto* out_buf =
       static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
 
@@ -1197,8 +1278,9 @@ void copy_gpu_inplace(
     }
   }
 
-  // Fallback for Vector copies with dtype conversion when no shader exists.
-  // try_host_vector_cast_copy handles GPU readback -> CPU conversion -> upload.
+  // Fallback for Vector copies with dtype conversion when no static shader
+  // exists. try_host_vector_cast_copy dispatches a dynamic GPU cast shader or
+  // falls back to CPU conversion for non-Vulkan inputs.
   if (ctype == CopyType::Vector && !same_dtype && !shader_copy) {
     try {
       if (try_host_vector_cast_copy(

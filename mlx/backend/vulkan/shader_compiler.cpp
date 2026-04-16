@@ -161,6 +161,8 @@ std::string zero_literal_for_dtype(Dtype dtype) {
       return "int(0)";
     case mlx::core::int64:
       return "int64_t(0)";
+    case mlx::core::bfloat16:
+      return "uint16_t(0)";
     default:
       throw std::runtime_error(
           "Unsupported dtype for Vulkan dynamic cast shader zero literal.");

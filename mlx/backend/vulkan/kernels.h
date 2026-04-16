@@ -966,4 +966,49 @@ std::tuple<uint32_t, uint32_t, uint32_t> get_element_wise_grid_dims(
 // Logical tile size used by generic Vulkan indexing helpers.
 constexpr uint32_t VULKAN_INDEX_TILE_SIZE = 512;
 
+struct DynamicArrayRef {
+  const array* arr;
+  uint32_t binding;
+};
+
+struct DynamicComputeDispatch {
+  vk::CommandBuffer command_buffer;
+  ComputePipeline* pipeline;
+  std::vector<VkDescriptorBufferInfo> infos;
+  std::vector<VkWriteDescriptorSet> writes;
+  vk::DescriptorSet descriptor_set;
+};
+
+void write_descriptor_binding(
+    std::vector<VkDescriptorSetLayoutBinding>& bindings,
+    uint32_t binding);
+void write_descriptor_buffer(
+    const array& arr,
+    uint32_t binding,
+    VkDescriptorSet descriptor_set,
+    std::vector<VkDescriptorBufferInfo>& infos,
+    std::vector<VkWriteDescriptorSet>& writes);
+void ensure_dynamic_shader_registered(
+    const std::string& shader_name,
+    const std::string& glsl_source);
+bool is_vulkan_storage_array(const array& arr);
+
+DynamicComputeDispatch dispatch_dynamic_compute_begin(
+    const std::string& shader_name,
+    const std::string& glsl_source,
+    uint32_t num_bindings,
+    const DynamicArrayRef* arrays,
+    uint32_t push_constant_size,
+    const Stream& s);
+
+void dispatch_dynamic_compute(
+    const std::string& shader_name,
+    const std::string& glsl_source,
+    uint32_t num_bindings,
+    const DynamicArrayRef* arrays,
+    uint32_t workgroup_x,
+    uint32_t workgroup_y,
+    uint32_t workgroup_z,
+    const Stream& s);
+
 } // namespace mlx::core::vulkan

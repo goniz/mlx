@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <unordered_set>
 #include "mlx/backend/vulkan/device.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 
 namespace mlx::core::vulkan {
@@ -1524,7 +1525,9 @@ vk::DescriptorSet KernelManager::allocate_descriptor_set(
         std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
         auto& reusable_sets = reusable_descriptor_sets_[layout];
         reusable_sets.insert(
-            reusable_sets.end(), descriptor_sets.begin(), descriptor_sets.end());
+            reusable_sets.end(),
+            descriptor_sets.begin(),
+            descriptor_sets.end());
         descriptor_set_layouts_[descriptor_set] = layout;
         for (const auto& reusable_set : descriptor_sets) {
           descriptor_set_layouts_[reusable_set] = layout;
@@ -1539,7 +1542,7 @@ vk::DescriptorSet KernelManager::allocate_descriptor_set(
             << " count=" << std::dec << (descriptor_sets.size() + 1)
             << " set=0x" << std::hex
             << reinterpret_cast<uintptr_t>(
-                    static_cast<VkDescriptorSet>(descriptor_set))
+                   static_cast<VkDescriptorSet>(descriptor_set))
             << std::dec;
         trace_descriptor_epochs(oss.str());
       }
@@ -3452,6 +3455,141 @@ void dispatch_fused_affine_matmul_op(
       s,
       grid,
       matmul_specialization_constants({}));
+}
+
+void write_descriptor_binding(
+    std::vector<VkDescriptorSetLayoutBinding>& bindings,
+    uint32_t binding) {
+  bindings.push_back(
+      {binding,
+       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       1,
+       VK_SHADER_STAGE_COMPUTE_BIT,
+       nullptr});
+}
+
+void write_descriptor_buffer(
+    const array& arr,
+    uint32_t binding,
+    VkDescriptorSet descriptor_set,
+    std::vector<VkDescriptorBufferInfo>& infos,
+    std::vector<VkWriteDescriptorSet>& writes) {
+  auto* vulkan_buffer = static_cast<const VulkanBuffer*>(
+      static_cast<const void*>(arr.buffer().ptr()));
+  if (vulkan_buffer == nullptr || vulkan_buffer->buffer == VK_NULL_HANDLE) {
+    throw std::runtime_error("Missing Vulkan buffer for dynamic copy shader.");
+  }
+
+  VkDescriptorBufferInfo info{};
+  info.buffer = vulkan_buffer->buffer;
+  info.offset = 0;
+  info.range = VK_WHOLE_SIZE;
+  infos.push_back(info);
+
+  VkWriteDescriptorSet write{};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = descriptor_set;
+  write.dstBinding = binding;
+  write.dstArrayElement = 0;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write.descriptorCount = 1;
+  write.pBufferInfo = &infos.back();
+  writes.push_back(write);
+}
+
+void ensure_dynamic_shader_registered(
+    const std::string& shader_name,
+    const std::string& glsl_source) {
+  auto& manager = KernelManager::get();
+  if (manager.get_shader(shader_name) != nullptr) {
+    return;
+  }
+
+  auto spirv = compile_glsl_to_spirv(glsl_source, shader_name);
+  manager.register_shader(
+      shader_name, spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
+bool is_vulkan_storage_array(const array& arr) {
+  return arr.data_shared_ptr() != nullptr && is_vulkan_buffer(arr.buffer());
+}
+
+DynamicComputeDispatch dispatch_dynamic_compute_begin(
+    const std::string& shader_name,
+    const std::string& glsl_source,
+    uint32_t num_bindings,
+    const DynamicArrayRef* arrays,
+    uint32_t push_constant_size,
+    const Stream& s) {
+  ensure_dynamic_shader_registered(shader_name, glsl_source);
+
+  std::vector<VkDescriptorSetLayoutBinding> bindings;
+  for (uint32_t i = 0; i < num_bindings; ++i) {
+    write_descriptor_binding(bindings, i);
+  }
+
+  auto& manager = KernelManager::get();
+  auto* pipeline =
+      manager.get_pipeline(shader_name, bindings, push_constant_size);
+  auto command_buffer = begin_command_recording(s.index);
+  const uint64_t descriptor_epoch = descriptor_epoch_for_stream(s);
+  vk::DescriptorSet descriptor_set =
+      manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+
+  std::vector<VkDescriptorBufferInfo> infos;
+  std::vector<VkWriteDescriptorSet> writes;
+  infos.reserve(num_bindings);
+  writes.reserve(num_bindings);
+  for (uint32_t i = 0; i < num_bindings; ++i) {
+    write_descriptor_buffer(
+        *arrays[i].arr, arrays[i].binding, descriptor_set, infos, writes);
+  }
+  vkUpdateDescriptorSets(
+      VulkanContext::get().device(),
+      static_cast<uint32_t>(writes.size()),
+      writes.data(),
+      0,
+      nullptr);
+
+  vkCmdBindPipeline(
+      command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+  VkDescriptorSet vk_descriptor_set =
+      static_cast<VkDescriptorSet>(descriptor_set);
+  vkCmdBindDescriptorSets(
+      command_buffer,
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeline->layout,
+      0,
+      1,
+      &vk_descriptor_set,
+      0,
+      nullptr);
+
+  return DynamicComputeDispatch{
+      command_buffer,
+      pipeline,
+      std::move(infos),
+      std::move(writes),
+      descriptor_set};
+}
+
+void dispatch_dynamic_compute(
+    const std::string& shader_name,
+    const std::string& glsl_source,
+    uint32_t num_bindings,
+    const DynamicArrayRef* arrays,
+    uint32_t workgroup_x,
+    uint32_t workgroup_y,
+    uint32_t workgroup_z,
+    const Stream& s) {
+  auto dispatch = dispatch_dynamic_compute_begin(
+      shader_name, glsl_source, num_bindings, arrays, 0, s);
+  vkCmdDispatch(dispatch.command_buffer, workgroup_x, workgroup_y, workgroup_z);
+  for (uint32_t i = 0; i < num_bindings; ++i) {
+    retain_array_for_stream(s, *arrays[i].arr);
+  }
+  end_command_recording(s.index);
 }
 
 } // namespace mlx::core::vulkan

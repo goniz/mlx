@@ -108,6 +108,13 @@ class VulkanContext {
   bool integer_dot_product_supported() const {
     return integer_dot_product_supported_;
   }
+  bool push_descriptor_supported() const {
+    return push_descriptor_supported_;
+  }
+  // Get the vkCmdPushDescriptorSetKHR function pointer (nullptr if not supported)
+  PFN_vkCmdPushDescriptorSetKHR push_descriptor_fn() const {
+    return push_descriptor_fn_;
+  }
   uint32_t vendor_id() const {
     return vendor_id_;
   }
@@ -168,6 +175,8 @@ class VulkanContext {
   bool coopmat_flash_attention_f32acc_supported_{false};
   bool coopmat2_conv2d_supported_{false};
   bool integer_dot_product_supported_{false};
+  bool push_descriptor_supported_{false};
+  PFN_vkCmdPushDescriptorSetKHR push_descriptor_fn_{nullptr};
   uint32_t vendor_id_{0};
   uint32_t device_id_{0};
   GpuArchitecture architecture_{GpuArchitecture::Unknown};

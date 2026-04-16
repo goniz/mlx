@@ -808,18 +808,8 @@ void dispatch_with_spec(
       bindings,
       static_cast<uint32_t>(sizeof(PushConstants)),
       specialization_constants);
-  VkDescriptorSet descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  const uint64_t descriptor_epoch = descriptor_epoch_for_stream(s);
-  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
-  if (trace_descriptor_epochs_enabled()) {
-    std::ostringstream oss;
-    oss << "defer stream=" << s.index << " epoch=" << descriptor_epoch
-        << " set=0x" << std::hex << reinterpret_cast<uintptr_t>(descriptor_set)
-        << std::dec;
-    trace_descriptor_epochs(oss.str());
-  }
 
+  // Prepare descriptor writes (used for both push descriptor and traditional path)
   std::vector<VkDescriptorBufferInfo> descriptor_infos(bound_arrays.size());
   std::vector<VkWriteDescriptorSet> descriptor_writes(bound_arrays.size());
 
@@ -833,8 +823,8 @@ void dispatch_with_spec(
     descriptor_infos[i] =
         make_buffer_info(*bound_arrays[i].arr, bound_arrays[i].name);
     auto& write = descriptor_writes[i];
+    write = {};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptor_set;
     write.dstBinding = spec.bindings[i];
     write.dstArrayElement = 0;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -842,24 +832,62 @@ void dispatch_with_spec(
     write.pBufferInfo = &descriptor_infos[i];
   }
 
-  vkUpdateDescriptorSets(
-      VulkanContext::get().device(),
-      static_cast<uint32_t>(bound_arrays.size()),
-      descriptor_writes.data(),
-      0,
-      nullptr);
-
   vkCmdBindPipeline(
       cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  vkCmdBindDescriptorSets(
-      cmd_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &descriptor_set,
-      0,
-      nullptr);
+
+  if (pipeline->supports_push_descriptor) {
+    // Use push descriptors: avoid allocation, update, and bind
+    // vkCmdPushDescriptorSetKHR combines update and bind in one call
+    if (trace_descriptor_epochs_enabled()) {
+      trace_descriptor_epochs("using push descriptors");
+    }
+    auto push_fn = VulkanContext::get().push_descriptor_fn();
+    if (push_fn != nullptr) {
+      push_fn(
+          cmd_buffer,
+          VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline->layout,
+          0, // set index
+          static_cast<uint32_t>(bound_arrays.size()),
+          descriptor_writes.data());
+    }
+  } else {
+    // Traditional path: allocate, update, and bind descriptor set
+    VkDescriptorSet descriptor_set =
+        manager.allocate_descriptor_set(pipeline->descriptor_layout);
+    const uint64_t descriptor_epoch = descriptor_epoch_for_stream(s);
+    manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+    if (trace_descriptor_epochs_enabled()) {
+      std::ostringstream oss;
+      oss << "defer stream=" << s.index << " epoch=" << descriptor_epoch
+          << " set=0x" << std::hex << reinterpret_cast<uintptr_t>(descriptor_set)
+          << std::dec;
+      trace_descriptor_epochs(oss.str());
+    }
+
+    // Set descriptor set handle in writes
+    for (size_t i = 0; i < bound_arrays.size(); ++i) {
+      descriptor_writes[i].dstSet = descriptor_set;
+    }
+
+    vkUpdateDescriptorSets(
+        VulkanContext::get().device(),
+        static_cast<uint32_t>(bound_arrays.size()),
+        descriptor_writes.data(),
+        0,
+        nullptr);
+
+    vkCmdBindDescriptorSets(
+        cmd_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline->layout,
+        0,
+        1,
+        &descriptor_set,
+        0,
+        nullptr);
+  }
+
   vkCmdPushConstants(
       cmd_buffer,
       pipeline->layout,
@@ -1134,12 +1162,18 @@ ComputePipeline* KernelManager::get_pipeline(
         std::string("Shader not found: ") + static_shader_name(shader_id));
   }
 
+  const bool use_push_descriptor =
+      VulkanContext::get().push_descriptor_supported();
   VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
   if (!bindings.empty()) {
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
+    if (use_push_descriptor) {
+      layoutInfo.flags =
+          VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    }
 
     if (vkCreateDescriptorSetLayout(
             device, &layoutInfo, nullptr, &descriptor_layout) != VK_SUCCESS) {
@@ -1253,6 +1287,7 @@ ComputePipeline* KernelManager::get_pipeline(
   pipeline_ptr->layout = pipeline_layout;
   pipeline_ptr->descriptor_layout = descriptor_layout;
   pipeline_ptr->push_constant_size = push_constant_size;
+  pipeline_ptr->supports_push_descriptor = use_push_descriptor;
 
   auto* result = pipeline_ptr.get();
   pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
@@ -1315,12 +1350,18 @@ ComputePipeline* KernelManager::get_pipeline(
   }
 
   // Create descriptor set layout
+  const bool use_push_descriptor =
+      VulkanContext::get().push_descriptor_supported();
   VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
   if (!bindings.empty()) {
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
+    if (use_push_descriptor) {
+      layoutInfo.flags =
+          VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    }
 
     if (vkCreateDescriptorSetLayout(
             device, &layoutInfo, nullptr, &descriptor_layout) != VK_SUCCESS) {
@@ -1436,6 +1477,7 @@ ComputePipeline* KernelManager::get_pipeline(
   pipeline_ptr->layout = pipeline_layout;
   pipeline_ptr->descriptor_layout = descriptor_layout;
   pipeline_ptr->push_constant_size = push_constant_size;
+  pipeline_ptr->supports_push_descriptor = use_push_descriptor;
 
   auto* result = pipeline_ptr.get();
   pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
@@ -3532,39 +3574,62 @@ DynamicComputeDispatch dispatch_dynamic_compute_begin(
   auto* pipeline =
       manager.get_pipeline(shader_name, bindings, push_constant_size);
   auto command_buffer = begin_command_recording(s.index);
-  const uint64_t descriptor_epoch = descriptor_epoch_for_stream(s);
-  vk::DescriptorSet descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
 
+  // Prepare descriptor writes (used for both push descriptor and traditional path)
   std::vector<VkDescriptorBufferInfo> infos;
   std::vector<VkWriteDescriptorSet> writes;
   infos.reserve(num_bindings);
   writes.reserve(num_bindings);
+
+  vk::DescriptorSet descriptor_set = nullptr;
+  if (!pipeline->supports_push_descriptor) {
+    // Traditional path: allocate descriptor set
+    const uint64_t descriptor_epoch = descriptor_epoch_for_stream(s);
+    descriptor_set = manager.allocate_descriptor_set(pipeline->descriptor_layout);
+    manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+  }
+
   for (uint32_t i = 0; i < num_bindings; ++i) {
     write_descriptor_buffer(
         *arrays[i].arr, arrays[i].binding, descriptor_set, infos, writes);
   }
-  vkUpdateDescriptorSets(
-      VulkanContext::get().device(),
-      static_cast<uint32_t>(writes.size()),
-      writes.data(),
-      0,
-      nullptr);
 
   vkCmdBindPipeline(
       command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  VkDescriptorSet vk_descriptor_set =
-      static_cast<VkDescriptorSet>(descriptor_set);
-  vkCmdBindDescriptorSets(
-      command_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &vk_descriptor_set,
-      0,
-      nullptr);
+
+  if (pipeline->supports_push_descriptor) {
+    // Use push descriptors: single call to update and bind
+    auto push_fn = VulkanContext::get().push_descriptor_fn();
+    if (push_fn != nullptr) {
+      push_fn(
+          command_buffer,
+          VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline->layout,
+          0, // set index
+          static_cast<uint32_t>(writes.size()),
+          writes.data());
+    }
+  } else {
+    // Traditional path: update and bind descriptor set
+    vkUpdateDescriptorSets(
+        VulkanContext::get().device(),
+        static_cast<uint32_t>(writes.size()),
+        writes.data(),
+        0,
+        nullptr);
+
+    VkDescriptorSet vk_descriptor_set =
+        static_cast<VkDescriptorSet>(descriptor_set);
+    vkCmdBindDescriptorSets(
+        command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline->layout,
+        0,
+        1,
+        &vk_descriptor_set,
+        0,
+        nullptr);
+  }
 
   return DynamicComputeDispatch{
       command_buffer,

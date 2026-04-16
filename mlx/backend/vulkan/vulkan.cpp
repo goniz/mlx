@@ -502,6 +502,8 @@ void VulkanContext::init() {
         extensions, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
     const bool has_shader_bfloat16_ext =
         has_device_extension(extensions, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+    const bool has_push_descriptor_ext = has_device_extension(
+        extensions, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
     auto device_properties = physical_device.getProperties();
     vendor_id = device_properties.vendorID;
@@ -843,6 +845,9 @@ void VulkanContext::init() {
     if (coopmat2_conv2d_supported) {
       device_extensions.push_back(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
     }
+    if (has_push_descriptor_ext) {
+      device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    }
 
     vk::DeviceCreateInfo device_create_info;
     device_create_info.flags = vk::DeviceCreateFlags();
@@ -858,6 +863,13 @@ void VulkanContext::init() {
     device_create_info.pNext = &enabled_features;
 
     device = physical_device.createDevice(device_create_info);
+
+    // Load extension function pointers
+    PFN_vkCmdPushDescriptorSetKHR push_descriptor_fn = nullptr;
+    if (has_push_descriptor_ext) {
+      push_descriptor_fn = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
+          vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR"));
+    }
 
     // 5. Get queues and create timeline semaphore
     compute_queue =
@@ -906,6 +918,8 @@ void VulkanContext::init() {
         subgroup_require_full_support;
     this->coopmat2_conv2d_supported_ = coopmat2_conv2d_supported;
     this->integer_dot_product_supported_ = integer_dot_product_supported;
+    this->push_descriptor_supported_ = has_push_descriptor_ext;
+    this->push_descriptor_fn_ = push_descriptor_fn;
     this->vendor_id_ = vendor_id;
     this->device_id_ = device_id;
     this->architecture_ = architecture;

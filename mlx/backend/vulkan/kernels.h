@@ -67,6 +67,7 @@ struct ComputePipeline {
   vk::PipelineLayout layout;
   vk::DescriptorSetLayout descriptor_layout;
   uint32_t push_constant_size{0};
+  bool supports_push_descriptor{false};
 
   ~ComputePipeline();
 };

@@ -396,7 +396,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   if (!fused_dispatched) {
-    array x_mat_f32 = ensure_float32_row_contiguous(x_mat, s);
     array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
     if (!vulkan::affine_dequantize_to_float32(
             w, scales, biases, w_deq, s, group_size_, bits_)) {
@@ -404,12 +403,36 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           "[QuantizedMatmul::eval_gpu] Failed to dequantize weights on Vulkan.");
     }
 
-    array rhs = transpose_ ? swapaxes_in_eval(w_deq, -1, -2) : w_deq;
-    rhs = ensure_row_contiguous_zero_offset(rhs, s);
+    array rhs_f32 = transpose_ ? swapaxes_in_eval(w_deq, -1, -2) : w_deq;
+    rhs_f32 = ensure_row_contiguous_zero_offset(rhs_f32, s);
 
-    if (!try_eval_matmul_vulkan({x_mat_f32, rhs}, out_work, s)) {
+    bool lowp_dispatched = false;
+    if (x_mat.dtype() != float32) {
+      array lhs_lowp = ensure_row_contiguous_zero_offset(x_mat, s);
+      array rhs_lowp(rhs_f32.shape(), x_mat.dtype(), nullptr, {});
+      rhs_lowp.set_data(allocator::malloc(rhs_lowp.nbytes()));
+      copy_gpu(rhs_f32, rhs_lowp, CopyType::General, s);
+
+      array out_lowp(out_work.shape(), x_mat.dtype(), nullptr, {});
+      if (try_eval_matmul_vulkan({lhs_lowp, rhs_lowp}, out_lowp, s)) {
+        out_work.set_data(allocator::malloc(out_work.nbytes()));
+        copy_gpu(out_lowp, out_work, CopyType::General, s);
+        lowp_dispatched = true;
+      }
+
+    }
+
+    if (!lowp_dispatched) {
+      array x_mat_f32 = ensure_float32_row_contiguous(x_mat, s);
+      if (!try_eval_matmul_vulkan({x_mat_f32, rhs_f32}, out_work, s)) {
+        throw std::runtime_error(
+            "[QuantizedMatmul::eval_gpu] Failed to dispatch Vulkan matmul.");
+      }
+    }
+
+    if (out_work.dtype() != float32) {
       throw std::runtime_error(
-          "[QuantizedMatmul::eval_gpu] Failed to dispatch Vulkan matmul.");
+          "[QuantizedMatmul::eval_gpu] Internal error: expected float32 work buffer.");
     }
   }
 

@@ -3525,7 +3525,7 @@ DynamicComputeDispatch dispatch_dynamic_compute_begin(
 
   std::vector<VkDescriptorSetLayoutBinding> bindings;
   for (uint32_t i = 0; i < num_bindings; ++i) {
-    write_descriptor_binding(bindings, i);
+    write_descriptor_binding(bindings, arrays[i].binding);
   }
 
   auto& manager = KernelManager::get();

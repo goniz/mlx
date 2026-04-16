@@ -12,8 +12,6 @@
 #include "mlx/stream.h"
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -22,7 +20,6 @@
 #include <numeric>
 #include <sstream>
 #include <string>
-#include <thread>
 
 #include "mlx/backend/vulkan/shader_compiler.h"
 
@@ -181,6 +178,25 @@ bool uses_8bit_storage(Dtype dtype) {
       dtype == mlx::core::uint8;
 }
 
+bool supports_dynamic_gpu_cast_dtype(Dtype dtype) {
+  switch (dtype) {
+    case mlx::core::bool_:
+    case mlx::core::uint8:
+    case mlx::core::uint16:
+    case mlx::core::uint32:
+    case mlx::core::uint64:
+    case mlx::core::int8:
+    case mlx::core::int16:
+    case mlx::core::int32:
+    case mlx::core::int64:
+    case mlx::core::float16:
+    case mlx::core::float32:
+      return true;
+    default:
+      return false;
+  }
+}
+
 std::string emit_dynamic_shader_preamble(Dtype dtype, bool needs_int64_output) {
   std::ostringstream os;
   os << "#version 450\n";
@@ -202,6 +218,71 @@ std::string emit_dynamic_shader_preamble(Dtype dtype, bool needs_int64_output) {
   }
   os << "\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
   return os.str();
+}
+
+std::string emit_dynamic_shader_preamble(
+    Dtype in_dtype,
+    Dtype out_dtype,
+    bool needs_int64_output) {
+  std::ostringstream os;
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  if (needs_int64_output || in_dtype == mlx::core::int64 ||
+      in_dtype == mlx::core::uint64 || out_dtype == mlx::core::int64 ||
+      out_dtype == mlx::core::uint64) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
+  }
+  if (uses_float16_extension(in_dtype) || uses_float16_extension(out_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+  }
+  if (uses_16bit_storage(in_dtype) || uses_16bit_storage(out_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+    os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  }
+  if (uses_8bit_storage(in_dtype) || uses_8bit_storage(out_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
+    os << "#extension GL_EXT_shader_8bit_storage : require\n";
+  }
+  os << "\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  return os.str();
+}
+
+std::string zero_literal_for_dtype(Dtype dtype) {
+  switch (dtype) {
+    case mlx::core::float32:
+      return "0.0";
+    case mlx::core::float16:
+      return "float16_t(0.0)";
+    case mlx::core::bool_:
+      return "uint8_t(0)";
+    case mlx::core::uint8:
+      return "uint8_t(0)";
+    case mlx::core::uint16:
+      return "uint16_t(0)";
+    case mlx::core::uint32:
+      return "uint(0)";
+    case mlx::core::uint64:
+      return "uint64_t(0)";
+    case mlx::core::int8:
+      return "int8_t(0)";
+    case mlx::core::int16:
+      return "int16_t(0)";
+    case mlx::core::int32:
+      return "int(0)";
+    case mlx::core::int64:
+      return "int64_t(0)";
+    default:
+      throw std::runtime_error(
+          "Unsupported dtype for Vulkan dynamic cast shader zero literal.");
+  }
+}
+
+std::string cast_expr_for_dtype(const std::string& expr, Dtype in, Dtype out) {
+  if (out == mlx::core::bool_) {
+    return "((" + expr + ") != " + zero_literal_for_dtype(in) +
+        " ? uint8_t(1) : uint8_t(0))";
+  }
+  return dtype_to_glsl_storage_type(out) + "(" + expr + ")";
 }
 
 void append_layout_key(std::ostringstream& os, const Shape& shape) {
@@ -585,6 +666,121 @@ bool dispatch_dynamic_general_copy(
   return true;
 }
 
+std::string build_dynamic_vector_cast_shader(
+    Dtype in_dtype,
+    Dtype out_dtype,
+    int64_t in_base_offset,
+    int64_t out_base_offset,
+    size_t total_elements) {
+  std::ostringstream os;
+  os << emit_dynamic_shader_preamble(in_dtype, out_dtype, false);
+  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
+     << dtype_to_glsl_storage_type(in_dtype) << " data[];} input_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
+     << dtype_to_glsl_storage_type(out_dtype) << " data[];} output_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (linear_idx >= " << total_elements << "u) {\n";
+  os << "    return;\n";
+  os << "  }\n";
+  os << "  uint input_index = linear_idx + " << in_base_offset << "u;\n";
+  os << "  uint output_index = linear_idx + " << out_base_offset << "u;\n";
+  os << "  output_buf.data[output_index] = "
+     << cast_expr_for_dtype("input_buf.data[input_index]", in_dtype, out_dtype)
+     << ";\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool dispatch_dynamic_vector_cast_copy(
+    const mlx::core::array& in,
+    mlx::core::array& out,
+    size_t size,
+    int64_t in_offset,
+    int64_t out_offset,
+    const mlx::core::Stream& s) {
+  if (!is_vulkan_storage_array(in) || !is_vulkan_storage_array(out)) {
+    return false;
+  }
+  if (!supports_dynamic_gpu_cast_dtype(in.dtype()) ||
+      !supports_dynamic_gpu_cast_dtype(out.dtype())) {
+    return false;
+  }
+  if (size == 0) {
+    return true;
+  }
+  if (size > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  const int64_t in_base_offset = in_offset;
+  const int64_t out_base_offset = out_offset;
+  if (in_base_offset < 0 || out_base_offset < 0) {
+    return false;
+  }
+
+  std::ostringstream layout_key;
+  layout_key << static_cast<int>(in.dtype().val()) << ':'
+             << static_cast<int>(out.dtype().val()) << ':' << in_base_offset
+             << ':' << out_base_offset << ':' << size;
+  const std::string shader_name = "dynamic_vector_cast_copy_" +
+      copy_dtype_suffix(in.dtype()) + "_" + copy_dtype_suffix(out.dtype()) +
+      "_" + std::to_string(std::hash<std::string>{}(layout_key.str()));
+
+  ensure_dynamic_shader_registered(
+      shader_name,
+      build_dynamic_vector_cast_shader(
+          in.dtype(), out.dtype(), in_base_offset, out_base_offset, size));
+
+  std::vector<VkDescriptorSetLayoutBinding> bindings;
+  write_descriptor_binding(bindings, 0);
+  write_descriptor_binding(bindings, 1);
+
+  auto& manager = vulkan::KernelManager::get();
+  auto* pipeline = manager.get_pipeline(shader_name, bindings, 0);
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
+  vk::DescriptorSet descriptor_set =
+      manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+
+  std::vector<VkDescriptorBufferInfo> infos;
+  std::vector<VkWriteDescriptorSet> writes;
+  infos.reserve(2);
+  writes.reserve(2);
+  write_descriptor_buffer(in, 0, descriptor_set, infos, writes);
+  write_descriptor_buffer(out, 1, descriptor_set, infos, writes);
+  vkUpdateDescriptorSets(
+      vulkan::VulkanContext::get().device(),
+      static_cast<uint32_t>(writes.size()),
+      writes.data(),
+      0,
+      nullptr);
+
+  vkCmdBindPipeline(
+      command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+  VkDescriptorSet vk_descriptor_set =
+      static_cast<VkDescriptorSet>(descriptor_set);
+  vkCmdBindDescriptorSets(
+      command_buffer,
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeline->layout,
+      0,
+      1,
+      &vk_descriptor_set,
+      0,
+      nullptr);
+
+  const uint32_t workgroups =
+      std::max<uint32_t>((static_cast<uint32_t>(size) + 255u) / 256u, 1u);
+  vkCmdDispatch(command_buffer, workgroups, 1, 1);
+
+  vulkan::retain_array_for_stream(s, in);
+  vulkan::retain_array_for_stream(s, out);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 mlx::core::array make_copy_view(
     const mlx::core::array& base,
     const Shape& shape,
@@ -739,10 +935,6 @@ bool try_host_vector_cast_copy(
     int64_t out_offset,
     const mlx::core::Stream& s) {
   const bool in_is_vulkan = mlx::core::vulkan::is_vulkan_buffer(in.buffer());
-  auto* in_buf = in_is_vulkan
-      ? static_cast<mlx::core::vulkan::VulkanBuffer*>(
-            const_cast<void*>(static_cast<const void*>(in.buffer().ptr())))
-      : nullptr;
   auto* out_buf =
       static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
 
@@ -776,83 +968,16 @@ bool try_host_vector_cast_copy(
     return true;
   }
 
-  if (in_buf->mapped_ptr != nullptr) {
-    auto* src_ptr = static_cast<const char*>(in_buf->mapped_ptr) +
-        in_offset * size_of(in.dtype());
-    convert_and_store(src_ptr);
+  if (dispatch_dynamic_vector_cast_copy(
+          in, out, size, in_offset, out_offset, s)) {
     return true;
   }
 
-  const auto readback_bytes = size * size_of(in.dtype());
-  const auto upload_offset = out_offset * size_of(out.dtype());
-  const auto in_dtype = in.dtype();
-  const auto out_dtype = out.dtype();
-
-  auto in_keepalive = in;
-  auto out_keepalive = out;
-  auto stream = s;
-  auto upload_enqueued = std::make_shared<std::atomic<bool>>(false);
-  auto callback_error = std::make_shared<std::exception_ptr>();
-
-  mlx::core::vulkan::enqueue_owned_staging_readback(
-      stream,
-      in_buf->buffer,
-      in_offset * size_of(in.dtype()),
-      readback_bytes,
-      [size,
-       in_dtype,
-       out_dtype,
-       upload_offset,
-       upload_enqueued,
-       callback_error,
-       in_keepalive = std::move(in_keepalive),
-       out_keepalive = std::move(out_keepalive),
-       stream](const void* ptr, size_t /*nbytes*/) mutable {
-        try {
-          std::vector<char> host_out(size * size_of(out_dtype));
-          host_cast_copy_dispatch_src(
-              ptr, in_dtype, host_out.data(), size, out_dtype);
-
-          auto* callback_out_buf =
-              static_cast<mlx::core::vulkan::VulkanBuffer*>(
-                  out_keepalive.buffer().ptr());
-          if (mlx::core::vulkan::VulkanContext::get().is_unified_memory() &&
-              callback_out_buf->mapped_ptr != nullptr) {
-            auto* dst_ptr = static_cast<char*>(callback_out_buf->mapped_ptr) +
-                upload_offset;
-            std::memcpy(dst_ptr, host_out.data(), host_out.size());
-            upload_enqueued->store(true, std::memory_order_release);
-            return;
-          }
-
-          mlx::core::vulkan::enqueue_owned_staging_upload(
-              stream,
-              host_out.data(),
-              host_out.size(),
-              callback_out_buf->buffer,
-              upload_offset);
-          mlx::core::vulkan::retain_array_for_stream(stream, in_keepalive);
-          mlx::core::vulkan::retain_array_for_stream(stream, out_keepalive);
-        } catch (...) {
-          *callback_error = std::current_exception();
-        }
-        upload_enqueued->store(true, std::memory_order_release);
-      });
-
-  const auto timeout_at =
-      std::chrono::steady_clock::now() + std::chrono::seconds(30);
-  while (!upload_enqueued->load(std::memory_order_acquire)) {
-    if (std::chrono::steady_clock::now() >= timeout_at) {
-      throw std::runtime_error(
-          "Timed out waiting for Vulkan cast-copy fallback readback completion.");
-    }
-    mlx::core::vulkan::finalize_stream(stream);
-    std::this_thread::yield();
-  }
-  if (*callback_error) {
-    std::rethrow_exception(*callback_error);
-  }
-  return true;
+  std::ostringstream oss;
+  oss << "Vulkan cast-copy fallback is not implemented for dtype pair in="
+      << static_cast<int>(in.dtype().val())
+      << " out=" << static_cast<int>(out.dtype().val());
+  throw std::runtime_error(oss.str());
 }
 
 std::string copy_dtype_suffix(Dtype dtype) {
@@ -1455,7 +1580,8 @@ void copy_gpu_inplace(
   // Small copies, especially decode-time KV cache updates, are latency
   // sensitive and do better when they stay in the current compute submission.
   const bool use_transfer_queue =
-      (raw_buffer_copy || contiguous_large_rank_copy || segmented_buffer_copy) &&
+      (raw_buffer_copy || contiguous_large_rank_copy ||
+       segmented_buffer_copy) &&
       should_use_transfer_queue_for_copy(copy_bytes);
   vk::CommandBuffer cmd_buffer = use_transfer_queue
       ? vulkan::begin_transfer_command_recording(s.index)

@@ -108,14 +108,18 @@ float bf16_to_fp32(uint u) {
 )";
 }
 
-std::string power_input_expr(Dtype dtype, const char* buffer_name) {
+std::string power_input_expr(
+    Dtype dtype,
+    const char* buffer_name,
+    const char* index_name) {
   if (dtype == bfloat16) {
-    return std::string("bf16_to_fp32(uint(") + buffer_name + ".data[idx]))";
+    return std::string("bf16_to_fp32(uint(") + buffer_name + ".data[" +
+        index_name + "]))";
   }
   if (dtype == float16) {
-    return std::string("float(") + buffer_name + ".data[idx])";
+    return std::string("float(") + buffer_name + ".data[" + index_name + "])";
   }
-  return std::string(buffer_name) + ".data[idx]";
+  return std::string(buffer_name) + ".data[" + index_name + "]";
 }
 
 std::string power_output_expr(Dtype out_dtype, const std::string& expr) {
@@ -130,7 +134,20 @@ std::string power_output_expr(Dtype out_dtype, const std::string& expr) {
 
 std::string build_power_shader(Dtype a_dtype, Dtype b_dtype, Dtype out_dtype) {
   std::ostringstream os;
-  os << vulkan::emit_dynamic_shader_preamble(a_dtype, out_dtype, false);
+  const bool uses_bfloat16 =
+      a_dtype == bfloat16 || b_dtype == bfloat16 || out_dtype == bfloat16;
+  const bool uses_float16 =
+      a_dtype == float16 || b_dtype == float16 || out_dtype == float16;
+  if (uses_bfloat16 || uses_float16) {
+    os << "#version 450\n";
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+    os << "#extension GL_EXT_shader_16bit_storage : require\n\n";
+    os << "layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  } else {
+    os << vulkan::emit_dynamic_shader_preamble(a_dtype, out_dtype, false);
+  }
   if (a_dtype == bfloat16 || b_dtype == bfloat16 || out_dtype == bfloat16) {
     os << emit_bf16_power_helpers();
   }
@@ -147,10 +164,10 @@ std::string build_power_shader(Dtype a_dtype, Dtype b_dtype, Dtype out_dtype) {
   os << "  uint idx = linear_idx;\n";
   os << "  uint a_idx = idx + pc.a_offset;\n";
   os << "  uint b_idx = idx + pc.b_offset;\n";
-  os << "  float lhs = " << power_input_expr(a_dtype, "a_buf") << ";\n";
-  os << "  float rhs = " << power_input_expr(b_dtype, "b_buf") << ";\n";
+  os << "  float lhs = " << power_input_expr(a_dtype, "a_buf", "a_idx") << ";\n";
+  os << "  float rhs = " << power_input_expr(b_dtype, "b_buf", "b_idx") << ";\n";
   os << "  out_buf.data[idx + pc.out_offset] = "
-     << power_output_expr(out_dtype, "pow(lhs, rhs)") << ";\n";
+      << power_output_expr(out_dtype, "pow(lhs, rhs)") << ";\n";
   os << "}\n";
   return os.str();
 }

@@ -1095,10 +1095,6 @@ void Compiled::eval_gpu(
   const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
 
   const bool use_push_descriptor = pipeline->supports_push_descriptor;
-  vk::DescriptorSet descriptor_set;
-  if (!use_push_descriptor) {
-    descriptor_set = manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  }
 
   // Prepare descriptor writes
   std::vector<VkWriteDescriptorSet> writes;
@@ -1132,7 +1128,7 @@ void Compiled::eval_gpu(
     add_buffer(dispatch_inputs[i]);
     writes.push_back({});
     writes[write_idx].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[write_idx].dstSet = descriptor_set;
+    writes[write_idx].dstSet = VK_NULL_HANDLE;
     writes[write_idx].dstBinding = write_idx;
     writes[write_idx].dstArrayElement = 0;
     writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1165,7 +1161,7 @@ void Compiled::eval_gpu(
     add_buffer(outputs[i]);
     writes.push_back({});
     writes[write_idx].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[write_idx].dstSet = descriptor_set;
+    writes[write_idx].dstSet = VK_NULL_HANDLE;
     writes[write_idx].dstBinding = write_idx;
     writes[write_idx].dstArrayElement = 0;
     writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1197,7 +1193,7 @@ void Compiled::eval_gpu(
           }
           const auto& arr = dispatch_inputs[i];
           const uint64_t item_size = static_cast<uint64_t>(size_of(arr.dtype()));
-          uint64_t offset_bytes = static_cast<uint64_t>(input_offsets[i]) * item_size;
+          uint64_t offset_bytes = 0;
           if (large && !is_scalar(arr)) {
             offset_bytes += chunk_base_elements * item_size;
           }
@@ -1210,8 +1206,7 @@ void Compiled::eval_gpu(
         for (size_t i = 0; i < outputs.size(); ++i) {
           const auto& arr = outputs[i];
           const uint64_t item_size = static_cast<uint64_t>(size_of(arr.dtype()));
-          uint64_t offset_bytes =
-              static_cast<uint64_t>(output_offsets[i]) * item_size;
+          uint64_t offset_bytes = 0;
           if (large) {
             offset_bytes += chunk_base_elements * item_size;
           }
@@ -1221,36 +1216,44 @@ void Compiled::eval_gpu(
           descriptor_binding++;
         }
 
-        if (use_push_descriptor) {
-          for (auto& write : writes) {
-            write.dstSet = vk::DescriptorSet();
-          }
-        } else if (!writes.empty()) {
+      };
+
+  std::vector<vk::DescriptorSet> descriptor_sets_to_free;
+  auto bind_descriptors_for_chunk = [&](uint64_t chunk_base_elements, uint64_t chunk_elements) {
+    update_descriptor_set_for_chunk(chunk_base_elements, chunk_elements);
+
+    if (use_push_descriptor) {
+      auto push_fn = vulkan::VulkanContext::get().push_descriptor_fn();
+      if (push_fn == nullptr) {
+        throw std::runtime_error("Missing Vulkan push descriptor function for compiled kernel");
+      }
+      for (auto& write : writes) {
+        write.dstSet = VK_NULL_HANDLE;
+      }
+      push_fn(
+          cmd_buffer,
+          VK_PIPELINE_BIND_POINT_COMPUTE,
+          pipeline->layout,
+          0,
+          static_cast<uint32_t>(writes.size()),
+          writes.data());
+      return;
+    }
+
+    auto descriptor_set = manager.allocate_descriptor_set(pipeline->descriptor_layout);
+    descriptor_sets_to_free.push_back(descriptor_set);
+    for (auto& write : writes) {
+      write.dstSet = descriptor_set;
+    }
+    if (!writes.empty()) {
           vkUpdateDescriptorSets(
               vulkan::VulkanContext::get().device(),
               static_cast<uint32_t>(writes.size()),
               writes.data(),
               0,
               nullptr);
-        }
-      };
-
-  // Bind pipeline and descriptor set
-  vkCmdBindPipeline(
-      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  if (use_push_descriptor) {
-    auto push_fn = vulkan::VulkanContext::get().push_descriptor_fn();
-    if (push_fn == nullptr) {
-      throw std::runtime_error("Missing Vulkan push descriptor function for compiled kernel");
     }
-    push_fn(
-        cmd_buffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline->layout,
-        0,
-        static_cast<uint32_t>(writes.size()),
-        writes.data());
-  } else {
+
     VkDescriptorSet vk_descriptor_set = static_cast<VkDescriptorSet>(descriptor_set);
     vkCmdBindDescriptorSets(
         cmd_buffer,
@@ -1261,7 +1264,11 @@ void Compiled::eval_gpu(
         &vk_descriptor_set,
         0,
         nullptr);
-  }
+  };
+
+  // Bind pipeline and descriptor set
+  vkCmdBindPipeline(
+      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
 
   // Set push constants
   struct PushConstants {
@@ -1271,7 +1278,7 @@ void Compiled::eval_gpu(
   // Dispatch
   uint64_t num_elements = outputs[0].data_size();
   if (!large) {
-    update_descriptor_set_for_chunk(0, num_elements);
+    bind_descriptors_for_chunk(0, num_elements);
 
     pc.size = static_cast<uint32_t>(num_elements);
     vkCmdPushConstants(
@@ -1293,7 +1300,7 @@ void Compiled::eval_gpu(
     for (uint64_t chunk_base = 0; chunk_base < num_elements;) {
       const uint64_t chunk_elements =
           std::min(kMaxChunkElements, num_elements - chunk_base);
-      update_descriptor_set_for_chunk(chunk_base, chunk_elements);
+      bind_descriptors_for_chunk(chunk_base, chunk_elements);
 
       pc.size = static_cast<uint32_t>(chunk_elements);
       vkCmdPushConstants(
@@ -1316,7 +1323,9 @@ void Compiled::eval_gpu(
 
   // Defer descriptor set cleanup
   if (!use_push_descriptor) {
-    manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+    for (auto descriptor_set : descriptor_sets_to_free) {
+      manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+    }
   }
 }
 

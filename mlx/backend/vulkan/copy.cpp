@@ -378,7 +378,14 @@ bool dispatch_dynamic_general_copy(
     arrays.push_back({&*dynamic_o_offset, 3});
   }
 
-  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) + sizeof(int64_t) * 4;
+  struct PushConstants {
+    uint32_t total_elements;
+    int64_t input_base;
+    int64_t output_base;
+    int64_t dynamic_i_base;
+    int64_t dynamic_o_base;
+  };
+  constexpr uint32_t kPushConstantSize = sizeof(PushConstants);
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name,
       glsl_source,
@@ -387,13 +394,7 @@ bool dispatch_dynamic_general_copy(
       kPushConstantSize,
       s);
 
-  struct PushConstants {
-    uint32_t total_elements;
-    int64_t input_base;
-    int64_t output_base;
-    int64_t dynamic_i_base;
-    int64_t dynamic_o_base;
-  } pc{};
+  PushConstants pc{};
   pc.total_elements = static_cast<uint32_t>(total_elements);
   pc.input_base = in_base_offset + i_offset;
   pc.output_base = out_base_offset + o_offset;

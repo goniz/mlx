@@ -741,23 +741,51 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
                 )
 
     def test_compiled_gelu_approx_negative_power_regression(self):
-        x = mx.linspace(-6.0, 6.0, 6144, dtype=mx.float32).reshape(1, 1, 6144)
-
         def gelu_approx(x):
             return 0.5 * x * (1.0 + mx.tanh(0.7978845608 * (x + 0.044715 * mx.power(x, 3.0))))
+
+        def make_x():
+            return mx.linspace(-6.0, 6.0, 6144, dtype=mx.float32).reshape(1, 1, 6144)
 
         @mx.compile
         def compiled(gate, value):
             return gelu_approx(gate) * value
 
-        expected = self._run_on_device(mx.cpu, lambda: gelu_approx(x) * x)
-        actual = self._run_on_device(mx.gpu, lambda: compiled(x, x))
+        expected = self._run_on_device(mx.cpu, lambda: gelu_approx(make_x()) * make_x())
+        actual = self._run_on_device(mx.gpu, lambda: compiled(make_x(), make_x()))
         self._assert_outputs_close(
             actual.astype(mx.float32),
             expected.astype(mx.float32),
             atol=1e-4,
             rtol=1e-4,
         )
+
+    def test_power_mixed_dtype_sliced_inputs_regression(self):
+        def fn():
+            base = mx.arange(0, 256, dtype=mx.float32).reshape(16, 16) / 32.0 + 0.5
+            exponents = (mx.arange(0, 256, dtype=mx.float32).reshape(16, 16) % 5) / 4.0
+            lhs = base[:, 1:-1].astype(mx.float32)
+            rhs = exponents[:, 1:-1].astype(mx.float16)
+            return mx.power(lhs, rhs).astype(mx.float32)
+
+        self._assert_cpu_gpu_same(fn, atol=1e-3, rtol=1e-3)
+
+    def test_compiled_nonzero_runtime_offsets_regression(self):
+        def eager(a, b):
+            return (a + b) * 0.5
+
+        def make_inputs():
+            lhs = mx.arange(0, 128, dtype=mx.float32)[8:120].reshape(7, 16)
+            rhs = mx.linspace(1.0, 2.0, 128, dtype=mx.float32)[8:120].reshape(7, 16)
+            return lhs, rhs
+
+        @mx.compile
+        def compiled(a, b):
+            return eager(a, b)
+
+        expected = self._run_on_device(mx.cpu, lambda: eager(*make_inputs()))
+        actual = self._run_on_device(mx.gpu, lambda: compiled(*make_inputs()))
+        self._assert_outputs_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 def _cases():
     return [

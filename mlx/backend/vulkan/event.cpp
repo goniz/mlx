@@ -39,6 +39,13 @@ void Event::wait() {
   auto* counter = static_cast<EventCounter*>(event_.get());
   if (stream_.device == Device::gpu && counter->value < value()) {
     vulkan::synchronize_stream(stream_);
+    {
+      std::lock_guard<std::mutex> lock(counter->mutex);
+      if (counter->value < value()) {
+        counter->value = value();
+      }
+    }
+    counter->cv.notify_all();
   }
   std::unique_lock<std::mutex> lock(counter->mutex);
   if (counter->value >= value()) {

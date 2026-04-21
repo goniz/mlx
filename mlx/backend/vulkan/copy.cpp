@@ -39,6 +39,9 @@ using vulkan::zero_literal_for_dtype;
 constexpr size_t kMinTransferQueueCopyBytes = 256 * 1024;
 
 std::string copy_dtype_suffix(Dtype dtype);
+bool needs_bf16_helpers(Dtype in_dtype, Dtype out_dtype);
+std::string emit_bf16_conversion_helpers();
+std::string bf16_cast_expr(const std::string& expr, Dtype in_dtype, Dtype out_dtype);
 
 bool has_row_contiguous_strides(const mlx::core::array& arr) {
   if (arr.ndim() == 0) {
@@ -204,14 +207,18 @@ std::string build_dynamic_offset_shader(
 }
 
 std::string build_dynamic_general_copy_shader(
-    Dtype dtype,
+    Dtype in_dtype,
+    Dtype out_dtype,
     const Shape& shape,
     const Strides& i_strides,
     const Strides& o_strides,
     bool has_dynamic_i_offset,
     bool has_dynamic_o_offset) {
   std::ostringstream os;
-  os << emit_dynamic_shader_preamble(dtype, true);
+  os << emit_dynamic_shader_preamble(in_dtype, out_dtype, true);
+  if (needs_bf16_helpers(in_dtype, out_dtype)) {
+    os << emit_bf16_conversion_helpers();
+  }
   os << "layout(push_constant) uniform PushConstants {\n";
   os << "  uint total_elements;\n";
   os << "  int64_t input_base;\n";
@@ -220,9 +227,9 @@ std::string build_dynamic_general_copy_shader(
   os << "  int64_t dynamic_o_base;\n";
   os << "} pc;\n";
   os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
-     << dtype_to_glsl_storage_type(dtype) << " data[];} input_buf;\n";
+     << dtype_to_glsl_storage_type(in_dtype) << " data[];} input_buf;\n";
   os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
-     << dtype_to_glsl_storage_type(dtype) << " data[];} output_buf;\n";
+     << dtype_to_glsl_storage_type(out_dtype) << " data[];} output_buf;\n";
   if (has_dynamic_i_offset) {
     os << "layout(set = 0, binding = 2) readonly buffer DynamicInputOffset {int64_t data[];} dynamic_i_offset_buf;\n";
   }
@@ -256,7 +263,15 @@ std::string build_dynamic_general_copy_shader(
       os << "  }\n";
     }
   }
-  os << "  output_buf.data[uint(output_index)] = input_buf.data[uint(input_index)];\n";
+  std::string cast_expr;
+  if (needs_bf16_helpers(in_dtype, out_dtype)) {
+    cast_expr = bf16_cast_expr(
+        "input_buf.data[uint(input_index)]", in_dtype, out_dtype);
+  } else {
+    cast_expr = cast_expr_for_dtype(
+        "input_buf.data[uint(input_index)]", in_dtype, out_dtype);
+  }
+  os << "  output_buf.data[uint(output_index)] = " << cast_expr << ";\n";
   os << "}\n";
   return os.str();
 }
@@ -306,10 +321,6 @@ bool dispatch_dynamic_general_copy(
   validate_dynamic_offset_array(dynamic_i_offset);
   validate_dynamic_offset_array(dynamic_o_offset);
 
-  if (in.dtype() != out.dtype()) {
-    throw std::runtime_error(
-        "Dynamic Vulkan copy currently requires matching input/output dtypes.");
-  }
   if (!is_vulkan_storage_array(in) || !is_vulkan_storage_array(out)) {
     throw std::runtime_error(
         "Dynamic Vulkan copy requires Vulkan-backed input and output arrays.");
@@ -345,11 +356,12 @@ bool dispatch_dynamic_general_copy(
   append_layout_key(layout_key, o_strides);
 
   const std::string shader_name = "dynamic_general_copy_" +
-      copy_dtype_suffix(in.dtype()) + "_" +
+      copy_dtype_suffix(in.dtype()) + "_" + copy_dtype_suffix(out.dtype()) + "_" +
       std::to_string(std::hash<std::string>{}(layout_key.str()));
 
   const std::string glsl_source = build_dynamic_general_copy_shader(
       in.dtype(),
+      out.dtype(),
       shape,
       i_strides,
       o_strides,
@@ -1268,10 +1280,11 @@ void copy_gpu_inplace(
 
   const bool is_slice_copy =
       shader_copy_type && shader_id.has_value() && in.size() != out.size();
-
-  const bool segmented_buffer_copy = same_dtype &&
+  const bool large_shader_offset =
       (shader_copy || is_slice_copy) &&
       (has_large_element_offset(in_view) || has_large_element_offset(out_view));
+
+  const bool segmented_buffer_copy = same_dtype && large_shader_offset;
 
   const bool host_contiguous_copy = in_view.flags().row_contiguous &&
       out_view.flags().row_contiguous && dispatch_elements == in_view.size() &&
@@ -1439,6 +1452,24 @@ void copy_gpu_inplace(
       if (dispatch_shape.size() > 4) {
         throw std::runtime_error(
             "Copy operation failed on Vulkan: >4D non-contiguous arrays not supported");
+      }
+
+      if (large_shader_offset) {
+        if (!dispatch_dynamic_general_copy(
+                in_view,
+                out_view,
+                dispatch_shape,
+                dispatch_i_strides,
+                dispatch_o_strides,
+                0,
+                0,
+                s,
+                std::nullopt,
+                std::nullopt)) {
+          throw std::runtime_error(
+              "Large-offset shader copy does not support tensors with rank greater than 4.");
+        }
+        return;
       }
 
       vulkan::dispatch_unary_op(in_view, out_view, *shader_id, cmd_buffer, s);

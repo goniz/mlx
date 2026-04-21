@@ -64,6 +64,13 @@ void Fence::wait(Stream stream, const array&) {
 
   if (impl->stream.device == Device::gpu) {
     vulkan::synchronize_stream(impl->stream);
+    {
+      std::lock_guard<std::mutex> lock(impl->mutex);
+      if (impl->value < target) {
+        impl->value = target;
+      }
+    }
+    impl->cv.notify_all();
   }
   wait_fence_value(fence_, target);
 }

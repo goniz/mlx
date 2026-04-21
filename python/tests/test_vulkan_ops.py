@@ -787,6 +787,41 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
         actual = self._run_on_device(mx.gpu, lambda: compiled(*make_inputs()))
         self._assert_outputs_close(actual, expected, atol=1e-5, rtol=1e-5)
 
+    def test_compiled_int8_uint8_regression(self):
+        def make_int8():
+            return mx.arange(-32, 32, dtype=mx.int8)
+
+        def make_uint8():
+            return mx.arange(0, 64, dtype=mx.uint8)
+
+        @mx.compile
+        def compiled_int8(a):
+            return mx.add(a, mx.array(7, dtype=mx.int8))
+
+        @mx.compile
+        def compiled_uint8(a):
+            return mx.add(a, mx.array(7, dtype=mx.uint8))
+
+        expected_int8 = self._run_on_device(mx.cpu, lambda: compiled_int8(make_int8()))
+        actual_int8 = self._run_on_device(mx.gpu, lambda: compiled_int8(make_int8()))
+        self._assert_outputs_close(actual_int8, expected_int8, atol=0.0, rtol=0.0)
+
+        expected_uint8 = self._run_on_device(mx.cpu, lambda: compiled_uint8(make_uint8()))
+        actual_uint8 = self._run_on_device(mx.gpu, lambda: compiled_uint8(make_uint8()))
+        self._assert_outputs_close(actual_uint8, expected_uint8, atol=0.0, rtol=0.0)
+
+    def test_compiled_bool_roundtrip_regression(self):
+        def make_bool():
+            return mx.array([True, False, True, True, False, False, True], dtype=mx.bool_)
+
+        @mx.compile
+        def compiled_bool(a):
+            return a.astype(mx.int8).astype(mx.bool_)
+
+        expected = self._run_on_device(mx.cpu, lambda: compiled_bool(make_bool()))
+        actual = self._run_on_device(mx.gpu, lambda: compiled_bool(make_bool()))
+        self._assert_outputs_close(actual, expected, atol=0.0, rtol=0.0)
+
 def _cases():
     return [
         (

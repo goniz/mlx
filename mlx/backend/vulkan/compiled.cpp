@@ -899,17 +899,6 @@ void Compiled::eval_gpu(
       return true;
     }
 
-    auto has_unimplemented_dtype = [](const std::vector<array>& arrays) {
-      return std::any_of(arrays.begin(), arrays.end(), [](const array& x) {
-        return x.dtype() == bool_ || x.dtype() == int8 || x.dtype() == uint8;
-      });
-    };
-
-    if (has_unimplemented_dtype(inputs_) ||
-        has_unimplemented_dtype(outputs_) || has_unimplemented_dtype(tape_)) {
-      return true;
-    }
-
     return std::any_of(tape_.begin(), tape_.end(), [](const array& x) {
       return !is_static_cast(x.primitive()) &&
           !supports_primitive_name(x.primitive().name());

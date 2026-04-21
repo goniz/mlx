@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <sstream>
 
+#include <fmt/format.h>
+
 #define NS_PRIVATE_IMPLEMENTATION
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
@@ -45,15 +47,17 @@ auto get_metal_version() {
   return metal_version_;
 }
 
-auto load_device() {
-  auto devices = MTL::CopyAllDevices();
-  auto device = static_cast<MTL::Device*>(devices->object(0))
-      ?: MTL::CreateSystemDefaultDevice();
+NS::SharedPtr<MTL::Device> load_device() {
+  auto pool = new_scoped_memory_pool();
+  auto devices = NS::TransferPtr(MTL::CopyAllDevices());
+  auto device = NS::RetainPtr(static_cast<MTL::Device*>(devices->object(0)))
+      ?: NS::TransferPtr(MTL::CreateSystemDefaultDevice());
   if (!device) {
     throw std::runtime_error("Failed to load device");
   }
   return device;
 }
+
 std::pair<MTL::Library*, NS::Error*> load_library_from_path(
     MTL::Device* device,
     const char* path) {
@@ -248,7 +252,7 @@ MTL::Library* load_library(
 CommandEncoder::CommandEncoder(
     Device& d,
     int index,
-    const MTL::ResidencySet* residency_set)
+    ResidencySet& residency_set)
     : device_(d) {
   auto pool = new_scoped_memory_pool();
   queue_ = NS::TransferPtr(device_.mtl_device()->newCommandQueue());
@@ -256,11 +260,19 @@ CommandEncoder::CommandEncoder(
     throw std::runtime_error(
         "[metal::CommandEncoder] Failed to make new command queue.");
   }
-  if (residency_set) {
-    queue_->addResidencySet(residency_set);
+  if (residency_set.mtl_residency_set()) {
+    queue_->addResidencySet(residency_set.mtl_residency_set());
   }
   debug_set_stream_queue_label(queue_.get(), index);
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
+}
+
+CommandEncoder::~CommandEncoder() {
+  exiting_ = true;
+  synchronize();
+  auto pool = new_scoped_memory_pool();
+  buffer_.reset();
+  queue_.reset();
 }
 
 void CommandEncoder::set_buffer(
@@ -431,6 +443,22 @@ void CommandEncoder::commit() {
   buffer_sizes_ = 0;
 }
 
+void CommandEncoder::synchronize() {
+  auto pool = new_scoped_memory_pool();
+  auto cb = NS::RetainPtr(get_command_buffer());
+  end_encoding();
+  commit();
+  cb->waitUntilCompleted();
+  if (!exiting_) {
+    if (cb->status() == MTL::CommandBufferStatusError) {
+      throw std::runtime_error(
+          fmt::format(
+              "[METAL] Command buffer execution failed: {}.",
+              cb->error()->localizedDescription()->utf8String()));
+    }
+  }
+}
+
 MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
   if (!encoder_) {
     encoder_ = NS::RetainPtr(
@@ -440,10 +468,9 @@ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
   return encoder_.get();
 }
 
-Device::Device() {
+Device::Device() : device_(load_device()), residency_set_(device_.get()) {
   auto pool = new_scoped_memory_pool();
-  device_ = load_device();
-  default_library_ = load_default_library(device_);
+  default_library_ = NS::TransferPtr(load_default_library(device_.get()));
   arch_ = env::metal_gpu_arch();
   if (arch_.empty()) {
     arch_ = std::string(device_->architecture()->name()->utf8String());
@@ -484,49 +511,7 @@ Device::Device() {
   max_mb_per_buffer_ = env::max_mb_per_buffer(max_mb_per_buffer_);
 }
 
-Device::~Device() {
-  auto pool = new_scoped_memory_pool();
-  for (auto& [l, kernel_map] : library_kernels_) {
-    l->release();
-    for (auto& [_, k] : kernel_map) {
-      k->release();
-    }
-  }
-  encoders_.clear();
-  device_->release();
-}
-
-bool Device::command_buffer_needs_commit(int index) {
-  return get_command_encoder(index).needs_commit();
-}
-
-MTL::CommandBuffer* Device::get_command_buffer(int index) {
-  return get_command_encoder(index).get_command_buffer();
-}
-
-void Device::commit_command_buffer(int index) {
-  get_command_encoder(index).commit();
-}
-
-void Device::add_temporary(array arr, int index) {
-  get_command_encoder(index).add_temporary(std::move(arr));
-}
-
-void Device::add_temporaries(std::vector<array> arrays, int index) {
-  get_command_encoder(index).add_temporaries(std::move(arrays));
-}
-
-void Device::end_encoding(int index) {
-  get_command_encoder(index).end_encoding();
-}
-
-CommandEncoder& Device::get_command_encoder(int index) {
-  auto it = encoders_.find(index);
-  if (it == encoders_.end()) {
-    it = encoders_.try_emplace(index, *this, index, residency_set_).first;
-  }
-  return it->second;
-}
+Device::~Device() = default;
 
 MTL::Library* Device::get_library(
     const std::string& name,
@@ -534,28 +519,29 @@ MTL::Library* Device::get_library(
   {
     std::shared_lock rlock(library_mtx_);
     if (auto it = library_map_.find(name); it != library_map_.end()) {
-      return it->second;
+      return it->second.get();
     }
   }
 
   std::unique_lock wlock(library_mtx_);
   if (auto it = library_map_.find(name); it != library_map_.end()) {
-    return it->second;
+    return it->second.get();
   }
 
-  auto new_lib = load_library(device_, name, path.c_str());
-  library_map_.insert({name, new_lib});
+  auto new_lib = load_library(device_.get(), name, path.c_str());
+  library_map_.insert({name, NS::TransferPtr(new_lib)});
   return new_lib;
 }
 
-MTL::Library* Device::build_library_(const std::string& source_string) {
+NS::SharedPtr<MTL::Library> Device::build_library_(
+    const std::string& source_string) {
   auto pool = new_scoped_memory_pool();
 
   auto ns_code =
       NS::String::string(source_string.c_str(), NS::ASCIIStringEncoding);
 
   NS::Error* error = nullptr;
-  auto options = MTL::CompileOptions::alloc()->init();
+  auto options = MTL::CompileOptions::alloc()->init()->autorelease();
   options->setFastMathEnabled(false);
   options->setLanguageVersion(get_metal_version());
 #ifndef NDEBUG
@@ -563,8 +549,7 @@ MTL::Library* Device::build_library_(const std::string& source_string) {
     options->setEnableLogging(true);
   }
 #endif
-  auto mtl_lib = device_->newLibrary(ns_code, options, &error);
-  options->release();
+  auto mtl_lib = NS::TransferPtr(device_->newLibrary(ns_code, options, &error));
 
   // Throw error if unable to compile library
   if (!mtl_lib) {
@@ -579,17 +564,16 @@ MTL::Library* Device::build_library_(const std::string& source_string) {
   return mtl_lib;
 }
 
-MTL::Function* Device::get_function_(
+NS::SharedPtr<MTL::Function> Device::get_function_(
     const std::string& name,
     MTL::Library* mtl_lib) {
+  auto pool = new_scoped_memory_pool();
   // Pull kernel from library
   auto ns_name = NS::String::string(name.c_str(), NS::ASCIIStringEncoding);
-  auto mtl_function = mtl_lib->newFunction(ns_name);
-
-  return mtl_function;
+  return NS::TransferPtr(mtl_lib->newFunction(ns_name));
 }
 
-MTL::Function* Device::get_function_(
+NS::SharedPtr<MTL::Function> Device::get_function_(
     const std::string& name,
     const std::string& specialized_name,
     const MTLFCList& func_consts,
@@ -598,8 +582,11 @@ MTL::Function* Device::get_function_(
     return get_function_(name, mtl_lib);
   }
 
+  auto pool = new_scoped_memory_pool();
+
   // Prepare function constants
-  auto mtl_func_consts = MTL::FunctionConstantValues::alloc()->init();
+  auto mtl_func_consts =
+      MTL::FunctionConstantValues::alloc()->init()->autorelease();
 
   for (auto [value, type, index] : func_consts) {
     mtl_func_consts->setConstantValue(value, type, index);
@@ -614,7 +601,7 @@ MTL::Function* Device::get_function_(
 
   // Pull kernel from library
   NS::Error* error = nullptr;
-  auto mtl_function = mtl_lib->newFunction(desc, &error);
+  auto mtl_function = NS::TransferPtr(mtl_lib->newFunction(desc, &error));
 
   // Throw error if unable to build metal function
   if (!mtl_function) {
@@ -626,20 +613,19 @@ MTL::Function* Device::get_function_(
     throw std::runtime_error(msg.str());
   }
 
-  mtl_func_consts->release();
-
   return mtl_function;
 }
 
-MTL::ComputePipelineState* Device::get_kernel_(
+NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
     const std::string& name,
     const MTL::Function* mtl_function) {
   // Compile kernel to compute pipeline
   NS::Error* error = nullptr;
-  MTL::ComputePipelineState* kernel;
+  NS::SharedPtr<MTL::ComputePipelineState> kernel;
 
   if (mtl_function) {
-    kernel = device_->newComputePipelineState(mtl_function, &error);
+    kernel =
+        NS::TransferPtr(device_->newComputePipelineState(mtl_function, &error));
   }
 
   // Throw error if unable to compile metal function
@@ -655,7 +641,7 @@ MTL::ComputePipelineState* Device::get_kernel_(
   return kernel;
 }
 
-MTL::ComputePipelineState* Device::get_kernel_(
+NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
     const std::string& name,
     const MTL::Function* mtl_function,
     const MTL::LinkedFunctions* linked_functions) {
@@ -670,15 +656,17 @@ MTL::ComputePipelineState* Device::get_kernel_(
     throw std::runtime_error(msg.str());
   }
 
+  auto pool = new_scoped_memory_pool();
+
   // Prepare compute pipeline state descriptor
-  auto desc = MTL::ComputePipelineDescriptor::alloc()->init();
+  auto desc = MTL::ComputePipelineDescriptor::alloc()->init()->autorelease();
   desc->setComputeFunction(mtl_function);
   desc->setLinkedFunctions(linked_functions);
 
   // Compile kernel to compute pipeline
   NS::Error* error = nullptr;
-  auto kernel = device_->newComputePipelineState(
-      desc, MTL::PipelineOptionNone, nullptr, &error);
+  auto kernel = NS::TransferPtr(device_->newComputePipelineState(
+      desc, MTL::PipelineOptionNone, nullptr, &error));
 
   // Throw error if unable to compile metal function
   if (!kernel) {
@@ -693,62 +681,45 @@ MTL::ComputePipelineState* Device::get_kernel_(
   return kernel;
 }
 
-MTL::Library* Device::get_library_(const std::string& name) {
-  std::shared_lock lock(library_mtx_);
-  auto it = library_map_.find(name);
-  return (it != library_map_.end()) ? it->second : nullptr;
-}
-
 MTL::Library* Device::get_library(
     const std::string& name,
     const std::function<std::string(void)>& builder) {
   {
     std::shared_lock rlock(library_mtx_);
     if (auto it = library_map_.find(name); it != library_map_.end()) {
-      return it->second;
+      return it->second.get();
     }
   }
 
   std::unique_lock wlock(library_mtx_);
   if (auto it = library_map_.find(name); it != library_map_.end()) {
-    return it->second;
+    return it->second.get();
   }
 
   auto mtl_lib = build_library_(builder());
   library_map_.insert({name, mtl_lib});
-  return mtl_lib;
+  return mtl_lib.get();
 }
 
 void Device::clear_library(const std::string& name) {
   std::unique_lock wlock(library_mtx_);
   if (auto it = library_map_.find(name); it != library_map_.end()) {
-    auto kernel_map_it = library_kernels_.find(it->second);
-    for (auto& [_, kernel] : kernel_map_it->second) {
-      kernel->release();
-    }
-    library_kernels_.erase(kernel_map_it);
-    it->second->release();
+    library_kernels_.erase(it->second.get());
     library_map_.erase(it);
   }
 }
 
-MTL::LinkedFunctions* Device::get_linked_functions_(
+NS::SharedPtr<MTL::LinkedFunctions> Device::get_linked_functions_(
     const std::vector<MTL::Function*>& funcs) {
   if (funcs.empty()) {
     return nullptr;
   }
 
-  auto lfuncs = MTL::LinkedFunctions::linkedFunctions();
-
-  std::vector<NS::Object*> objs(funcs.size());
-  for (int i = 0; i < funcs.size(); i++) {
-    objs[i] = funcs[i];
-  }
-
-  NS::Array* funcs_arr = NS::Array::array(objs.data(), funcs.size());
-
+  auto pool = new_scoped_memory_pool();
+  auto lfuncs = NS::TransferPtr(MTL::LinkedFunctions::linkedFunctions());
+  NS::Array* funcs_arr = NS::Array::array(
+      reinterpret_cast<const NS::Object* const*>(funcs.data()), funcs.size());
   lfuncs->setPrivateFunctions(funcs_arr);
-
   return lfuncs;
 }
 
@@ -764,7 +735,7 @@ MTL::ComputePipelineState* Device::get_kernel_(
   // Try loading again to avoid loading twice
   auto& kernel_map_ = library_kernels_[mtl_lib];
   if (auto it = kernel_map_.find(hash_name); it != kernel_map_.end()) {
-    return it->second;
+    return it->second.get();
   }
 
   auto pool = new_scoped_memory_pool();
@@ -774,15 +745,13 @@ MTL::ComputePipelineState* Device::get_kernel_(
 
   // Compile kernel to compute pipeline
   auto mtl_linked_funcs = get_linked_functions_(linked_functions);
-  auto kernel = get_kernel_(hash_name, mtl_function, mtl_linked_funcs);
-
-  mtl_function->release();
-  mtl_linked_funcs->release();
+  auto kernel =
+      get_kernel_(hash_name, mtl_function.get(), mtl_linked_funcs.get());
 
   // Add kernel to cache
   kernel_map_.insert({hash_name, kernel});
 
-  return kernel;
+  return kernel.get();
 }
 
 MTL::ComputePipelineState* Device::get_kernel(
@@ -799,7 +768,7 @@ MTL::ComputePipelineState* Device::get_kernel(
     // Look for cached kernel
     auto& kernel_map_ = library_kernels_[mtl_lib];
     if (auto it = kernel_map_.find(kname); it != kernel_map_.end()) {
-      return it->second;
+      return it->second.get();
     }
   }
   return get_kernel_(base_name, mtl_lib, kname, func_consts, linked_functions);
@@ -811,22 +780,11 @@ MTL::ComputePipelineState* Device::get_kernel(
     const MTLFCList& func_consts /*  = {} */,
     const std::vector<MTL::Function*>& linked_functions /*  = {} */) {
   return get_kernel(
-      base_name, default_library_, hash_name, func_consts, linked_functions);
-}
-
-void Device::set_residency_set(const MTL::ResidencySet* residency_set) {
-  if (residency_set_ != nullptr) {
-    throw std::runtime_error(
-        "[Device::set_residency_set] Can only be set once.");
-  }
-  if (residency_set == nullptr) {
-    return;
-  }
-  residency_set_ = residency_set;
-  // Attach residency set to existing command queues
-  for (auto& [_, encoder] : encoders_) {
-    encoder.get_command_queue()->addResidencySet(residency_set_);
-  }
+      base_name,
+      default_library_.get(),
+      hash_name,
+      func_consts,
+      linked_functions);
 }
 
 Device& device(mlx::core::Device) {
@@ -837,12 +795,44 @@ Device& device(mlx::core::Device) {
   return *metal_device;
 }
 
-std::unique_ptr<void, std::function<void(void*)>> new_scoped_memory_pool() {
-  auto dtor = [](void* ptr) {
-    static_cast<NS::AutoreleasePool*>(ptr)->release();
+CommandEncoder& get_command_encoder(Stream s) {
+  auto& encoders = get_command_encoders();
+  auto it = encoders.find(s.index);
+  if (it == encoders.end()) {
+    throw std::runtime_error(
+        fmt::format("There is no Stream(gpu, {}) in current thread.", s.index));
+  }
+  return it->second;
+}
+
+std::unordered_map<int, CommandEncoder>& get_command_encoders() {
+  static thread_local std::unordered_map<int, CommandEncoder> encoders;
+  return encoders;
+}
+
+NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool() {
+  return NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+}
+
+bool is_nax_available() {
+#ifdef MLX_METAL_NO_NAX
+  return false;
+#else
+  auto _check_nax = []() {
+    bool can_use_nax = false;
+    if (__builtin_available(
+            macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
+      can_use_nax = true;
+    }
+    auto& d = metal::device(mlx::core::Device::gpu);
+    auto arch = d.get_architecture().back();
+    auto gen = d.get_architecture_gen();
+    can_use_nax &= gen >= (arch == 'p' ? 18 : 17);
+    return can_use_nax;
   };
-  return std::unique_ptr<void, std::function<void(void*)>>(
-      NS::AutoreleasePool::alloc()->init(), dtor);
+  static bool is_nax_available_ = _check_nax();
+  return is_nax_available_;
+#endif
 }
 
 } // namespace mlx::core::metal

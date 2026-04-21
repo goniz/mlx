@@ -200,6 +200,7 @@ class AddMM : public UnaryPrimitive {
   DEFINE_NAME(AddMM)
 
   bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
   std::pair<float, float> state() const {
     return {alpha_, beta_};
   };
@@ -697,6 +698,7 @@ class Conjugate : public UnaryPrimitive {
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
 
   DEFINE_VMAP()
+  DEFINE_GRADS()
   DEFINE_NAME(Conjugate)
   DEFINE_DEFAULT_IS_EQUIVALENT()
   DEFINE_INPUT_OUTPUT_SHAPE()

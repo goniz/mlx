@@ -11,6 +11,7 @@
 #include <unordered_set>
 
 #include "mlx/array.h"
+#include "mlx/backend/metal/resident.h"
 #include "mlx/device.h"
 
 namespace mlx::core::metal {
@@ -22,7 +23,9 @@ class Device;
 
 class MLX_API CommandEncoder {
  public:
-  CommandEncoder(Device& d, int index, const MTL::ResidencySet* residency_set);
+  CommandEncoder(Device& d, int index, ResidencySet& residency_set);
+  ~CommandEncoder();
+
   CommandEncoder(const CommandEncoder&) = delete;
   CommandEncoder& operator=(const CommandEncoder&) = delete;
 
@@ -89,6 +92,7 @@ class MLX_API CommandEncoder {
   void end_encoding();
   bool needs_commit() const;
   void commit();
+  void synchronize();
 
   MTL::CommandQueue* get_command_queue() const {
     return queue_.get();
@@ -101,6 +105,7 @@ class MLX_API CommandEncoder {
   MTL::ComputeCommandEncoder* get_command_encoder();
 
   Device& device_;
+  bool exiting_{false};
 
   // Buffer that stores encoded commands.
   NS::SharedPtr<MTL::CommandQueue> queue_;
@@ -135,7 +140,7 @@ class MLX_API Device {
   ~Device();
 
   MTL::Device* mtl_device() {
-    return device_;
+    return device_.get();
   };
 
   const std::string& get_architecture() const {
@@ -147,12 +152,6 @@ class MLX_API Device {
   std::tuple<int, int> get_max_ops_mb_per_buffer() const {
     return std::make_tuple(max_ops_per_buffer_, max_mb_per_buffer_);
   }
-
-  MTL::CommandBuffer* get_command_buffer(int index);
-  bool command_buffer_needs_commit(int index);
-  void commit_command_buffer(int index);
-  CommandEncoder& get_command_encoder(int index);
-  void end_encoding(int index);
 
   MTL::Library* get_library(
       const std::string& name,
@@ -177,34 +176,29 @@ class MLX_API Device {
       const MTLFCList& func_consts = {},
       const std::vector<MTL::Function*>& linked_functions = {});
 
-  // Record temporary arrays for the given stream index
-  void add_temporary(array arr, int index);
-  void add_temporaries(std::vector<array> arrays, int index);
-
-  void set_residency_set(const MTL::ResidencySet* residency_set);
+  ResidencySet& residency_set() {
+    return residency_set_;
+  }
 
  private:
-  MTL::Library* get_library_cache_(const std::string& name);
+  NS::SharedPtr<MTL::Library> build_library_(const std::string& source_string);
 
-  MTL::Library* get_library_(const std::string& name);
-  MTL::Library* build_library_(const std::string& source_string);
-
-  MTL::Function* get_function_(const std::string& name, MTL::Library* mtl_lib);
-
-  MTL::Function* get_function_(
+  NS::SharedPtr<MTL::Function> get_function_(
+      const std::string& name,
+      MTL::Library* mtl_lib);
+  NS::SharedPtr<MTL::Function> get_function_(
       const std::string& name,
       const std::string& specialized_name,
       const MTLFCList& func_consts,
       MTL::Library* mtl_lib);
 
-  MTL::LinkedFunctions* get_linked_functions_(
+  NS::SharedPtr<MTL::LinkedFunctions> get_linked_functions_(
       const std::vector<MTL::Function*>& funcs);
 
-  MTL::ComputePipelineState* get_kernel_(
+  NS::SharedPtr<MTL::ComputePipelineState> get_kernel_(
       const std::string& name,
       const MTL::Function* mtl_function);
-
-  MTL::ComputePipelineState* get_kernel_(
+  NS::SharedPtr<MTL::ComputePipelineState> get_kernel_(
       const std::string& name,
       const MTL::Function* mtl_function,
       const MTL::LinkedFunctions* linked_functions);
@@ -216,18 +210,17 @@ class MLX_API Device {
       const MTLFCList& func_consts = {},
       const std::vector<MTL::Function*>& linked_functions = {});
 
-  MTL::Device* device_;
-  std::unordered_map<int32_t, CommandEncoder> encoders_;
+  NS::SharedPtr<MTL::Device> device_;
+  ResidencySet residency_set_;
 
   std::shared_mutex kernel_mtx_;
   std::shared_mutex library_mtx_;
-  std::unordered_map<std::string, MTL::Library*> library_map_;
-  MTL::Library* default_library_;
+  std::unordered_map<std::string, NS::SharedPtr<MTL::Library>> library_map_;
+  NS::SharedPtr<MTL::Library> default_library_;
   std::unordered_map<
       MTL::Library*,
-      std::unordered_map<std::string, MTL::ComputePipelineState*>>
+      std::unordered_map<std::string, NS::SharedPtr<MTL::ComputePipelineState>>>
       library_kernels_;
-  const MTL::ResidencySet* residency_set_{nullptr};
   std::string arch_;
   int arch_gen_;
   int max_ops_per_buffer_;
@@ -235,28 +228,11 @@ class MLX_API Device {
 };
 
 MLX_API Device& device(mlx::core::Device);
+MLX_API CommandEncoder& get_command_encoder(Stream s);
 
-std::unique_ptr<void, std::function<void(void*)>> new_scoped_memory_pool();
+std::unordered_map<int, CommandEncoder>& get_command_encoders();
+NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
-inline bool is_nax_available() {
-#ifdef MLX_METAL_NO_NAX
-  return false;
-#else
-  auto _check_nax = []() {
-    bool can_use_nax = false;
-    if (__builtin_available(
-            macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
-      can_use_nax = true;
-    }
-    auto& d = metal::device(mlx::core::Device::gpu);
-    auto arch = d.get_architecture().back();
-    auto gen = d.get_architecture_gen();
-    can_use_nax &= gen >= (arch == 'p' ? 18 : 17);
-    return can_use_nax;
-  };
-  static bool is_nax_available_ = _check_nax();
-  return is_nax_available_;
-#endif
-}
+bool is_nax_available();
 
 } // namespace mlx::core::metal

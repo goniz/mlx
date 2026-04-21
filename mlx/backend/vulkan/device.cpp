@@ -825,6 +825,50 @@ class VulkanDevice {
     trace_sync("sync(all) done");
   }
 
+  void clear_streams() {
+    vk::Device device;
+    vk::Queue compute_queue;
+    vk::Queue transfer_queue;
+    bool has_transfer_queue = false;
+    try {
+      auto& ctx = VulkanContext::get();
+      device = ctx.device();
+      compute_queue = ctx.compute_queue();
+      transfer_queue = ctx.transfer_queue();
+      has_transfer_queue = ctx.has_separate_transfer_queue();
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      streams_.clear();
+      return;
+    }
+
+    if (compute_queue) {
+      std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+      wait_for_queue_idle_with_retry(compute_queue);
+      if (has_transfer_queue && transfer_queue) {
+        wait_for_queue_idle_with_retry(transfer_queue);
+      }
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [_, stream] : streams_) {
+      destroy_submission_resources(device, stream->recording_resources);
+      for (auto& resources : stream->available_resources) {
+        destroy_submission_resources(device, resources);
+      }
+      stream->available_resources.clear();
+      for (auto& submission : stream->in_flight_submissions) {
+        destroy_submission_resources(device, submission.resources);
+      }
+      stream->in_flight_submissions.clear();
+      if (stream->timeline_semaphore) {
+        device.destroySemaphore(stream->timeline_semaphore);
+        stream->timeline_semaphore = nullptr;
+      }
+    }
+    streams_.clear();
+  }
+
   void synchronize_buffer_for_host_access(VulkanBuffer* buffer) {
     if (buffer == nullptr) {
       return;
@@ -2326,6 +2370,10 @@ class VulkanDevice {
 
 namespace mlx::core::gpu {
 
+void init() {
+  (void)mlx::core::vulkan::VulkanContext::get();
+}
+
 void new_stream(Stream s) {
   if (s.device == mlx::core::Device::gpu) {
     mlx::core::vulkan::VulkanDevice::get().ensure_stream(s.index);
@@ -2334,6 +2382,10 @@ void new_stream(Stream s) {
 
 void synchronize(Stream s) {
   mlx::core::vulkan::VulkanDevice::get().synchronize(s);
+}
+
+void clear_streams() {
+  mlx::core::vulkan::VulkanDevice::get().clear_streams();
 }
 
 } // namespace mlx::core::gpu

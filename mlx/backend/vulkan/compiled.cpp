@@ -853,14 +853,14 @@ void Compiled::eval_gpu(
       return true;
     }
 
-    auto has_bool_dtype = [](const std::vector<array>& arrays) {
+    auto has_unimplemented_dtype = [](const std::vector<array>& arrays) {
       return std::any_of(arrays.begin(), arrays.end(), [](const array& x) {
-        return x.dtype() == bool_;
+        return x.dtype() == bool_ || x.dtype() == int8 || x.dtype() == uint8;
       });
     };
 
-    if (has_bool_dtype(inputs_) || has_bool_dtype(outputs_) ||
-        has_bool_dtype(tape_)) {
+    if (has_unimplemented_dtype(inputs_) ||
+        has_unimplemented_dtype(outputs_) || has_unimplemented_dtype(tape_)) {
       return true;
     }
 
@@ -894,6 +894,10 @@ void Compiled::eval_gpu(
 
   // Use large index if needed
   bool large = compiled_use_large_index(dispatch_inputs, outputs, contiguous);
+  if (large) {
+    throw std::runtime_error(
+        "Compiled kernel failed on Vulkan (arrays >2^32 elements are not yet implemented).");
+  }
   const bool has_nonzero_runtime_offset =
       std::any_of(
           input_offsets.begin(),
@@ -951,10 +955,6 @@ void Compiled::eval_gpu(
     kernel_name +=
         fmt::format("_layout_{}", std::hash<std::string>{}(layout_key.str()));
   }
-  if (large) {
-    kernel_name += "_large";
-  }
-
   // Check if we already have this kernel compiled (simple cache check)
   auto& manager = vulkan::KernelManager::get();
   auto* existing_shader = manager.get_shader(kernel_name);

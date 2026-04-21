@@ -9,11 +9,8 @@
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cmath>
-#include <cstdlib>
 #include <iostream>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -31,71 +28,6 @@ struct QueueFamilyIndices {
   uint32_t transfer_queue_index{0};
   bool has_separate_transfer{false};
 };
-
-std::optional<uint32_t> parse_env_uint32(const char* env_name) {
-  const char* env = std::getenv(env_name);
-  if (env == nullptr || *env == '\0') {
-    return std::nullopt;
-  }
-
-  errno = 0;
-  char* end = nullptr;
-  unsigned long parsed = std::strtoul(env, &end, 0);
-  if (errno != 0 || end == env || (end != nullptr && *end != '\0') ||
-      parsed > std::numeric_limits<uint32_t>::max()) {
-    throw std::runtime_error(
-        std::string("[vulkan::init] Invalid ") + env_name + "='" + env +
-        "'. Expected unsigned integer.");
-  }
-  return static_cast<uint32_t>(parsed);
-}
-
-uint32_t device_type_rank(vk::PhysicalDeviceType type) {
-  switch (type) {
-    case vk::PhysicalDeviceType::eDiscreteGpu:
-      return 5;
-    case vk::PhysicalDeviceType::eIntegratedGpu:
-      return 4;
-    case vk::PhysicalDeviceType::eVirtualGpu:
-      return 3;
-    case vk::PhysicalDeviceType::eCpu:
-      return 2;
-    default:
-      return 1;
-  }
-}
-
-uint64_t total_device_local_memory(vk::PhysicalDevice physical_device) {
-  const auto mem = physical_device.getMemoryProperties();
-  uint64_t total = 0;
-  for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
-    if ((mem.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) !=
-        vk::MemoryHeapFlagBits{}) {
-      total += mem.memoryHeaps[i].size;
-    }
-  }
-  return total;
-}
-
-uint64_t score_physical_device(
-    vk::PhysicalDevice physical_device,
-    const QueueFamilyIndices& indices,
-    std::optional<uint32_t> preferred_vendor_id) {
-  const auto properties = physical_device.getProperties();
-  const uint64_t type_score =
-      static_cast<uint64_t>(device_type_rank(properties.deviceType)) << 60;
-  const uint64_t local_mem_score =
-      std::min<uint64_t>(total_device_local_memory(physical_device), (1ull << 56) - 1)
-      << 4;
-  const uint64_t queue_topology_score =
-      indices.has_separate_transfer ? (1ull << 3) : 0ull;
-  const uint64_t vendor_score =
-      (preferred_vendor_id.has_value() &&
-       properties.vendorID == preferred_vendor_id.value())
-      ? (1ull << 2)
-      : 0ull;
-  return type_score + local_mem_score + queue_topology_score + vendor_score;
-}
 
 uint32_t find_queue_family(
     const std::vector<vk::QueueFamilyProperties>& queue_families,
@@ -527,16 +459,8 @@ void VulkanContext::init() {
           "[vulkan::init] Failed to find GPUs with Vulkan support.");
     }
 
-    const auto forced_device_index = parse_env_uint32("MLX_VULKAN_DEVICE_INDEX");
-    const auto preferred_vendor_id =
-        parse_env_uint32("MLX_VULKAN_PREFERRED_VENDOR_ID");
-
-    std::optional<std::pair<uint64_t, uint32_t>> best_candidate;
     bool found_compute_device = false;
-    for (uint32_t candidate_index = 0;
-         candidate_index < available_devices.size();
-         ++candidate_index) {
-      auto candidate = available_devices[candidate_index];
+    for (auto candidate : available_devices) {
       auto queue_families = candidate.getQueueFamilyProperties();
       bool has_compute = false;
       for (const auto& qf : queue_families) {
@@ -547,36 +471,19 @@ void VulkanContext::init() {
         }
       }
       if (has_compute) {
-        if (forced_device_index.has_value() &&
-            forced_device_index.value() != candidate_index) {
-          continue;
-        }
         auto indices = find_queue_families(candidate);
-        const uint64_t score =
-            score_physical_device(candidate, indices, preferred_vendor_id);
-        if (!best_candidate.has_value() || score > best_candidate->first) {
-          best_candidate = std::make_pair(score, candidate_index);
-        }
+        physical_device = candidate;
+        compute_queue_family_index = indices.compute_family;
+        compute_queue_index = indices.compute_queue_index;
+        transfer_queue_family_index = indices.transfer_family;
+        transfer_queue_index = indices.transfer_queue_index;
+        has_separate_transfer_queue = indices.has_separate_transfer;
+        found_compute_device = true;
+        break;
       }
-    }
-
-    if (best_candidate.has_value()) {
-      const uint32_t selected_index = best_candidate->second;
-      physical_device = available_devices[selected_index];
-      auto indices = find_queue_families(physical_device);
-      compute_queue_family_index = indices.compute_family;
-      compute_queue_index = indices.compute_queue_index;
-      transfer_queue_family_index = indices.transfer_family;
-      transfer_queue_index = indices.transfer_queue_index;
-      has_separate_transfer_queue = indices.has_separate_transfer;
-      found_compute_device = true;
     }
 
     if (!found_compute_device) {
-      if (forced_device_index.has_value()) {
-        throw std::runtime_error(
-            "[vulkan::init] Forced MLX_VULKAN_DEVICE_INDEX does not refer to a compute-capable physical device.");
-      }
       throw std::runtime_error(
           "[vulkan::init] Failed to find a compute-capable physical device.");
     }

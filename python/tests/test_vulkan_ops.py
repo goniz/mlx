@@ -727,6 +727,38 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
         for gpu_out, host_src in zip(outs, host_srcs):
             self._assert_outputs_close(gpu_out, host_src, atol=0.0, rtol=0.0)
 
+    def test_large_low_precision_gather_regression(self):
+        for dtype, atol in ((mx.float16, 5e-3), (mx.bfloat16, 5e-2)):
+            with self.subTest(dtype=str(dtype)):
+                self._assert_cpu_gpu_same(
+                    lambda dtype=dtype: mx.arange(
+                        100 * 8960, dtype=mx.float32
+                    ).reshape(100, 8960).astype(dtype)[mx.array([[23]], dtype=mx.int32)].astype(
+                        mx.float32
+                    ),
+                    atol=atol,
+                    rtol=atol,
+                )
+
+    def test_compiled_gelu_approx_negative_power_regression(self):
+        x = mx.linspace(-6.0, 6.0, 6144, dtype=mx.float32).reshape(1, 1, 6144)
+
+        def gelu_approx(x):
+            return 0.5 * x * (1.0 + mx.tanh(0.7978845608 * (x + 0.044715 * mx.power(x, 3.0))))
+
+        @mx.compile
+        def compiled(gate, value):
+            return gelu_approx(gate) * value
+
+        expected = self._run_on_device(mx.cpu, lambda: gelu_approx(x) * x)
+        actual = self._run_on_device(mx.gpu, lambda: compiled(x, x))
+        self._assert_outputs_close(
+            actual.astype(mx.float32),
+            expected.astype(mx.float32),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
 def _cases():
     return [
         (

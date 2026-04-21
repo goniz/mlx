@@ -1,7 +1,9 @@
 // Copyright © 2024 Apple Inc.
 
 #include <utility>
+#include <limits>
 
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/ops.h"
 
@@ -9,8 +11,92 @@ namespace mlx::core {
 
 namespace {
 
+uint32_t checked_shape_product(
+    const array& arr,
+    int begin,
+    int end,
+    const char* label);
+
 bool needs_row_contiguous(const array& arr) {
   return !arr.flags().row_contiguous || arr.offset() != 0;
+}
+
+bool is_low_precision_gather_value_dtype(Dtype dtype) {
+  return dtype == float16 || dtype == bfloat16;
+}
+
+int64_t read_index_value(const array& idx, size_t flat_pos) {
+  switch (idx.dtype()) {
+    case int32:
+      return static_cast<int64_t>(idx.data<int32_t>()[flat_pos]);
+    case int64:
+      return idx.data<int64_t>()[flat_pos];
+    case uint32:
+      return static_cast<int64_t>(idx.data<uint32_t>()[flat_pos]);
+    case uint64: {
+      auto value = idx.data<uint64_t>()[flat_pos];
+      if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        throw std::out_of_range("Gather index exceeds int64 range.");
+      }
+      return static_cast<int64_t>(value);
+    }
+    default:
+      throw std::runtime_error("Unsupported gather index dtype.");
+  }
+}
+
+bool try_eval_take_axis0_low_precision_copy_fallback(
+    const array& src,
+    array idx,
+    array& out,
+    Stream s) {
+  if (src.ndim() == 0 || idx.size() == 0) {
+    return false;
+  }
+  if (!is_low_precision_gather_value_dtype(src.dtype()) || !src.flags().row_contiguous ||
+      src.offset() != 0 || idx.ndim() == 0) {
+    return false;
+  }
+
+  idx.wait();
+  const uint32_t size_axis = static_cast<uint32_t>(src.shape(0));
+  const uint32_t size_post = checked_shape_product(
+      src, 1, src.ndim(), "gather_take_fallback size_post");
+  array out_work(out.shape(), out.dtype(), nullptr, {});
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+
+  for (size_t flat_pos = 0; flat_pos < idx.size(); ++flat_pos) {
+    int64_t raw_index = read_index_value(idx, flat_pos);
+    if (raw_index < 0) {
+      raw_index += size_axis;
+    }
+    if (raw_index < 0 || raw_index >= size_axis) {
+      throw std::out_of_range("Gather index out of bounds.");
+    }
+
+    array src_slice({static_cast<int>(size_post)}, src.dtype(), nullptr, {});
+    src_slice.copy_shared_buffer(
+        src,
+        {1},
+        {true, true, true},
+        size_post,
+        static_cast<size_t>(raw_index) * size_post);
+    src_slice.set_status(array::Status::available);
+
+    array out_slice({static_cast<int>(size_post)}, out.dtype(), nullptr, {});
+    out_slice.copy_shared_buffer(
+        out_work,
+        {1},
+        {true, true, true},
+        size_post,
+        flat_pos * static_cast<size_t>(size_post));
+    out_slice.set_status(array::Status::available);
+
+    copy_gpu_inplace(src_slice, out_slice, CopyType::Vector, s);
+  }
+
+  copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+  return true;
 }
 
 array ensure_row_contiguous(array arr, Stream s) {
@@ -178,6 +264,11 @@ bool try_eval_gather_vulkan(
 
   array src = ensure_row_contiguous(src_input, s);
   idx = ensure_row_contiguous(idx, s);
+
+  if (axis == 0 &&
+      try_eval_take_axis0_low_precision_copy_fallback(src, idx, out, s)) {
+    return true;
+  }
 
   const uint32_t size_pre =
       checked_shape_product(src_input, 0, axis, "gather_take size_pre");

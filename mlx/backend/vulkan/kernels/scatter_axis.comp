@@ -1,6 +1,7 @@
 #version 450
 
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
 
 #if defined(INDEX_IS_I64)
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -25,9 +26,9 @@ layout(push_constant) uniform parameter {
     uint idx_axis_size;
 } p;
 
-layout(binding = 0) readonly buffer U { VALUE_TYPE data_u[]; };
-layout(binding = 1) readonly buffer I { INDEX_TYPE data_i[]; };
-layout(binding = 2) buffer D { VALUE_TYPE data_d[]; };
+layout(scalar, binding = 0) readonly buffer U { VALUE_TYPE data_u[]; };
+layout(scalar, binding = 1) readonly buffer I { INDEX_TYPE data_i[]; };
+layout(scalar, binding = 2) buffer D { VALUE_TYPE data_d[]; };
 
 uint get_idx() {
     return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;

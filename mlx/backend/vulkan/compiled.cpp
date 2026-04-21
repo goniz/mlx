@@ -216,7 +216,8 @@ std::string emit_glsl_preamble(
     bool uses_complex64,
     bool uses_float16_types,
     bool uses_int16_types,
-    bool uses_int8_types) {
+    bool uses_int8_types,
+    bool uses_power) {
   std::ostringstream os;
   os << "#version 450\n";
   os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
@@ -294,6 +295,38 @@ float complex_abs(vec2 z) {
 
 vec2 complex_conjugate(vec2 z) {
   return vec2(z.x, -z.y);
+}
+
+)";
+  }
+
+  if (uses_power) {
+    os << R"(
+float safe_real_pow(float x, float y) {
+  if (x < 0.0) {
+    float yi = round(y);
+    if (abs(y - yi) <= 0.00001 && abs(yi) <= 64.0) {
+      int n = int(yi);
+      float base = abs(x);
+      float result = 1.0;
+      int exp = abs(n);
+      while (exp > 0) {
+        if ((exp & 1) != 0) {
+          result *= base;
+        }
+        base *= base;
+        exp >>= 1;
+      }
+      if (n < 0) {
+        result = 1.0 / result;
+      }
+      if ((abs(n) & 1) != 0) {
+        result = -result;
+      }
+      return result;
+    }
+  }
+  return pow(x, y);
 }
 
 )";
@@ -399,6 +432,10 @@ inline void build_glsl_kernel(
   bool uses_int8_types = has_any_dtype(inputs, {int8, uint8, bool_}) ||
       has_any_dtype(outputs, {int8, uint8, bool_}) ||
       has_any_dtype(tape, {int8, uint8, bool_});
+  const bool uses_power = std::any_of(
+      tape.begin(), tape.end(), [](const array& x) {
+        return x.primitive().name() == "Power";
+      });
 
   // GLSL header
   os = emit_glsl_preamble(
@@ -406,7 +443,8 @@ inline void build_glsl_kernel(
       uses_complex64,
       uses_float16_types,
       uses_int16_types,
-      uses_int8_types);
+      uses_int8_types,
+      uses_power);
 
   // Determine max work per thread based on output dtype size
   int max_itemsize = 1;
@@ -625,6 +663,14 @@ layout(push_constant) uniform PushConstants {
 
       if (prim_name == "Negative" && x.inputs().size() == 1) {
         os += fmt::format("(-{});\n", get_input_expr(x.inputs()[0]));
+      } else if (prim_name == "Power" && x.inputs().size() == 2 && !is_complex) {
+        const auto lhs = get_input_expr(x.inputs()[0]);
+        const auto rhs = get_input_expr(x.inputs()[1]);
+        os += fmt::format(
+            "{}(safe_real_pow(float({}), float({})));\n",
+            type_str,
+            lhs,
+            rhs);
       } else if (prim_name == "LogAddExp" && x.inputs().size() == 2) {
         auto lhs = get_input_expr(x.inputs()[0]);
         auto rhs = get_input_expr(x.inputs()[1]);

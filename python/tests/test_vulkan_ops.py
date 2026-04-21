@@ -822,6 +822,20 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
         actual = self._run_on_device(mx.gpu, lambda: compiled_bool(make_bool()))
         self._assert_outputs_close(actual, expected, atol=0.0, rtol=0.0)
 
+    def test_compiled_bool_add_falls_back_regression(self):
+        def make_bool_pair():
+            lhs = mx.array([True, False, True, False], dtype=mx.bool_)
+            rhs = mx.array([False, True, True, False], dtype=mx.bool_)
+            return lhs, rhs
+
+        @mx.compile
+        def compiled_bool_add(a, b):
+            return mx.add(a, b)
+
+        expected = self._run_on_device(mx.cpu, lambda: compiled_bool_add(*make_bool_pair()))
+        actual = self._run_on_device(mx.gpu, lambda: compiled_bool_add(*make_bool_pair()))
+        self._assert_outputs_close(actual, expected, atol=0.0, rtol=0.0)
+
 def _cases():
     return [
         (

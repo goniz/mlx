@@ -211,6 +211,20 @@ bool supports_primitive_name(const std::string& prim_name) {
   return supported.contains(prim_name);
 }
 
+bool has_unsupported_bool_tape_op(const std::vector<array>& tape) {
+  return std::any_of(tape.begin(), tape.end(), [](const array& x) {
+    if (is_static_cast(x.primitive())) {
+      return false;
+    }
+    if (x.dtype() == bool_) {
+      return true;
+    }
+    return std::any_of(x.inputs().begin(), x.inputs().end(), [](const array& input) {
+      return input.dtype() == bool_;
+    });
+  });
+}
+
 std::string emit_glsl_preamble(
     bool uses_bfloat16,
     bool uses_complex64,
@@ -896,6 +910,10 @@ void Compiled::eval_gpu(
     if (std::any_of(tape_.begin(), tape_.end(), [](const array& x) {
           return x.offset() != 0;
         })) {
+      return true;
+    }
+
+    if (has_unsupported_bool_tape_op(tape_)) {
       return true;
     }
 

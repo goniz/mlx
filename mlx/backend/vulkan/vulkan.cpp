@@ -485,6 +485,9 @@ void VulkanContext::init() {
   bool has_separate_transfer_queue = false;
   bool is_unified_memory = false;
   bool shader_float16_supported = false;
+  bool shader_int8_supported = false;
+  bool storage_buffer_8bit_supported = false;
+  bool scalar_block_layout_supported = false;
   bool shader_bfloat16_supported = false;
   bool subgroup_size_control_supported = false;
   bool subgroup_require_full_support = false;
@@ -660,11 +663,15 @@ void VulkanContext::init() {
     vk::PhysicalDeviceFeatures2 supported_features;
     vk::PhysicalDeviceVulkan11Features supported_vulkan11_features;
     vk::PhysicalDeviceShaderFloat16Int8Features supported_shader_float16_int8;
+    vk::PhysicalDevice8BitStorageFeatures supported_storage_8bit;
+    vk::PhysicalDeviceScalarBlockLayoutFeatures supported_scalar_block_layout;
     supported_features.pNext = &supported_vulkan11_features;
     supported_vulkan11_features.pNext = &supported_shader_float16_int8;
+    supported_shader_float16_int8.pNext = &supported_storage_8bit;
+    supported_storage_8bit.pNext = &supported_scalar_block_layout;
     vk::PhysicalDeviceShaderIntegerDotProductFeatures
         supported_shader_integer_dot_product{};
-    supported_shader_float16_int8.pNext = &supported_shader_integer_dot_product;
+    supported_scalar_block_layout.pNext = &supported_shader_integer_dot_product;
 
     vk::PhysicalDeviceSubgroupSizeControlFeatures
         supported_subgroup_size_control{};
@@ -734,11 +741,15 @@ void VulkanContext::init() {
     vk::PhysicalDeviceFeatures2 enabled_features;
     vk::PhysicalDeviceVulkan11Features enabled_vulkan11_features;
     vk::PhysicalDeviceShaderFloat16Int8Features enabled_shader_float16_int8;
+    vk::PhysicalDevice8BitStorageFeatures enabled_storage_8bit;
+    vk::PhysicalDeviceScalarBlockLayoutFeatures enabled_scalar_block_layout;
     enabled_features.pNext = &enabled_vulkan11_features;
     enabled_vulkan11_features.pNext = &enabled_shader_float16_int8;
+    enabled_shader_float16_int8.pNext = &enabled_storage_8bit;
+    enabled_storage_8bit.pNext = &enabled_scalar_block_layout;
     vk::PhysicalDeviceShaderIntegerDotProductFeatures
         enabled_shader_integer_dot_product{};
-    enabled_shader_float16_int8.pNext = &enabled_shader_integer_dot_product;
+    enabled_scalar_block_layout.pNext = &enabled_shader_integer_dot_product;
 
     vk::PhysicalDeviceSubgroupSizeControlFeatures
         enabled_subgroup_size_control{};
@@ -791,8 +802,20 @@ void VulkanContext::init() {
     if (supported_vulkan11_features.storageBuffer16BitAccess) {
       enabled_vulkan11_features.storageBuffer16BitAccess = VK_TRUE;
     }
+    if (supported_storage_8bit.storageBuffer8BitAccess) {
+      enabled_storage_8bit.storageBuffer8BitAccess = VK_TRUE;
+      storage_buffer_8bit_supported = true;
+    }
+    if (supported_scalar_block_layout.scalarBlockLayout) {
+      enabled_scalar_block_layout.scalarBlockLayout = VK_TRUE;
+      scalar_block_layout_supported = true;
+    }
     if (supported_features.features.shaderInt16) {
       enabled_features.features.shaderInt16 = VK_TRUE;
+    }
+    if (supported_shader_float16_int8.shaderInt8) {
+      enabled_shader_float16_int8.shaderInt8 = VK_TRUE;
+      shader_int8_supported = true;
     }
     if (supported_shader_float16_int8.shaderFloat16) {
       enabled_shader_float16_int8.shaderFloat16 = VK_TRUE;
@@ -935,6 +958,9 @@ void VulkanContext::init() {
     if (shader_bfloat16_supported) {
       device_extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
     }
+    if (has_device_extension(extensions, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME)) {
+      device_extensions.push_back(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME);
+    }
     if (coopmat2_conv2d_supported) {
       device_extensions.push_back(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
     }
@@ -996,6 +1022,9 @@ void VulkanContext::init() {
     mem_properties_ = mem_properties;
     is_unified_memory_ = is_unified_memory;
     this->shader_float16_supported_ = shader_float16_supported;
+    this->shader_int8_supported_ = shader_int8_supported;
+    this->storage_buffer_8bit_supported_ = storage_buffer_8bit_supported;
+    this->scalar_block_layout_supported_ = scalar_block_layout_supported;
     this->shader_bfloat16_extension_present_ = has_shader_bfloat16_ext;
     this->shader_bfloat16_reported_supported_ = shader_bfloat16_supported;
     this->shader_bfloat16_supported_ = false;
@@ -1066,6 +1095,9 @@ void VulkanContext::cleanup() {
   timeline_value_ = 0;
   is_unified_memory_ = false;
   shader_float16_supported_ = false;
+  shader_int8_supported_ = false;
+  storage_buffer_8bit_supported_ = false;
+  scalar_block_layout_supported_ = false;
   shader_bfloat16_extension_present_ = false;
   shader_bfloat16_reported_supported_ = false;
   shader_bfloat16_supported_ = false;

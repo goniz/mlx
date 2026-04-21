@@ -77,6 +77,15 @@ class VulkanContext {
   bool shader_float16_supported() const {
     return shader_float16_supported_;
   }
+  bool shader_int8_supported() const {
+    return shader_int8_supported_;
+  }
+  bool storage_buffer_8bit_supported() const {
+    return storage_buffer_8bit_supported_;
+  }
+  bool scalar_block_layout_supported() const {
+    return scalar_block_layout_supported_;
+  }
   bool shader_bfloat16_supported() const;
   bool subgroup_size_control_supported() const {
     return subgroup_size_control_supported_;
@@ -161,6 +170,9 @@ class VulkanContext {
   bool initialized_{false};
   bool is_unified_memory_{false};
   bool shader_float16_supported_{false};
+  bool shader_int8_supported_{false};
+  bool storage_buffer_8bit_supported_{false};
+  bool scalar_block_layout_supported_{false};
   bool shader_bfloat16_extension_present_{false};
   bool shader_bfloat16_reported_supported_{false};
   mutable std::once_flag shader_bfloat16_probe_once_;

@@ -727,7 +727,6 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
         for gpu_out, host_src in zip(outs, host_srcs):
             self._assert_outputs_close(gpu_out, host_src, atol=0.0, rtol=0.0)
 
-
 def _cases():
     return [
         (

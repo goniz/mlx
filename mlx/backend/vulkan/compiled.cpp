@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <unordered_set>
@@ -114,6 +115,8 @@ std::string dtype_to_glsl_compute(Dtype d) {
       return "float";
     case complex64:
       return "vec2";
+    case bool_:
+      return "bool";
     default:
       return dtype_to_glsl_storage(d);
   }
@@ -227,6 +230,8 @@ std::string emit_glsl_preamble(
   }
   if (uses_int8_types) {
     os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
+    os << "#extension GL_EXT_shader_8bit_storage : require\n";
+    os << "#extension GL_EXT_scalar_block_layout : require\n";
   }
   os << "\n";
 
@@ -409,6 +414,10 @@ inline void build_glsl_kernel(
   int wpt = std::min(work_per_thread, 16 / max_itemsize);
   wpt = std::max(wpt, 1);
 
+  const std::string buffer_layout_fmt = uses_int8_types
+      ? "layout(scalar, binding = {})"
+      : "layout(binding = {})";
+
   // Buffer bindings for non-constant inputs
   int binding = 0;
   std::vector<std::pair<int, std::string>> input_bindings; // (index, name)
@@ -421,8 +430,8 @@ inline void build_glsl_kernel(
     const auto& xname = get_var_name(x);
 
     os += fmt::format(
-        "layout(binding = {}) readonly buffer Buf{} {{ {} {}[]; }};\n",
-        binding++,
+        "{} readonly buffer Buf{} {{ {} {}[]; }};\n",
+        fmt::format(fmt::runtime(buffer_layout_fmt), binding++),
         i,
         dtype_to_glsl_storage(x.dtype()),
         xname);
@@ -435,8 +444,8 @@ inline void build_glsl_kernel(
     auto& x = outputs[i];
     const auto& xname = get_var_name(x);
     os += fmt::format(
-        "layout(binding = {}) buffer OutBuf{} {{ {} {}[]; }};\n",
-        binding++,
+        "{} buffer OutBuf{} {{ {} {}[]; }};\n",
+        fmt::format(fmt::runtime(buffer_layout_fmt), binding++),
         i,
         dtype_to_glsl_storage(x.dtype()),
         xname);
@@ -882,10 +891,11 @@ void Compiled::eval_gpu(
   }
 
   // Use large index if needed
-  bool large = compiled_use_large_index(dispatch_inputs, outputs, contiguous);
-  if (large) {
+  bool large = compiled_use_large_index(dispatch_inputs, outputs, contiguous) ||
+      outputs[0].data_size() > std::numeric_limits<uint32_t>::max();
+  if (large && !contiguous) {
     throw std::runtime_error(
-        "Compiled kernel failed on Vulkan (arrays >2^32 elements are not yet implemented).");
+        "Compiled kernel failed on Vulkan (arrays >2^32 elements are only supported for contiguous layouts).");
   }
   const bool has_nonzero_runtime_offset =
       std::any_of(
@@ -1077,7 +1087,6 @@ void Compiled::eval_gpu(
     writes[write_idx].dstArrayElement = 0;
     writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[write_idx].descriptorCount = 1;
-    writes[write_idx].pBufferInfo = &buffer_infos[write_idx];
     ++write_idx;
   }
 
@@ -1110,19 +1119,68 @@ void Compiled::eval_gpu(
     writes[write_idx].dstArrayElement = 0;
     writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[write_idx].descriptorCount = 1;
-    writes[write_idx].pBufferInfo = &buffer_infos[write_idx];
     ++write_idx;
   }
 
-  // Update descriptor sets
-  if (!writes.empty()) {
-    vkUpdateDescriptorSets(
-        vulkan::VulkanContext::get().device(),
-        static_cast<uint32_t>(writes.size()),
-        writes.data(),
-        0,
-        nullptr);
+  if (large) {
+    for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+      if (is_constant_(i) || is_scalar(dispatch_inputs[i])) {
+        continue;
+      }
+      if (dispatch_inputs[i].data_size() != outputs[0].data_size()) {
+        throw std::runtime_error(
+            "Compiled kernel failed on Vulkan (large contiguous compiled kernels require elementwise non-scalar inputs)."
+        );
+      }
+    }
   }
+
+  auto update_descriptor_set_for_chunk =
+      [&](uint64_t chunk_base_elements, uint64_t chunk_elements) {
+        std::vector<VkDescriptorBufferInfo> chunk_infos = buffer_infos;
+        size_t descriptor_binding = 0;
+
+        for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+          if (is_constant_(i)) {
+            continue;
+          }
+          const auto& arr = dispatch_inputs[i];
+          const uint64_t item_size = static_cast<uint64_t>(size_of(arr.dtype()));
+          uint64_t offset_bytes = static_cast<uint64_t>(input_offsets[i]) * item_size;
+          if (large && !is_scalar(arr)) {
+            offset_bytes += chunk_base_elements * item_size;
+          }
+
+          chunk_infos[descriptor_binding].offset = static_cast<VkDeviceSize>(offset_bytes);
+          chunk_infos[descriptor_binding].range = VK_WHOLE_SIZE;
+          writes[descriptor_binding].pBufferInfo = &chunk_infos[descriptor_binding];
+          descriptor_binding++;
+        }
+
+        for (size_t i = 0; i < outputs.size(); ++i) {
+          const auto& arr = outputs[i];
+          const uint64_t item_size = static_cast<uint64_t>(size_of(arr.dtype()));
+          uint64_t offset_bytes =
+              static_cast<uint64_t>(output_offsets[i]) * item_size;
+          if (large) {
+            offset_bytes += chunk_base_elements * item_size;
+          }
+
+          chunk_infos[descriptor_binding].offset = static_cast<VkDeviceSize>(offset_bytes);
+          chunk_infos[descriptor_binding].range = VK_WHOLE_SIZE;
+          writes[descriptor_binding].pBufferInfo = &chunk_infos[descriptor_binding];
+          descriptor_binding++;
+        }
+
+        if (!writes.empty()) {
+          vkUpdateDescriptorSets(
+              vulkan::VulkanContext::get().device(),
+              static_cast<uint32_t>(writes.size()),
+              writes.data(),
+              0,
+              nullptr);
+        }
+      };
 
   // Bind pipeline and descriptor set
   vkCmdBindPipeline(
@@ -1144,25 +1202,51 @@ void Compiled::eval_gpu(
     uint32_t size;
   } pc;
 
-  // TODO: Handle arrays larger than 2^32 elements
-  pc.size = static_cast<uint32_t>(outputs[0].data_size());
-
-  vkCmdPushConstants(
-      cmd_buffer,
-      pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      sizeof(pc),
-      &pc);
-
   // Dispatch
   uint64_t num_elements = outputs[0].data_size();
-  uint32_t workgroups = static_cast<uint32_t>(
-      (num_elements + 256ULL * static_cast<uint64_t>(work_per_thread) - 1) /
-      (256ULL * static_cast<uint64_t>(work_per_thread)));
-  workgroups = std::max(workgroups, 1u);
+  if (!large) {
+    update_descriptor_set_for_chunk(0, num_elements);
 
-  vkCmdDispatch(cmd_buffer, workgroups, 1, 1);
+    pc.size = static_cast<uint32_t>(num_elements);
+    vkCmdPushConstants(
+        cmd_buffer,
+        pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(pc),
+        &pc);
+
+    uint32_t workgroups = static_cast<uint32_t>(
+        (num_elements + 256ULL * static_cast<uint64_t>(work_per_thread) - 1) /
+        (256ULL * static_cast<uint64_t>(work_per_thread)));
+    workgroups = std::max(workgroups, 1u);
+    vkCmdDispatch(cmd_buffer, workgroups, 1, 1);
+  } else {
+    constexpr uint64_t kMaxChunkElements =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    for (uint64_t chunk_base = 0; chunk_base < num_elements;) {
+      const uint64_t chunk_elements =
+          std::min(kMaxChunkElements, num_elements - chunk_base);
+      update_descriptor_set_for_chunk(chunk_base, chunk_elements);
+
+      pc.size = static_cast<uint32_t>(chunk_elements);
+      vkCmdPushConstants(
+          cmd_buffer,
+          pipeline->layout,
+          VK_SHADER_STAGE_COMPUTE_BIT,
+          0,
+          sizeof(pc),
+          &pc);
+
+      uint32_t workgroups = static_cast<uint32_t>(
+          (chunk_elements + 256ULL * static_cast<uint64_t>(work_per_thread) -
+           1) /
+          (256ULL * static_cast<uint64_t>(work_per_thread)));
+      workgroups = std::max(workgroups, 1u);
+      vkCmdDispatch(cmd_buffer, workgroups, 1, 1);
+      chunk_base += chunk_elements;
+    }
+  }
 
   // Defer descriptor set cleanup
   manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);

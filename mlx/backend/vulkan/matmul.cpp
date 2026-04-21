@@ -30,6 +30,7 @@ constexpr char kMatvecMatrixCastScratchLane[] = "matvec.matrix_f16";
 constexpr char kMatvecVectorCastScratchLane[] = "matvec.vec_f16";
 constexpr char kMatvecOutScratchLane[] = "matvec.out_work";
 constexpr char kMatvecScoresVOutScratchLane[] = "matvec.scores_v.out_work";
+constexpr char kMatmulZeroScratchLane[] = "matmul.zero.out";
 constexpr char kMulMmACastScratchLane[] = "mul_mm.a_f16";
 constexpr char kMulMmBCastScratchLane[] = "mul_mm.b_f16";
 constexpr char kMulMmOutScratchLane[] = "mul_mm.out_work";
@@ -167,39 +168,39 @@ std::vector<vulkan::StaticShaderId> matvec_shader_candidates(
   switch (*base) {
     case vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32:
       return {
-          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32,
           vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32_subgroup,
           vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32,
       };
     case vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32:
       return {
-          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32,
           vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32_subgroup,
           vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32,
       };
     case vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32:
       return {
-          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32,
           vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32_subgroup,
           vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32,
       };
     case vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32:
       return {
-          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32,
           vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32_subgroup,
           vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32,
       };
     case vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32:
       return {
-          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32,
           vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32_subgroup,
           vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32,
       };
     case vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32:
       return {
-          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32,
           vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32_subgroup,
           vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32,
       };
     case vulkan::StaticShaderId::Count:
       break;
@@ -456,6 +457,7 @@ choose_split_k(uint32_t k, uint32_t num_batches, uint32_t split_k_threshold) {
 MatmulDispatchTuning
 select_matmul_dispatch_tuning(Dtype dtype, uint32_t m, uint32_t n, uint32_t k) {
   const auto profile = matmul_profile_for_device();
+  const auto& ctx = vulkan::VulkanContext::get();
   const bool aligned = matmul_inputs_aligned(m, n, k);
   const MatmulFamily family = classify_matmul_family(m, n, k);
   const size_t family_index = static_cast<size_t>(family);
@@ -471,12 +473,30 @@ select_matmul_dispatch_tuning(Dtype dtype, uint32_t m, uint32_t n, uint32_t k) {
   tuning.prefer_fp32_accum = dtype == float32 ||
       (dtype != float32 && k >= family_spec.fp32_accum_k_threshold);
 
-  if (const auto& ctx = vulkan::VulkanContext::get();
-      !ctx.cooperative_matrix_supported() &&
+  if (!ctx.cooperative_matrix_supported() &&
       ctx.architecture() == vulkan::GpuArchitecture::AmdRdna &&
       tuning.specialization_constants.size() > 0) {
     tuning.specialization_constants[0] =
         std::min(tuning.specialization_constants[0], 64u);
+  }
+
+  if (tuning.specialization_constants.size() > 10 &&
+      ctx.subgroup_size_control_supported()) {
+    const uint32_t preferred = std::clamp(
+        profile.preferred_subgroup_size,
+        std::max(ctx.subgroup_min_size(), 1u),
+        std::max(ctx.subgroup_max_size(), 1u));
+    tuning.specialization_constants[10] = preferred;
+  }
+
+  if (ctx.shader_core_count() > 0) {
+    const uint32_t core_scale = std::clamp(ctx.shader_core_count() / 8u, 1u, 4u);
+    tuning.split_k_threshold =
+        std::max<uint32_t>(tuning.split_k_threshold, 512u * core_scale);
+    if (dtype != float32) {
+      tuning.prefer_fp32_accum =
+          k >= std::max<uint32_t>(tuning.split_k_threshold, 1024u);
+    }
   }
 
   return tuning;
@@ -519,7 +539,7 @@ TensorLayout4D make_tensor_layout_4d(const array& arr) {
 
 bool has_vulkan_buffer(const array& arr) {
   auto data = arr.data_shared_ptr();
-  return data != nullptr && data->buffer.ptr() != nullptr;
+  return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
 }
 
 array cast_to_float16_scratch(const array& arr, Stream s, const char* lane) {
@@ -556,6 +576,9 @@ bool try_eval_scores_v_matvec_vulkan(
     return false;
   }
   if (scores.shape(0) != values.shape(0) || scores.shape(0) != out.shape(0)) {
+    return false;
+  }
+  if (scores.shape(-3) != out.shape(-3)) {
     return false;
   }
 
@@ -700,7 +723,7 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   }
 
   auto data = arr.data_shared_ptr();
-  if (data == nullptr || data->buffer.ptr() == nullptr) {
+  if (data == nullptr || !vulkan::is_vulkan_buffer(data->buffer)) {
     return false;
   }
 
@@ -709,14 +732,31 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
 }
 
 void zero_initialize_output(array& out, Stream s) {
-  out.set_data(allocator::malloc(out.nbytes()));
-  if (out.nbytes() == 0) {
+  if (out.size() == 0) {
     return;
   }
-  auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
-  auto cmd_buffer = vulkan::begin_command_recording(s.index);
-  cmd_buffer.fillBuffer(out_buf->buffer, 0, out.nbytes(), 0);
-  vulkan::end_command_recording(s.index);
+
+  auto zero_contiguous = [&](array& target) {
+    target.set_data(allocator::malloc(target.nbytes()));
+    if (target.nbytes() == 0) {
+      return;
+    }
+    auto* target_buf = static_cast<vulkan::VulkanBuffer*>(target.buffer().ptr());
+    auto cmd_buffer = vulkan::begin_command_recording(s.index);
+    cmd_buffer.fillBuffer(target_buf->buffer, 0, target.nbytes(), 0);
+    vulkan::end_command_recording(s.index);
+  };
+
+  if (is_row_contiguous_zero_offset(out)) {
+    zero_contiguous(out);
+    return;
+  }
+
+  array scratch =
+      vulkan::acquire_scratch_array(s, kMatmulZeroScratchLane, out.shape(), out.dtype());
+  zero_contiguous(scratch);
+  vulkan::mark_scratch_array_written(s, kMatmulZeroScratchLane);
+  copy_gpu(scratch, out, CopyType::General, s);
 }
 
 bool try_eval_matvec_vulkan(
@@ -891,7 +931,13 @@ bool try_eval_mul_mm_vulkan(
     return true;
   };
 
-  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+  const bool can_keep_a_broadcast_view = a.ndim() == 4 &&
+      a.shape(-2) == out.shape(-2) && a.shape(-1) == b.shape(-2) &&
+      (a.shape(-3) == 1 || a.shape(-3) == out.shape(-3)) &&
+      (a.shape(-4) == 1 || a.shape(-4) == out.shape(-4));
+
+  if ((!can_keep_a_broadcast_view && !materialize_broadcast_input(a)) ||
+      !materialize_broadcast_input(b)) {
     return false;
   }
 
@@ -1016,6 +1062,20 @@ bool try_eval_mul_mm_vulkan(
       }
     }
 
+    const uint32_t a_heads = static_cast<uint32_t>(
+        a.ndim() >= 3 ? a.shape(-3) : 1);
+    const uint32_t out_heads = static_cast<uint32_t>(
+        out_work.ndim() >= 3 ? out_work.shape(-3) : 1);
+    const uint32_t a_batches_outer = static_cast<uint32_t>(
+        a.ndim() >= 4 ? a.shape(-4) : 1);
+    const uint32_t out_batches_outer = static_cast<uint32_t>(
+        out_work.ndim() >= 4 ? out_work.shape(-4) : 1);
+    if (a_heads == 0 || out_heads == 0 || a_batches_outer == 0 ||
+        out_batches_outer == 0 || (out_heads % a_heads) != 0 ||
+        (out_batches_outer % a_batches_outer) != 0) {
+      return false;
+    }
+
     vulkan::MatmulPushConstants push_constants{};
     push_constants.M = m;
     push_constants.N = n;
@@ -1028,10 +1088,10 @@ bool try_eval_mul_mm_vulkan(
     push_constants.batch_stride_d = batch_stride_d;
     push_constants.num_batches = num_batches;
     push_constants.k_split = round_up_div(k, split_k);
-    push_constants.ne02 = num_batches;
-    push_constants.ne12 = num_batches;
-    push_constants.broadcast2 = 1;
-    push_constants.broadcast3 = 1;
+    push_constants.ne02 = a_heads;
+    push_constants.ne12 = out_heads;
+    push_constants.broadcast2 = out_heads / a_heads;
+    push_constants.broadcast3 = out_batches_outer / a_batches_outer;
     push_constants.padded_N = n;
 
     if (matmul_debug_enabled()) {
@@ -1182,25 +1242,41 @@ bool try_eval_mul_mm_vulkan(
   return try_dispatch(shader_candidates, out_work, needs_out_copy);
 }
 
+bool try_eval_matmul_vulkan_impl(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s,
+    bool* used_matvec_fast_path) {
+  if (used_matvec_fast_path) {
+    *used_matvec_fast_path = false;
+  }
+  if (inputs.size() == 2 && (inputs[0].size() == 0 || inputs[1].size() == 0)) {
+    zero_initialize_output(out, s);
+    return true;
+  }
+  if (matvec_enabled() && try_eval_matvec_vulkan(inputs, out, s)) {
+    if (used_matvec_fast_path) {
+      *used_matvec_fast_path = true;
+    }
+    return true;
+  }
+  return try_eval_mul_mm_vulkan(inputs, out, s);
+}
+
 } // namespace
 
 bool try_eval_matmul_vulkan(
     const std::vector<array>& inputs,
     array& out,
     Stream s) {
-  if (inputs.size() == 2 && (inputs[0].size() == 0 || inputs[1].size() == 0)) {
-    zero_initialize_output(out, s);
-    return true;
-  }
-  if (matvec_enabled() && try_eval_matvec_vulkan(inputs, out, s)) {
-    return true;
-  }
-  return try_eval_mul_mm_vulkan(inputs, out, s);
+  return try_eval_matmul_vulkan_impl(inputs, out, s, nullptr);
 }
 
 void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (try_eval_matmul_vulkan(inputs, out, stream())) {
-    log_matmul_path(inputs, "mul_mm");
+  bool used_matvec_fast_path = false;
+  if (try_eval_matmul_vulkan_impl(
+          inputs, out, stream(), &used_matvec_fast_path)) {
+    log_matmul_path(inputs, used_matvec_fast_path ? "matvec" : "mul_mm");
     return;
   }
   throw std::runtime_error(

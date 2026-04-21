@@ -189,6 +189,8 @@ class KernelManager {
       pipelines_;
   bool static_registry_initialized_{false};
   std::mutex static_registry_mutex_;
+  std::mutex shader_cache_mutex_;
+  std::mutex pipeline_cache_mutex_;
 
   struct DescriptorSetRecord {
     vk::DescriptorSet set;
@@ -214,6 +216,7 @@ class KernelManager {
       VulkanHandleHash>
       descriptor_set_layouts_;
   std::mutex descriptor_sets_mutex_;
+  std::mutex descriptor_pool_mutex_;
 
   void init_descriptor_pool();
 };

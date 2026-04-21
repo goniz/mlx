@@ -998,6 +998,8 @@ void KernelManager::register_shader(
     const std::string& name,
     const void* data,
     size_t size_bytes) {
+  std::scoped_lock lock(shader_cache_mutex_, pipeline_cache_mutex_);
+
   auto& shader = dynamic_shaders_[name];
   if (!shader) {
     shader = std::make_unique<ShaderModule>();
@@ -1065,6 +1067,7 @@ vk::ShaderModule KernelManager::compile_shader(
 ShaderModule* KernelManager::get_shader(StaticShaderId id) {
   ensure_static_registry_initialized();
 
+  std::lock_guard<std::mutex> lock(shader_cache_mutex_);
   const size_t index = static_cast<size_t>(id);
   if (index >= static_shaders_.size()) {
     return nullptr;
@@ -1084,15 +1087,18 @@ ShaderModule* KernelManager::get_shader(StaticShaderId id) {
 
 mlx::core::vulkan::ShaderModule* mlx::core::vulkan::KernelManager::get_shader(
     const std::string& name) {
-  auto it = dynamic_shaders_.find(name);
-  if (it != dynamic_shaders_.end()) {
-    auto* shader = it->second.get();
-    if (!shader->compiled) {
-      shader->module = compile_shader(shader->spirv_code);
-      shader->compiled = true;
-    }
+  {
+    std::lock_guard<std::mutex> lock(shader_cache_mutex_);
+    auto it = dynamic_shaders_.find(name);
+    if (it != dynamic_shaders_.end()) {
+      auto* shader = it->second.get();
+      if (!shader->compiled) {
+        shader->module = compile_shader(shader->spirv_code);
+        shader->compiled = true;
+      }
 
-    return shader;
+      return shader;
+    }
   }
 
   ensure_static_registry_initialized();
@@ -1145,9 +1151,12 @@ ComputePipeline* KernelManager::get_pipeline(
     pipeline_key.bindings.push_back(make_descriptor_binding_key(binding));
   }
 
-  auto it = pipelines_.find(pipeline_key);
-  if (it != pipelines_.end()) {
-    return it->second.get();
+  {
+    std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
+    auto it = pipelines_.find(pipeline_key);
+    if (it != pipelines_.end()) {
+      return it->second.get();
+    }
   }
 
   VkDevice device = VulkanContext::get().device();
@@ -1287,7 +1296,19 @@ ComputePipeline* KernelManager::get_pipeline(
   pipeline_ptr->supports_push_descriptor = use_push_descriptor;
 
   auto* result = pipeline_ptr.get();
-  pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
+  {
+    std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
+    auto it = pipelines_.find(pipeline_key);
+    if (it != pipelines_.end()) {
+      vkDestroyPipeline(device, pipeline, nullptr);
+      vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+      if (descriptor_layout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
+      }
+      return it->second.get();
+    }
+    pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
+  }
 
   return result;
 }
@@ -1331,9 +1352,12 @@ ComputePipeline* KernelManager::get_pipeline(
     pipeline_key.bindings.push_back(make_descriptor_binding_key(binding));
   }
 
-  auto it = pipelines_.find(pipeline_key);
-  if (it != pipelines_.end()) {
-    return it->second.get();
+  {
+    std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
+    auto it = pipelines_.find(pipeline_key);
+    if (it != pipelines_.end()) {
+      return it->second.get();
+    }
   }
 
   VkDevice device = VulkanContext::get().device();
@@ -1477,12 +1501,25 @@ ComputePipeline* KernelManager::get_pipeline(
   pipeline_ptr->supports_push_descriptor = use_push_descriptor;
 
   auto* result = pipeline_ptr.get();
-  pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
+  {
+    std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
+    auto it = pipelines_.find(pipeline_key);
+    if (it != pipelines_.end()) {
+      vkDestroyPipeline(device, pipeline, nullptr);
+      vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+      if (descriptor_layout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
+      }
+      return it->second.get();
+    }
+    pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
+  }
 
   return result;
 }
 
 void KernelManager::init_descriptor_pool() {
+  std::lock_guard<std::mutex> lock(descriptor_pool_mutex_);
   if (descriptor_pool_initialized_) {
     return;
   }
@@ -1929,21 +1966,30 @@ void KernelManager::purge_descriptor_sets_for_layouts(
 
 void KernelManager::cleanup() {
   reclaim_all_descriptor_sets();
-  pipelines_.clear();
-  dynamic_shaders_.clear();
+  {
+    std::lock_guard<std::mutex> pipeline_lock(pipeline_cache_mutex_);
+    pipelines_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> shader_lock(shader_cache_mutex_);
+    dynamic_shaders_.clear();
+    for (auto& shader : static_shaders_) {
+      shader.reset();
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(static_registry_mutex_);
     static_registry_initialized_ = false;
   }
-  for (auto& shader : static_shaders_) {
-    shader.reset();
-  }
 
-  if (descriptor_pool_ != VK_NULL_HANDLE) {
-    VkDevice device = VulkanContext::get().device();
-    vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
-    descriptor_pool_ = VK_NULL_HANDLE;
-    descriptor_pool_initialized_ = false;
+  {
+    std::lock_guard<std::mutex> lock(descriptor_pool_mutex_);
+    if (descriptor_pool_ != VK_NULL_HANDLE) {
+      VkDevice device = VulkanContext::get().device();
+      vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+      descriptor_pool_ = VK_NULL_HANDLE;
+      descriptor_pool_initialized_ = false;
+    }
   }
 }
 

@@ -208,17 +208,17 @@ std::string build_dynamic_general_copy_shader(
     const Shape& shape,
     const Strides& i_strides,
     const Strides& o_strides,
-    int64_t in_base_offset,
-    int64_t out_base_offset,
-    int64_t i_offset,
-    int64_t o_offset,
-    int64_t dynamic_i_base_offset,
-    int64_t dynamic_o_base_offset,
     bool has_dynamic_i_offset,
-    bool has_dynamic_o_offset,
-    size_t total_elements) {
+    bool has_dynamic_o_offset) {
   std::ostringstream os;
   os << emit_dynamic_shader_preamble(dtype, true);
+  os << "layout(push_constant) uniform PushConstants {\n";
+  os << "  uint total_elements;\n";
+  os << "  int64_t input_base;\n";
+  os << "  int64_t output_base;\n";
+  os << "  int64_t dynamic_i_base;\n";
+  os << "  int64_t dynamic_o_base;\n";
+  os << "} pc;\n";
   os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
      << dtype_to_glsl_storage_type(dtype) << " data[];} input_buf;\n";
   os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
@@ -231,20 +231,16 @@ std::string build_dynamic_general_copy_shader(
   }
   os << "\nvoid main() {\n";
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
-  os << "  if (linear_idx >= " << total_elements << "u) {\n";
+  os << "  if (linear_idx >= pc.total_elements) {\n";
   os << "    return;\n";
   os << "  }\n";
-  os << "  int64_t input_index = int64_t(" << (in_base_offset + i_offset)
-     << ");\n";
-  os << "  int64_t output_index = int64_t(" << (out_base_offset + o_offset)
-     << ");\n";
+  os << "  int64_t input_index = pc.input_base;\n";
+  os << "  int64_t output_index = pc.output_base;\n";
   if (has_dynamic_i_offset) {
-    os << "  input_index += dynamic_i_offset_buf.data[" << dynamic_i_base_offset
-       << "];\n";
+    os << "  input_index += dynamic_i_offset_buf.data[uint(pc.dynamic_i_base)];\n";
   }
   if (has_dynamic_o_offset) {
-    os << "  output_index += dynamic_o_offset_buf.data["
-       << dynamic_o_base_offset << "];\n";
+    os << "  output_index += dynamic_o_offset_buf.data[uint(pc.dynamic_o_base)];\n";
   }
   if (!shape.empty()) {
     os << "  uint remaining = linear_idx;\n";
@@ -339,10 +335,8 @@ bool dispatch_dynamic_general_copy(
       dynamic_o_offset.has_value() ? element_offset(*dynamic_o_offset) : 0;
 
   std::ostringstream layout_key;
-  layout_key << static_cast<int>(in.dtype().val()) << ':' << in_base_offset
-             << ':' << out_base_offset << ':' << i_offset << ':' << o_offset
-             << ':' << dynamic_i_base_offset << ':' << dynamic_o_base_offset
-             << ':' << dynamic_i_offset.has_value() << ':'
+  layout_key << static_cast<int>(in.dtype().val()) << ':'
+             << dynamic_i_offset.has_value() << ':'
              << dynamic_o_offset.has_value() << ':';
   append_layout_key(layout_key, shape);
   layout_key << ':';
@@ -359,15 +353,8 @@ bool dispatch_dynamic_general_copy(
       shape,
       i_strides,
       o_strides,
-      in_base_offset,
-      out_base_offset,
-      i_offset,
-      o_offset,
-      dynamic_i_base_offset,
-      dynamic_o_base_offset,
       dynamic_i_offset.has_value(),
-      dynamic_o_offset.has_value(),
-      total_elements);
+      dynamic_o_offset.has_value());
 
   std::vector<vulkan::DynamicArrayRef> arrays;
   arrays.push_back({&in, 0});
@@ -379,17 +366,40 @@ bool dispatch_dynamic_general_copy(
     arrays.push_back({&*dynamic_o_offset, 3});
   }
 
-  const uint32_t workgroups = std::max<uint32_t>(
-      (static_cast<uint32_t>(total_elements) + 255u) / 256u, 1u);
-  vulkan::dispatch_dynamic_compute(
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) + sizeof(int64_t) * 4;
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name,
       glsl_source,
       static_cast<uint32_t>(arrays.size()),
       arrays.data(),
-      workgroups,
-      1,
-      1,
+      kPushConstantSize,
       s);
+
+  struct PushConstants {
+    uint32_t total_elements;
+    int64_t input_base;
+    int64_t output_base;
+    int64_t dynamic_i_base;
+    int64_t dynamic_o_base;
+  } pc{};
+  pc.total_elements = static_cast<uint32_t>(total_elements);
+  pc.input_base = in_base_offset + i_offset;
+  pc.output_base = out_base_offset + o_offset;
+  pc.dynamic_i_base = dynamic_i_base_offset;
+  pc.dynamic_o_base = dynamic_o_base_offset;
+
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+
+  const uint32_t workgroups = std::max<uint32_t>(
+      (static_cast<uint32_t>(total_elements) + 255u) / 256u, 1u);
+  vkCmdDispatch(dispatch.command_buffer, workgroups, 1, 1);
+  vulkan::end_command_recording(s.index);
   return true;
 }
 
@@ -499,6 +509,12 @@ bool dispatch_dynamic_vector_cast_copy(
   const int64_t in_base_offset = in_offset;
   const int64_t out_base_offset = out_offset;
   if (in_base_offset < 0 || out_base_offset < 0) {
+    return false;
+  }
+  if (static_cast<uint64_t>(in_base_offset) >
+          static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+      static_cast<uint64_t>(out_base_offset) >
+          static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
     return false;
   }
 
@@ -1257,17 +1273,12 @@ void copy_gpu_inplace(
       (shader_copy || is_slice_copy) &&
       (has_large_element_offset(in_view) || has_large_element_offset(out_view));
 
-  const bool contiguous_large_rank_copy = same_dtype &&
-      dispatch_shape.size() > 4 && in_view.flags().contiguous &&
-      out_view.flags().contiguous && in_view.size() == out_view.size() &&
-      !is_slice_copy;
-
   const bool host_contiguous_copy = in_view.flags().row_contiguous &&
       out_view.flags().row_contiguous && dispatch_elements == in_view.size() &&
       dispatch_elements == out_view.size();
 
   if (!raw_buffer_copy && !shader_copy && !is_slice_copy &&
-      !contiguous_large_rank_copy && host_contiguous_copy) {
+      host_contiguous_copy) {
     if (try_host_vector_cast_copy(
             in_view,
             out_view,
@@ -1298,8 +1309,7 @@ void copy_gpu_inplace(
     }
   }
 
-  if (!raw_buffer_copy && !shader_copy && !is_slice_copy &&
-      !contiguous_large_rank_copy) {
+  if (!raw_buffer_copy && !shader_copy && !is_slice_copy) {
     std::ostringstream oss;
     oss << "Copy operation failed on Vulkan (unsupported dtype or layout): "
         << "ctype=" << copy_type_name(ctype) << " "
@@ -1369,8 +1379,7 @@ void copy_gpu_inplace(
   // Small copies, especially decode-time KV cache updates, are latency
   // sensitive and do better when they stay in the current compute submission.
   const bool use_transfer_queue =
-      (raw_buffer_copy || contiguous_large_rank_copy ||
-       segmented_buffer_copy) &&
+      (raw_buffer_copy || segmented_buffer_copy) &&
       should_use_transfer_queue_for_copy(copy_bytes);
   vk::CommandBuffer cmd_buffer = use_transfer_queue
       ? vulkan::begin_transfer_command_recording(s.index)
@@ -1394,16 +1403,6 @@ void copy_gpu_inplace(
     vulkan::retain_array_for_stream(s, *source);
     vulkan::retain_array_for_stream(s, out);
 
-  } else if (contiguous_large_rank_copy) {
-    VkBufferCopy copy_region{};
-    copy_region.srcOffset = static_cast<VkDeviceSize>(in_view.offset());
-    copy_region.dstOffset = static_cast<VkDeviceSize>(out_view.offset());
-    copy_region.size = static_cast<VkDeviceSize>(in_view.nbytes());
-
-    cmd_buffer.copyBuffer(in_buf->buffer, out_buf->buffer, {copy_region});
-
-    vulkan::retain_array_for_stream(s, in_view);
-    vulkan::retain_array_for_stream(s, out_view);
   } else if (segmented_buffer_copy) {
     const auto copy_regions = make_strided_copy_regions(in_view, out_view);
     if (copy_regions.empty()) {
@@ -1487,9 +1486,21 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
       std::memcpy(dst_ptr + i, val_ptr, val_size);
     }
   } else {
-    // For discrete GPUs, we need to use a compute shader or staging buffer
-    // TODO: Implement compute shader fill
-    throw std::runtime_error("fill_gpu not yet implemented for discrete GPUs");
+    std::vector<char> host_fill(out.nbytes());
+    const char* val_ptr = static_cast<const char*>(val.data<void>());
+    size_t val_size = size_of(val.dtype());
+    for (size_t i = 0; i < host_fill.size(); i += val_size) {
+      std::memcpy(host_fill.data() + i, val_ptr, val_size);
+    }
+    vulkan::enqueue_owned_staging_upload(
+        s,
+        host_fill.data(),
+        host_fill.size(),
+        out_buf->buffer,
+        out.offset(),
+        out.data_shared_ptr());
+    vulkan::retain_array_for_stream(s, val);
+    vulkan::retain_array_for_stream(s, out);
   }
 }
 

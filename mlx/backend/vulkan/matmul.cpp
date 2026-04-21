@@ -25,7 +25,7 @@ namespace mlx::core {
 namespace {
 
 constexpr uint32_t kMaxGridZ = 65535;
-constexpr uint32_t kMaxMulMatVecCols = 8;
+constexpr uint32_t kMaxMulMatVecCols = 16;
 constexpr char kMatvecMatrixCastScratchLane[] = "matvec.matrix_f16";
 constexpr char kMatvecVectorCastScratchLane[] = "matvec.vec_f16";
 constexpr char kMatvecOutScratchLane[] = "matvec.out_work";
@@ -519,6 +519,10 @@ select_matmul_dispatch_tuning(Dtype dtype, uint32_t m, uint32_t n, uint32_t k) {
       tuning.prefer_fp32_accum =
           k >= std::max<uint32_t>(tuning.split_k_threshold, 1024u);
     }
+  }
+
+  if (ctx.architecture() == vulkan::GpuArchitecture::AmdRdna && dtype == bfloat16) {
+    tuning.prefer_fp32_accum = true;
   }
 
   return tuning;

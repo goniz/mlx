@@ -2970,8 +2970,8 @@ void dispatch_mul_mat_vec_op(
   push_constants.batch_stride_d = nrows;
   push_constants.fusion_flags = 0;
   push_constants.ne02 = 1;
-  push_constants.ne12 = 1;
-  push_constants.broadcast2 = 1;
+  push_constants.ne12 = batch_rows;
+  push_constants.broadcast2 = batch_rows;
   push_constants.broadcast3 = 1;
 
   const std::array<BoundArray, 5> bound_arrays = {{
@@ -2986,11 +2986,15 @@ void dispatch_mul_mat_vec_op(
   const uint32_t groups_z = (nrows + kMaxWorkgroupsX - 1u) / kMaxWorkgroupsX;
   const uint32_t groups_x = (nrows + groups_z - 1u) / groups_z;
 
+  const bool force_single_column_dispatch =
+      VulkanContext::get().architecture() == GpuArchitecture::AmdRdna;
+  const uint32_t col_chunk = force_single_column_dispatch ? 1u : kMaxMulMatVecCols;
+
   for (uint32_t base_work_group_y = 0; base_work_group_y < batch_rows;
-       base_work_group_y += kMaxMulMatVecCols) {
+       base_work_group_y += col_chunk) {
     push_constants.base_work_group_y = base_work_group_y;
     const uint32_t num_cols =
-        std::min(kMaxMulMatVecCols, batch_rows - base_work_group_y);
+        std::min(col_chunk, batch_rows - base_work_group_y);
     const std::array<uint32_t, 3> grid = {groups_x, 1u, groups_z};
     const std::vector<uint32_t> specialization_constants = {
         32u,

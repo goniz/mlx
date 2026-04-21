@@ -1,10 +1,13 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/distributed/primitives.h"
+#include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/slicing.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/allocator.h"
+#include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 
 namespace mlx::core {
 
@@ -62,6 +65,214 @@ namespace mlx::core {
   }
 
 namespace {
+
+array collapse_power_leading_dims(const array& arr, Stream s) {
+  if (arr.ndim() <= 4) {
+    return arr;
+  }
+  return flatten_in_eval(arr, 0, arr.ndim() - 4, s);
+}
+
+bool ensure_vulkan_buffer_power(array& arr, Stream s) {
+  auto data = arr.data_shared_ptr();
+  if (data != nullptr && vulkan::is_vulkan_buffer(data->buffer)) {
+    return true;
+  }
+  if (arr.has_primitive()) {
+    arr = contiguous_copy_gpu(arr, s);
+    data = arr.data_shared_ptr();
+    return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
+  }
+  arr.wait();
+  data = arr.data_shared_ptr();
+  if (data != nullptr && vulkan::is_vulkan_buffer(data->buffer)) {
+    return true;
+  }
+  arr = contiguous_copy_gpu(arr, s);
+  data = arr.data_shared_ptr();
+  return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
+}
+
+std::string emit_bf16_power_helpers() {
+  return R"(
+uint fp32_to_bf16(float f) {
+  uint u = floatBitsToUint(f);
+  u = (u + (0x7fffu + ((u >> 16) & 1u))) >> 16;
+  return u;
+}
+
+float bf16_to_fp32(uint u) {
+  return uintBitsToFloat(u << 16);
+}
+
+)";
+}
+
+std::string power_input_expr(Dtype dtype, const char* buffer_name) {
+  if (dtype == bfloat16) {
+    return std::string("bf16_to_fp32(uint(") + buffer_name + ".data[idx]))";
+  }
+  if (dtype == float16) {
+    return std::string("float(") + buffer_name + ".data[idx])";
+  }
+  return std::string(buffer_name) + ".data[idx]";
+}
+
+std::string power_output_expr(Dtype out_dtype, const std::string& expr) {
+  if (out_dtype == bfloat16) {
+    return "uint16_t(fp32_to_bf16(" + expr + "))";
+  }
+  if (out_dtype == float16) {
+    return "float16_t(" + expr + ")";
+  }
+  return expr;
+}
+
+std::string build_power_shader(Dtype a_dtype, Dtype b_dtype, Dtype out_dtype) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(a_dtype, out_dtype, false);
+  if (a_dtype == bfloat16 || b_dtype == bfloat16 || out_dtype == bfloat16) {
+    os << emit_bf16_power_helpers();
+  }
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {"
+     << vulkan::dtype_to_glsl_storage_type(a_dtype) << " data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {"
+     << vulkan::dtype_to_glsl_storage_type(b_dtype) << " data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {"
+     << vulkan::dtype_to_glsl_storage_type(out_dtype) << " data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (linear_idx >= pc.total_elements) return;\n";
+  os << "  uint idx = linear_idx;\n";
+  os << "  uint a_idx = idx + pc.a_offset;\n";
+  os << "  uint b_idx = idx + pc.b_offset;\n";
+  os << "  float lhs = " << power_input_expr(a_dtype, "a_buf") << ";\n";
+  os << "  float rhs = " << power_input_expr(b_dtype, "b_buf") << ";\n";
+  os << "  out_buf.data[idx + pc.out_offset] = "
+     << power_output_expr(out_dtype, "pow(lhs, rhs)") << ";\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_power_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 2) {
+    return false;
+  }
+  array a = inputs[0];
+  array b = inputs[1];
+
+  auto is_supported_dtype = [](Dtype dtype) {
+    return dtype == float16 || dtype == float32 || dtype == bfloat16;
+  };
+  if (!is_supported_dtype(a.dtype()) || !is_supported_dtype(b.dtype()) ||
+      !is_supported_dtype(out.dtype())) {
+    return false;
+  }
+
+  auto materialize_broadcast_input = [&](array& in) {
+    if (in.shape() == out.shape()) {
+      return true;
+    }
+    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
+      return false;
+    }
+    if (!ensure_vulkan_buffer_power(in, s)) {
+      return false;
+    }
+    array view(out.shape(), in.dtype(), nullptr, {});
+    broadcast(in, view);
+    in = view;
+    return true;
+  };
+
+  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+    return false;
+  }
+
+  if (!is_supported_elementwise_layout(a)) {
+    a = contiguous_copy_gpu(a, s);
+  }
+  if (!is_supported_elementwise_layout(b)) {
+    b = contiguous_copy_gpu(b, s);
+  }
+
+  a = collapse_power_leading_dims(a, s);
+  b = collapse_power_leading_dims(b, s);
+
+  const bool staged_output = !is_supported_elementwise_layout(out);
+  array out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  out_work = collapse_power_leading_dims(out_work, s);
+
+  if (!is_supported_elementwise_layout(a) || !is_supported_elementwise_layout(b) ||
+      !is_supported_elementwise_layout(out_work)) {
+    return false;
+  }
+  if (!ensure_vulkan_buffer_power(a, s) || !ensure_vulkan_buffer_power(b, s) ||
+      !ensure_vulkan_buffer_power(out_work, s)) {
+    return false;
+  }
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::General, s);
+    }
+    return true;
+  }
+
+  const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
+  const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
+  const auto out_offset = static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto total = static_cast<uint64_t>(out_work.data_size());
+  if (a_offset > std::numeric_limits<uint32_t>::max() ||
+      b_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  const std::string shader_name = "dynamic_power_" +
+      std::to_string(static_cast<int>(a.dtype().val())) + "_" +
+      std::to_string(static_cast<int>(b.dtype().val())) + "_" +
+      std::to_string(static_cast<int>(out_work.dtype().val()));
+  const std::string glsl_source =
+      build_power_shader(a.dtype(), b.dtype(), out_work.dtype());
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      shader_name, glsl_source, 3, arrays, kPushConstantSize, s);
+
+  struct PushConstants {
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t out_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(a_offset),
+      static_cast<uint32_t>(b_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  const uint32_t workgroups =
+      std::max<uint32_t>((static_cast<uint32_t>(total) + 255u) / 256u, 1u);
+  vkCmdDispatch(dispatch.command_buffer, workgroups, 1, 1);
+  vulkan::end_command_recording(s.index);
+
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::General, s);
+  }
+  return true;
+}
 
 bool is_supported_select_layout(const array& arr) {
   return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
@@ -235,7 +446,11 @@ NO_GPU_MULTI_STATE(SVD)
 
 CPU_FALLBACK(NotEqual)
 CPU_FALLBACK_STATE(Partition)
-CPU_FALLBACK(Power)
+void Power::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!try_eval_power_vulkan(inputs, out, stream())) {
+    eval_cpu_fallback_on_stream<Power>(inputs, out, stream());
+  }
+}
 // QuantizedMatmul and QQMatmul are implemented in quantized.cpp.
 
 CPU_FALLBACK(Real)

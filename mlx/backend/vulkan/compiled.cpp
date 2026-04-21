@@ -206,8 +206,8 @@ bool supports_primitive_name(const std::string& prim_name) {
   static const std::unordered_set<std::string> supported = {
       "Abs",       "Add",     "AsType",  "Broadcast", "Ceil",     "Conjugate",
       "Cos",       "Divide",  "Exp",     "Floor",     "Imag",     "Log",
-      "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Real",
-      "Round",     "Sigmoid", "Sin",     "Sqrt",      "Subtract", "Tan"};
+      "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Power", "Real",
+      "Round",     "Sigmoid", "Sin",     "Sqrt",      "Subtract", "Tan", "Tanh"};
   return supported.contains(prim_name);
 }
 
@@ -323,7 +323,9 @@ std::string get_glsl_operator(const std::string& primitive_name) {
       {"Floor", "floor"},
       {"Ceil", "ceil"},
       {"Round", "round"},
+      {"Power", "pow"},
       {"Sigmoid", "sigmoid"},
+      {"Tanh", "tanh"},
   };
 
   auto it = op_map.find(primitive_name);
@@ -1046,9 +1048,11 @@ void Compiled::eval_gpu(
   auto cmd_buffer = vulkan::begin_command_recording(s.index);
   const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
 
-  // Allocate descriptor set
-  auto descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  const bool use_push_descriptor = pipeline->supports_push_descriptor;
+  vk::DescriptorSet descriptor_set;
+  if (!use_push_descriptor) {
+    descriptor_set = manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  }
 
   // Prepare descriptor writes
   std::vector<VkWriteDescriptorSet> writes;
@@ -1087,6 +1091,7 @@ void Compiled::eval_gpu(
     writes[write_idx].dstArrayElement = 0;
     writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[write_idx].descriptorCount = 1;
+    writes[write_idx].pBufferInfo = &buffer_infos[write_idx];
     ++write_idx;
   }
 
@@ -1119,6 +1124,7 @@ void Compiled::eval_gpu(
     writes[write_idx].dstArrayElement = 0;
     writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[write_idx].descriptorCount = 1;
+    writes[write_idx].pBufferInfo = &buffer_infos[write_idx];
     ++write_idx;
   }
 
@@ -1137,7 +1143,6 @@ void Compiled::eval_gpu(
 
   auto update_descriptor_set_for_chunk =
       [&](uint64_t chunk_base_elements, uint64_t chunk_elements) {
-        std::vector<VkDescriptorBufferInfo> chunk_infos = buffer_infos;
         size_t descriptor_binding = 0;
 
         for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
@@ -1151,9 +1156,8 @@ void Compiled::eval_gpu(
             offset_bytes += chunk_base_elements * item_size;
           }
 
-          chunk_infos[descriptor_binding].offset = static_cast<VkDeviceSize>(offset_bytes);
-          chunk_infos[descriptor_binding].range = VK_WHOLE_SIZE;
-          writes[descriptor_binding].pBufferInfo = &chunk_infos[descriptor_binding];
+          buffer_infos[descriptor_binding].offset = static_cast<VkDeviceSize>(offset_bytes);
+          buffer_infos[descriptor_binding].range = VK_WHOLE_SIZE;
           descriptor_binding++;
         }
 
@@ -1166,13 +1170,16 @@ void Compiled::eval_gpu(
             offset_bytes += chunk_base_elements * item_size;
           }
 
-          chunk_infos[descriptor_binding].offset = static_cast<VkDeviceSize>(offset_bytes);
-          chunk_infos[descriptor_binding].range = VK_WHOLE_SIZE;
-          writes[descriptor_binding].pBufferInfo = &chunk_infos[descriptor_binding];
+          buffer_infos[descriptor_binding].offset = static_cast<VkDeviceSize>(offset_bytes);
+          buffer_infos[descriptor_binding].range = VK_WHOLE_SIZE;
           descriptor_binding++;
         }
 
-        if (!writes.empty()) {
+        if (use_push_descriptor) {
+          for (auto& write : writes) {
+            write.dstSet = vk::DescriptorSet();
+          }
+        } else if (!writes.empty()) {
           vkUpdateDescriptorSets(
               vulkan::VulkanContext::get().device(),
               static_cast<uint32_t>(writes.size()),
@@ -1185,17 +1192,30 @@ void Compiled::eval_gpu(
   // Bind pipeline and descriptor set
   vkCmdBindPipeline(
       cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  VkDescriptorSet vk_descriptor_set =
-      static_cast<VkDescriptorSet>(descriptor_set);
-  vkCmdBindDescriptorSets(
-      cmd_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &vk_descriptor_set,
-      0,
-      nullptr);
+  if (use_push_descriptor) {
+    auto push_fn = vulkan::VulkanContext::get().push_descriptor_fn();
+    if (push_fn == nullptr) {
+      throw std::runtime_error("Missing Vulkan push descriptor function for compiled kernel");
+    }
+    push_fn(
+        cmd_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline->layout,
+        0,
+        static_cast<uint32_t>(writes.size()),
+        writes.data());
+  } else {
+    VkDescriptorSet vk_descriptor_set = static_cast<VkDescriptorSet>(descriptor_set);
+    vkCmdBindDescriptorSets(
+        cmd_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline->layout,
+        0,
+        1,
+        &vk_descriptor_set,
+        0,
+        nullptr);
+  }
 
   // Set push constants
   struct PushConstants {
@@ -1249,7 +1269,9 @@ void Compiled::eval_gpu(
   }
 
   // Defer descriptor set cleanup
-  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+  if (!use_push_descriptor) {
+    manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+  }
 }
 
 } // namespace mlx::core

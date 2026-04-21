@@ -81,6 +81,18 @@ bool matvec_enabled() {
   return enabled;
 }
 
+bool prefer_subgroup_matvec() {
+  static const bool prefer = []() {
+    const char* env = std::getenv("MLX_VULKAN_PREFER_SUBGROUP_MATVEC");
+    if (env != nullptr) {
+      return std::string(env) != "0";
+    }
+    return vulkan::VulkanContext::get().architecture() ==
+        vulkan::GpuArchitecture::Nvidia;
+  }();
+  return prefer;
+}
+
 bool mul_mm_enabled() {
   static auto& runtime_disabled = []() -> std::atomic<bool>& {
     static std::atomic<bool> disabled{false};
@@ -165,43 +177,53 @@ std::vector<vulkan::StaticShaderId> matvec_shader_candidates(
   if (!base.has_value()) {
     return {};
   }
+  const auto order = [&](vulkan::StaticShaderId standard,
+                         vulkan::StaticShaderId subgroup,
+                         vulkan::StaticShaderId subgroup_no_shmem) {
+    if (prefer_subgroup_matvec()) {
+      return std::vector<vulkan::StaticShaderId>{
+          subgroup,
+          subgroup_no_shmem,
+          standard,
+      };
+    }
+    return std::vector<vulkan::StaticShaderId>{
+        standard,
+        subgroup,
+        subgroup_no_shmem,
+    };
+  };
   switch (*base) {
     case vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32:
-      return {
-          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32_subgroup,
-          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32_subgroup_no_shmem,
+      return order(
           vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32,
-      };
+          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32_subgroup_no_shmem);
     case vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32:
-      return {
-          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32_subgroup,
-          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32_subgroup_no_shmem,
+      return order(
           vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32,
-      };
+          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32_subgroup_no_shmem);
     case vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32:
-      return {
-          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32_subgroup,
-          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32_subgroup_no_shmem,
+      return order(
           vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32,
-      };
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32_subgroup_no_shmem);
     case vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32:
-      return {
-          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32_subgroup,
-          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32_subgroup_no_shmem,
+      return order(
           vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32,
-      };
+          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32_subgroup_no_shmem);
     case vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32:
-      return {
-          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32_subgroup,
-          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32_subgroup_no_shmem,
+      return order(
           vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32,
-      };
+          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32_subgroup_no_shmem);
     case vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32:
-      return {
-          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32_subgroup,
-          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32_subgroup_no_shmem,
+      return order(
           vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32,
-      };
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32_subgroup_no_shmem);
     case vulkan::StaticShaderId::Count:
       break;
   }

@@ -104,7 +104,12 @@ bool try_eval_reduce_sum_rows_vulkan(
     }
     std::vector<uint8_t> host_values(out.size(), fill_value);
     vulkan::enqueue_owned_staging_upload(
-        s, host_values.data(), host_values.size(), out_buf->buffer, 0);
+        s,
+        host_values.data(),
+        host_values.size(),
+        out_buf->buffer,
+        0,
+        out.data_shared_ptr());
     vulkan::retain_array_for_stream(s, out);
     return true;
   }

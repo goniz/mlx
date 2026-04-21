@@ -43,7 +43,8 @@ void fill_arange_like_cpu(array& out, Stream s, double start, double step) {
       host_values.data(),
       host_values.size() * sizeof(T),
       out_buf->buffer,
-      out.offset());
+      out.offset(),
+      out.data_shared_ptr());
   vulkan::retain_array_for_stream(s, out);
 }
 

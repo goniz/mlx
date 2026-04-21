@@ -737,7 +737,8 @@ bool try_host_vector_cast_copy(
         host_out.data(),
         host_out.size(),
         out_buf->buffer,
-        out_offset * size_of(out.dtype()));
+        out_offset * size_of(out.dtype()),
+        out.data_shared_ptr());
     mlx::core::vulkan::retain_array_for_stream(s, in);
     mlx::core::vulkan::retain_array_for_stream(s, out);
   };
@@ -1240,7 +1241,8 @@ void copy_gpu_inplace(
             host_fill.data(),
             host_fill.size(),
             out_buf->buffer,
-            out.offset());
+            out.offset(),
+            out.data_shared_ptr());
         vulkan::retain_array_for_stream(s, *source);
         vulkan::retain_array_for_stream(s, out);
       }
@@ -1330,7 +1332,12 @@ void copy_gpu_inplace(
       std::memcpy(dst_ptr, src_ptr, in_view.nbytes());
     } else {
       vulkan::enqueue_owned_staging_upload(
-          s, src_ptr, in_view.nbytes(), out_buf->buffer, out_view.offset());
+          s,
+          src_ptr,
+          in_view.nbytes(),
+          out_buf->buffer,
+          out_view.offset(),
+          out.data_shared_ptr());
       vulkan::retain_array_for_stream(s, *source);
       vulkan::retain_array_for_stream(s, out);
     }

@@ -721,6 +721,10 @@ layout(push_constant) uniform PushConstants {
     }
   }
 
+  const auto& runtime_shape = contiguous ? Shape{} : *strided_shape;
+  const auto& runtime_output_strides =
+      contiguous ? Strides{} : (*strided_strides)[0];
+
   // Write outputs
   for (size_t i = 0; i < outputs.size(); ++i) {
     auto& x = outputs[i];
@@ -745,21 +749,37 @@ layout(push_constant) uniform PushConstants {
             "    {}[idx + {}u] = t_{};\n", xname, base_offset, xname);
       }
     } else {
+      os += fmt::format("    uint loc_out_{} = {}u;\n", xname, base_offset);
+      os += fmt::format("    uint rem_out_{} = idx;\n", xname);
+      for (int axis = ndim - 1; axis >= 0; --axis) {
+        os += fmt::format(
+            "    uint coord_out_{0}_{1} = rem_out_{0} % uint({2});\n",
+            xname,
+            axis,
+            runtime_shape[axis]);
+        os += fmt::format(
+            "    rem_out_{0} /= uint({1});\n", xname, runtime_shape[axis]);
+        os += fmt::format(
+            "    loc_out_{0} += coord_out_{0}_{1} * uint({2});\n",
+            xname,
+            axis,
+            runtime_output_strides[axis]);
+      }
       if (x.dtype() == bool_) {
         os += fmt::format(
-            "    {}[idx + {}u] = uint8_t(t_{} ? 1 : 0);\n",
+            "    {}[loc_out_{}] = uint8_t(t_{} ? 1 : 0);\n",
             xname,
-            base_offset,
+            xname,
             xname);
       } else if (x.dtype() == bfloat16) {
         os += fmt::format(
-            "    {}[idx + {}u] = uint16_t(fp32_to_bf16(t_{}));\n",
+            "    {}[loc_out_{}] = uint16_t(fp32_to_bf16(t_{}));\n",
             xname,
-            base_offset,
+            xname,
             xname);
       } else {
         os += fmt::format(
-            "    {}[idx + {}u] = t_{};\n", xname, base_offset, xname);
+            "    {}[loc_out_{}] = t_{};\n", xname, xname, xname);
       }
     }
   }

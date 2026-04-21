@@ -59,13 +59,15 @@ void enqueue_owned_staging_upload(
     const void* src,
     size_t size,
     vk::Buffer dst_buffer,
-    uint64_t dst_offset = 0);
+    uint64_t dst_offset = 0,
+    std::shared_ptr<array::Data> tracked_dst_data = nullptr);
 void enqueue_owned_staging_readback(
     const Stream& s,
     vk::Buffer src_buffer,
     uint64_t src_offset,
     size_t size,
-    std::function<void(const void*, size_t)> completion);
+    std::function<void(const void*, size_t)> completion,
+    std::shared_ptr<array::Data> tracked_src_data = nullptr);
 uint64_t descriptor_epoch_for_stream(const Stream& s);
 array acquire_scratch_array(
     const Stream& s,

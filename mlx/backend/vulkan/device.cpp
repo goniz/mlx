@@ -432,7 +432,6 @@ struct SubmissionResources {
   vk::CommandBuffer compute_command_buffer;
   vk::CommandPool transfer_command_pool;
   vk::CommandBuffer transfer_command_buffer;
-  vk::Fence fence;
 };
 
 struct SubmissionRecord {
@@ -1577,8 +1576,7 @@ class VulkanDevice {
         continue;
       }
 
-      auto* storage = static_cast<const VulkanBuffer*>(
-          const_cast<void*>(static_cast<const void*>(data->buffer.ptr())));
+      auto* storage = referenced_vulkan_buffer(data);
       if (storage == nullptr || storage->buffer == VK_NULL_HANDLE) {
         continue;
       }
@@ -1823,9 +1821,6 @@ class VulkanDevice {
       resources->transfer_command_buffer = resources->compute_command_buffer;
     }
 
-    vk::FenceCreateInfo fence_info;
-    resources->fence = vk_device.createFence(fence_info);
-
     return resources;
   }
 
@@ -1847,9 +1842,6 @@ class VulkanDevice {
           resources->transfer_command_pool,
           {resources->transfer_command_buffer});
       device.destroyCommandPool(resources->transfer_command_pool);
-    }
-    if (resources->fence) {
-      device.destroyFence(resources->fence);
     }
     if (resources->compute_command_pool) {
       device.destroyCommandPool(resources->compute_command_pool);
@@ -2277,6 +2269,7 @@ class VulkanDevice {
     stream->recent_primitives.clear();
     stream->in_flight_submissions.push_back(std::move(submission));
     stream->recording_transfer = false;
+    stream->submission_count++;
 
     if (decode_batch_enabled() && submit_to_transfer_queue) {
       stream->decode_transfer_submit_count++;
@@ -2398,7 +2391,8 @@ void enqueue_owned_staging_upload(
     const void* src,
     size_t size,
     vk::Buffer dst_buffer,
-    uint64_t dst_offset) {
+    uint64_t dst_offset,
+    std::shared_ptr<array::Data> tracked_dst_data) {
   if (size == 0) {
     return;
   }
@@ -2432,6 +2426,7 @@ void enqueue_owned_staging_upload(
   command_buffer.copyBuffer(staging_buffer->buffer, dst_buffer, {copy_region});
 
   VulkanDevice::get().retain_data(s.index, staging.owner);
+  VulkanDevice::get().retain_data(s.index, std::move(tracked_dst_data));
   add_completion_callback_for_stream(
       s,
       [arena = std::move(staging.arena),
@@ -2446,7 +2441,8 @@ void enqueue_owned_staging_readback(
     vk::Buffer src_buffer,
     uint64_t src_offset,
     size_t size,
-    std::function<void(const void*, size_t)> completion) {
+    std::function<void(const void*, size_t)> completion,
+    std::shared_ptr<array::Data> tracked_src_data) {
   if (size == 0) {
     completion(nullptr, 0);
     return;
@@ -2477,6 +2473,7 @@ void enqueue_owned_staging_readback(
   command_buffer.copyBuffer(src_buffer, staging_buffer->buffer, {copy_region});
 
   VulkanDevice::get().retain_data(s.index, staging.owner);
+  VulkanDevice::get().retain_data(s.index, std::move(tracked_src_data));
   add_completion_callback_for_stream(
       s,
       [arena = std::move(staging.arena),

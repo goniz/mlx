@@ -11,23 +11,23 @@
 
 namespace mlx::core {
 
-#define CPU_FALLBACK(func)                                            \
+#define NYI_OP(func)                                                  \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
-#define CPU_FALLBACK_STATE(func)                                      \
+#define NYI_OP_STATE(func)                                            \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
-#define CPU_FALLBACK_MULTI(func)                                        \
+#define NYI_OP_MULTI(func)                                              \
   void func::eval_gpu(                                                  \
       const std::vector<array>& inputs, std::vector<array>& outputs) {  \
     throw std::runtime_error(#func " has no Vulkan implementation.");  \
   }
 
-#define CPU_FALLBACK_MULTI_STATE(func)                                 \
+#define NYI_OP_MULTI_STATE(func)                                       \
   void func::eval_gpu(                                                 \
       const std::vector<array>& inputs, std::vector<array>& outputs) { \
     throw std::runtime_error(#func " has no Vulkan implementation."); \
@@ -49,13 +49,6 @@ namespace mlx::core {
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
-
-#define NO_GPU_USE_FALLBACK(func)                             \
-  bool func::use_fallback(Stream s) {                         \
-    trace_use_fallback(#func, s, "no Vulkan implementation"); \
-    return true;                                              \
-  }                                                           \
-  NO_GPU_MULTI(func)
 
 #define NO_GPU(func)                                                  \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
@@ -401,7 +394,7 @@ bool try_eval_select_vulkan(
 } // namespace
 
 // Primitives with state that have CPU fallbacks
-CPU_FALLBACK_STATE(Equal)
+NYI_OP_STATE(Equal)
 
 // Primitives implemented in other files:
 // - binary.cpp: Add, Minimum, Maximum, Divide, Subtract, Multiply
@@ -421,35 +414,35 @@ void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 // CPU fallbacks for primitives not implemented on Vulkan
-CPU_FALLBACK(ArcCos)
-CPU_FALLBACK(ArcCosh)
-CPU_FALLBACK(ArcSin)
-CPU_FALLBACK(ArcSinh)
-CPU_FALLBACK(ArcTan)
-CPU_FALLBACK(ArcTan2)
-CPU_FALLBACK(ArcTanh)
-CPU_FALLBACK_STATE(ArgPartition)
-CPU_FALLBACK_STATE(ArgSort)
-CPU_FALLBACK_STATE(BitwiseBinary)
-CPU_FALLBACK(BitwiseInvert)
-CPU_FALLBACK(Conjugate)
-CPU_FALLBACK(Cosh)
-CPU_FALLBACK_MULTI(DivMod)
-CPU_FALLBACK(Remainder)
-CPU_FALLBACK(Expm1)
-CPU_FALLBACK_STATE(FFT)
-CPU_FALLBACK_STATE(GatherMM)
-CPU_FALLBACK_STATE(GatherQMM)
-CPU_FALLBACK(Greater)
-CPU_FALLBACK_STATE(Hadamard)
-CPU_FALLBACK(Imag)
-CPU_FALLBACK(Less)
-CPU_FALLBACK(LessEqual)
-CPU_FALLBACK(Log1p)
-CPU_FALLBACK(LogicalNot)
-CPU_FALLBACK(LogicalAnd)
-CPU_FALLBACK(LogicalOr)
-CPU_FALLBACK(LogAddExp)
+NYI_OP(ArcCos)
+NYI_OP(ArcCosh)
+NYI_OP(ArcSin)
+NYI_OP(ArcSinh)
+NYI_OP(ArcTan)
+NYI_OP(ArcTan2)
+NYI_OP(ArcTanh)
+NYI_OP_STATE(ArgPartition)
+NYI_OP_STATE(ArgSort)
+NYI_OP_STATE(BitwiseBinary)
+NYI_OP(BitwiseInvert)
+NYI_OP(Conjugate)
+NYI_OP(Cosh)
+NYI_OP_MULTI(DivMod)
+NYI_OP(Remainder)
+NYI_OP(Expm1)
+NYI_OP_STATE(FFT)
+NYI_OP_STATE(GatherMM)
+NYI_OP_STATE(GatherQMM)
+NYI_OP(Greater)
+NYI_OP_STATE(Hadamard)
+NYI_OP(Imag)
+NYI_OP(Less)
+NYI_OP(LessEqual)
+NYI_OP(Log1p)
+NYI_OP(LogicalNot)
+NYI_OP(LogicalAnd)
+NYI_OP(LogicalOr)
+NYI_OP(LogAddExp)
 // Linear algebra operations - throw NYI like Metal backend
 NO_GPU_MULTI(LUF)
 NO_GPU_MULTI(QRF)
@@ -459,8 +452,8 @@ NO_GPU_MULTI_STATE(Eigh)
 NO_GPU_MULTI_STATE(Eig)
 NO_GPU_MULTI_STATE(SVD)
 
-CPU_FALLBACK(NotEqual)
-CPU_FALLBACK_STATE(Partition)
+NYI_OP(NotEqual)
+NYI_OP_STATE(Partition)
 void Power::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_power_vulkan(inputs, out, stream())) {
     throw std::runtime_error("Power has no Vulkan implementation for this input.");
@@ -468,11 +461,11 @@ void Power::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 // QuantizedMatmul and QQMatmul are implemented in quantized.cpp.
 
-CPU_FALLBACK(Real)
-CPU_FALLBACK(Sign)
-CPU_FALLBACK(Sinh)
-CPU_FALLBACK_STATE(Sort)
-CPU_FALLBACK(Tan)
+NYI_OP(Real)
+NYI_OP(Sign)
+NYI_OP(Sinh)
+NYI_OP_STATE(Sort)
+NYI_OP(Tan)
 NO_GPU(MaskedScatter)
 // Scatter and ScatterAxis are implemented in scatter.cpp
 
@@ -520,7 +513,7 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
       stream());
 }
 
-CPU_FALLBACK(SegmentedMM)
+NYI_OP(SegmentedMM)
 
 void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_select_vulkan(inputs, out, stream())) {

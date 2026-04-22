@@ -1790,29 +1790,6 @@ bool ScaledDotProductAttention::use_fallback(
   if (s.device == Device::cpu) {
     return true;
   }
-
-  std::string reason;
-  const bool supported = sdpa_vulkan_supported(
-      q,
-      k,
-      v,
-      has_mask,
-      has_arr_mask,
-      do_causal,
-      is_training,
-      output_logsumexp,
-      false,
-      s,
-      &reason);
-  if (!supported && trace_fallback_enabled()) {
-    std::ostringstream oss;
-    oss << "q_shape=" << q.shape() << " k_shape=" << k.shape()
-        << " v_shape=" << v.shape() << " has_mask=" << has_mask
-        << " has_arr_mask=" << has_arr_mask << " do_causal=" << do_causal
-        << " is_training=" << is_training
-        << " output_logsumexp=" << output_logsumexp;
-    trace_use_fallback("ScaledDotProductAttention", s, reason, oss.str());
-  }
   return false;
 }
 

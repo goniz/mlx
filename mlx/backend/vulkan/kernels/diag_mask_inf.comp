@@ -1,6 +1,7 @@
 #version 450
 
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_control_flow_attributes : enable
 
 layout (push_constant) uniform parameter
@@ -26,9 +27,22 @@ void main() {
     }
 
     const uint i = row*p.ncols + col;
+#ifdef DATA_A_BF16
+    float in_val = bf16_to_fp32(uint32_t(data_a[i]));
+#else
+    A_TYPE in_val = data_a[i];
+#endif
     if (col > p.n_past + row % p.rows_per_channel) {
+#ifdef DATA_D_BF16
+        data_d[i] = uint16_t(fp32_to_bf16(uintBitsToFloat(0xFF800000)));
+#else
         data_d[i] = D_TYPE(uintBitsToFloat(0xFF800000));
+#endif
     } else {
-        data_d[i] = D_TYPE(data_a[i]);
+#ifdef DATA_D_BF16
+        data_d[i] = uint16_t(fp32_to_bf16(float(in_val)));
+#else
+        data_d[i] = D_TYPE(in_val);
+#endif
     }
 }

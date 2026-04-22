@@ -15,5 +15,9 @@ void main() {
     }
 
     // p.param1 = fill value
+#ifdef DATA_D_BF16
+    data_d[i] = uint16_t(fp32_to_bf16(p.param1));
+#else
     data_d[i] = D_TYPE(p.param1);
+#endif
 }

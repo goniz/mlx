@@ -2162,6 +2162,41 @@ void process_shaders() {
       "arange.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
+      "arange_f16",
+      "arange.comp",
+      {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "arange_bf16",
+      "arange.comp",
+      {{"A_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"FLOAT_TYPE", "float"},
+       {"DATA_D_BF16", "1"}});
+  string_to_spv(
+      "arange_i32",
+      "arange.comp",
+      {{"A_TYPE", "int"}, {"D_TYPE", "int"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "arange_u32",
+      "arange.comp",
+      {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "arange_i16",
+      "arange.comp",
+      {{"A_TYPE", "int16_t"}, {"D_TYPE", "int16_t"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "arange_u16",
+      "arange.comp",
+      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "arange_i8",
+      "arange.comp",
+      {{"A_TYPE", "int8_t"}, {"D_TYPE", "int8_t"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "arange_u8",
+      "arange.comp",
+      {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
       "fill_f32", "fill.comp", {{"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "fill_f16",
@@ -2170,7 +2205,11 @@ void process_shaders() {
   string_to_spv(
       "fill_bf16",
       "fill.comp",
-      {{"D_TYPE", "uint16_t"}, {"FLOAT_TYPE", "float"}});
+      {{"D_TYPE", "uint16_t"}, {"FLOAT_TYPE", "float"}, {"DATA_D_BF16", "1"}});
+  string_to_spv(
+      "fill_u8",
+      "fill.comp",
+      {{"D_TYPE", "uint8_t"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "step_f16",
       "step.comp",
@@ -2279,6 +2318,17 @@ void process_shaders() {
       "diag_mask_inf_f32",
       "diag_mask_inf.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "diag_mask_inf_f16",
+      "diag_mask_inf.comp",
+      {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+  string_to_spv(
+      "diag_mask_inf_bf16",
+      "diag_mask_inf.comp",
+      {{"A_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"DATA_A_BF16", "1"},
+       {"DATA_D_BF16", "1"}});
 
   string_to_spv(
       "logsumexp_f32",

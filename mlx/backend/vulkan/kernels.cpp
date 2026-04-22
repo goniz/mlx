@@ -2629,9 +2629,12 @@ void dispatch_diag_mask_inf_op(
     throw std::runtime_error(
         "[vulkan::kernels] DiagMaskInf requires input rank >= 1.");
   }
-  if (in.dtype() != float32 || out.dtype() != float32) {
+  const bool f32_io = in.dtype() == float32 && out.dtype() == float32;
+  const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
+  const bool bf16_io = in.dtype() == bfloat16 && out.dtype() == bfloat16;
+  if (!f32_io && !f16_io && !bf16_io) {
     throw std::runtime_error(
-        "[vulkan::kernels] DiagMaskInf currently requires float32 IO.");
+        "[vulkan::kernels] DiagMaskInf currently requires matching f32/f16/bf16 IO.");
   }
 
   const uint32_t ncols =

@@ -1093,6 +1093,9 @@ std::optional<vulkan::StaticShaderId> fill_shader_id(Dtype dtype) {
       return vulkan::StaticShaderId::fill_f16;
     case bfloat16:
       return vulkan::StaticShaderId::fill_bf16;
+    case bool_:
+    case uint8:
+      return vulkan::StaticShaderId::fill_u8;
     default:
       return std::nullopt;
   }
@@ -1110,6 +1113,10 @@ std::optional<float> scalar_fill_value_as_float(const array& val) {
       return static_cast<float>(*static_cast<const float16_t*>(ptr));
     case bfloat16:
       return static_cast<float>(*static_cast<const bfloat16_t*>(ptr));
+    case bool_:
+      return *static_cast<const bool*>(ptr) ? 1.0f : 0.0f;
+    case uint8:
+      return static_cast<float>(*static_cast<const uint8_t*>(ptr));
     default:
       return std::nullopt;
   }

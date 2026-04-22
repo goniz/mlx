@@ -90,27 +90,10 @@ bool try_eval_reduce_sum_rows_vulkan(
   }
 
   if (logic_reduce && in.size() == 0) {
-    out.set_data(allocator::malloc(out.nbytes()));
-    const uint8_t fill_value =
-        reduce_type == Reduce::And ? uint8_t(1) : uint8_t(0);
-    if (out.nbytes() == 0) {
-      return true;
-    }
-    auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
-    if (vulkan::VulkanContext::get().is_unified_memory() &&
-        out_buf->mapped_ptr != nullptr) {
-      std::memset(out_buf->mapped_ptr, fill_value, out.nbytes());
-      return true;
-    }
-    std::vector<uint8_t> host_values(out.size(), fill_value);
-    vulkan::enqueue_owned_staging_upload(
-        s,
-        host_values.data(),
-        host_values.size(),
-        out_buf->buffer,
-        0,
-        out.data_shared_ptr());
-    vulkan::retain_array_for_stream(s, out);
+    array fill_value(
+        reduce_type == Reduce::And ? true : false,
+        bool_);
+    fill_gpu(fill_value, out, s);
     return true;
   }
 

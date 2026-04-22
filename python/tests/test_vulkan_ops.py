@@ -226,6 +226,34 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             rtol=0.0,
         )
 
+    def test_arange_bf16_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.arange(-3, 13, dtype=mx.bfloat16).astype(mx.float32),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_gather_take_bf16_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.take(
+                mx.arange(1, 1 + 8 * 4, dtype=mx.float32).reshape(8, 4).astype(mx.bfloat16),
+                mx.array([5, 1, 7, 0], dtype=mx.int32),
+                axis=0,
+            ).astype(mx.float32),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_empty_bool_reduce_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: (
+                mx.all(mx.array([], dtype=mx.bool_)),
+                mx.any(mx.array([], dtype=mx.bool_)),
+            ),
+            atol=0.0,
+            rtol=0.0,
+        )
+
     def test_scaled_dot_product_attention_causal_gqa(self):
         self._assert_cpu_gpu_same(
             lambda: mx.fast.scaled_dot_product_attention(

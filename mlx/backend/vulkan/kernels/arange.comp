@@ -16,5 +16,9 @@ void main() {
 
     // p.param1 = start, p.param2 = step
     float value = p.param1 + p.param2 * float(i);
+#ifdef DATA_D_BF16
+    data_d[i] = uint16_t(fp32_to_bf16(value));
+#else
     data_d[i] = D_TYPE(value);
+#endif
 }

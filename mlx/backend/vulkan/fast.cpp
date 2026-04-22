@@ -546,13 +546,12 @@ array make_flash_attention_causal_mask(
     return mask;
   }
 
-  array mask_f32 = zeros(shape, float32, s);
-  if (mask_f32.dtype() != float32) {
+  array mask_f16 = zeros(shape, float16, s);
+  if (mask_f16.dtype() != float16) {
     throw std::runtime_error("Unexpected causal mask dtype.");
   }
   const int n_past = k.shape(2) - q.shape(2);
-  mask_f32 = apply_diag_mask_inf_vulkan(mask_f32, n_past, s);
-  array mask_f16 = astype(mask_f32, float16, s);
+  mask_f16 = apply_diag_mask_inf_vulkan(mask_f16, n_past, s);
   eval(mask_f16);
   copy_gpu_inplace(mask_f16, mask, CopyType::General, s);
   mask.set_status(array::Status::evaluated);
@@ -1469,9 +1468,22 @@ bool try_eval_sdpa_heads_vulkan(
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
   array in = ensure_sdpa_rowwise_layout(scores, s);
 
-  array masked(in.shape(), float32, nullptr, {});
+  array masked(in.shape(), in.dtype(), nullptr, {});
   masked.set_status(array::Status::available);
   masked.set_data(allocator::malloc(masked.nbytes()));
+
+  auto shader_id = [&]() {
+    switch (in.dtype()) {
+      case float32:
+        return vulkan::StaticShaderId::diag_mask_inf_f32;
+      case float16:
+        return vulkan::StaticShaderId::diag_mask_inf_f16;
+      case bfloat16:
+        return vulkan::StaticShaderId::diag_mask_inf_bf16;
+      default:
+        throw std::runtime_error("DiagMaskInf unsupported dtype on Vulkan.");
+    }
+  }();
 
   const std::vector<array> tracked_inputs = {in};
   const std::vector<array> tracked_outputs = {masked};
@@ -1481,7 +1493,7 @@ array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
   vulkan::dispatch_diag_mask_inf_op(
       in,
       masked,
-      vulkan::StaticShaderId::diag_mask_inf_f32,
+      shader_id,
       command_buffer,
       s,
       checked_u32_size(in.shape(in.ndim() - 2), "rows_per_channel"),

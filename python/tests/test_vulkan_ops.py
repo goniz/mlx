@@ -80,6 +80,19 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             raise
         self._assert_outputs_close(gpu_out, cpu_out, atol=atol, rtol=rtol)
 
+    def _assert_gpu_unsupported(self, fn, markers=None):
+        if markers is None:
+            markers = ("has no Vulkan implementation", "failed on Vulkan")
+
+        with self.assertRaises(RuntimeError) as exc:
+            self._run_on_device(mx.gpu, fn)
+
+        msg = str(exc.exception)
+        self.assertTrue(
+            any(marker in msg for marker in markers),
+            msg=f"unexpected GPU error: {msg}",
+        )
+
     def test_fast_rms_norm_low_precision_regression(self):
         for dtype, atol, rtol in (
             (mx.float16, 5e-2, 5e-2),
@@ -166,6 +179,14 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             ),
             atol=1e-5,
             rtol=1e-5,
+        )
+
+    def test_arccos_does_not_fallback_to_cpu(self):
+        self._assert_gpu_unsupported(
+            lambda: mx.arccos(
+                mx.array([[-0.75, -0.25], [0.25, 0.75]], dtype=mx.float32)
+            ),
+            markers=("ArcCos has no Vulkan implementation",),
         )
 
     def test_scaled_dot_product_attention_causal_gqa(self):

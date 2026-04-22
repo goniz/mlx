@@ -233,6 +233,11 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             rtol=0.0,
         )
 
+    def test_arange_int32_large_start_unsupported_vulkan(self):
+        self._assert_gpu_unsupported(
+            lambda: mx.arange(16_777_217, 16_777_221, dtype=mx.int32)
+        )
+
     def test_gather_take_bf16_vulkan(self):
         self._assert_cpu_gpu_same(
             lambda: mx.take(

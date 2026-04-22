@@ -567,8 +567,6 @@ bool dispatch_dynamic_vector_cast_copy(
       std::max<uint32_t>((static_cast<uint32_t>(size) + 255u) / 256u, 1u);
   vkCmdDispatch(dispatch.command_buffer, workgroups, 1, 1);
 
-  vulkan::retain_array_for_stream(s, in);
-  vulkan::retain_array_for_stream(s, out);
   vulkan::end_command_recording(s.index);
   return true;
 }

@@ -3661,6 +3661,7 @@ DynamicComputeDispatch dispatch_dynamic_compute_begin(
   }
 
   for (uint32_t i = 0; i < num_bindings; ++i) {
+    retain_array_for_stream(s, *arrays[i].arr);
     write_descriptor_buffer(
         *arrays[i].arr, arrays[i].binding, descriptor_set, infos, writes);
   }
@@ -3722,9 +3723,6 @@ void dispatch_dynamic_compute(
   auto dispatch = dispatch_dynamic_compute_begin(
       shader_name, glsl_source, num_bindings, arrays, 0, s);
   vkCmdDispatch(dispatch.command_buffer, workgroup_x, workgroup_y, workgroup_z);
-  for (uint32_t i = 0; i < num_bindings; ++i) {
-    retain_array_for_stream(s, *arrays[i].arr);
-  }
   end_command_recording(s.index);
 }
 

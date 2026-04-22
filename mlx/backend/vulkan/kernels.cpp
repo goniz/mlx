@@ -2288,6 +2288,27 @@ void dispatch_arange_op(
       s);
 }
 
+void dispatch_fill_op(
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float value) {
+  const auto num_elements = checked_u32(out.size(), "fill element count");
+  const auto push_constants =
+      make_generic_push_constants(num_elements, value, 0.0f, 0.0f, 0.0f);
+  const std::array<BoundArray, 1> bound_arrays = {{{&out, "dst"}}};
+
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Arange,
+      bound_arrays,
+      push_constants,
+      push_constants.KX,
+      cmd_buffer,
+      s);
+}
+
 void dispatch_sum_rows_op(
     const array& in,
     array& out,

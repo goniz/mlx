@@ -189,6 +189,43 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             markers=("ArcCos has no Vulkan implementation",),
         )
 
+    def test_equal_int32_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.equal(
+                mx.array([[1, 2], [3, 4]], dtype=mx.int32),
+                mx.array([[1, 0], [3, 5]], dtype=mx.int32),
+            ),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_bitwise_and_int32_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.bitwise_and(
+                mx.array([[7, 3], [12, 5]], dtype=mx.int32),
+                mx.array([[3, 6], [10, 1]], dtype=mx.int32),
+            ),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_logical_ops_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: (
+                mx.logical_not(mx.array([[True, False], [False, True]])),
+                mx.logical_and(
+                    mx.array([[True, False], [True, False]]),
+                    mx.array([[True, True], [False, False]]),
+                ),
+                mx.logical_or(
+                    mx.array([[True, False], [True, False]]),
+                    mx.array([[False, True], [False, False]]),
+                ),
+            ),
+            atol=0.0,
+            rtol=0.0,
+        )
+
     def test_scaled_dot_product_attention_causal_gqa(self):
         self._assert_cpu_gpu_same(
             lambda: mx.fast.scaled_dot_product_attention(

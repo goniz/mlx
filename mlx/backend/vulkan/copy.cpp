@@ -1083,6 +1083,40 @@ std::optional<vulkan::StaticShaderId> get_copy_shader_id(
 
 namespace mlx::core {
 
+namespace {
+
+std::optional<vulkan::StaticShaderId> fill_shader_id(Dtype dtype) {
+  switch (dtype) {
+    case float32:
+      return vulkan::StaticShaderId::fill_f32;
+    case float16:
+      return vulkan::StaticShaderId::fill_f16;
+    case bfloat16:
+      return vulkan::StaticShaderId::fill_bf16;
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<float> scalar_fill_value_as_float(const array& val) {
+  const void* ptr = val.data<void>();
+  if (ptr == nullptr) {
+    return std::nullopt;
+  }
+  switch (val.dtype()) {
+    case float32:
+      return *static_cast<const float*>(ptr);
+    case float16:
+      return static_cast<float>(*static_cast<const float16_t*>(ptr));
+    case bfloat16:
+      return static_cast<float>(*static_cast<const bfloat16_t*>(ptr));
+    default:
+      return std::nullopt;
+  }
+}
+
+} // namespace
+
 void copy_gpu(const array& src, array& out, CopyType ctype, const Stream& s) {
   bool donated = set_copy_output_data(src, out, ctype);
   if (donated && src.dtype() == out.dtype()) {
@@ -1092,6 +1126,10 @@ void copy_gpu(const array& src, array& out, CopyType ctype, const Stream& s) {
   }
   if (ctype == CopyType::GeneralGeneral) {
     ctype = CopyType::General;
+  }
+  if (ctype == CopyType::Scalar) {
+    fill_gpu(src, out, s);
+    return;
   }
   copy_gpu_inplace(src, out, ctype, s);
 }
@@ -1502,7 +1540,27 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
     return;
   }
 
+  array fill_val = val;
+  if (fill_val.has_primitive()) {
+    fill_val.eval();
+  } else {
+    auto data = fill_val.data_shared_ptr();
+    if (data == nullptr || data->buffer.ptr() == nullptr) {
+      fill_val.wait();
+    }
+  }
+
   out.set_data(allocator::malloc(out.nbytes()));
+
+  if (auto shader_id = fill_shader_id(out.dtype()); shader_id.has_value()) {
+    if (auto fill_value = scalar_fill_value_as_float(fill_val); fill_value.has_value()) {
+      auto command_buffer = vulkan::begin_command_recording(s.index);
+      vulkan::dispatch_fill_op(out, *shader_id, command_buffer, s, *fill_value);
+      vulkan::retain_array_for_stream(s, out);
+      vulkan::end_command_recording(s.index);
+      return;
+    }
+  }
 
   // For unified memory, we can directly fill on CPU
   auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
@@ -1510,17 +1568,25 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
   if (vulkan::VulkanContext::get().is_unified_memory()) {
     // Direct CPU fill for unified memory
     char* dst_ptr = static_cast<char*>(out_buf->mapped_ptr);
-    const char* val_ptr = static_cast<const char*>(val.data<void>());
-    size_t val_size = size_of(val.dtype());
+    const char* val_ptr = static_cast<const char*>(fill_val.data<void>());
+    size_t val_size = size_of(fill_val.dtype());
     size_t out_size = out.nbytes();
 
-    for (size_t i = 0; i < out_size; i += val_size) {
-      std::memcpy(dst_ptr + i, val_ptr, val_size);
+    const bool repeated_byte =
+        std::all_of(val_ptr + 1, val_ptr + val_size, [&](char c) {
+          return c == val_ptr[0];
+        });
+    if (repeated_byte) {
+      std::memset(dst_ptr, val_ptr[0], out_size);
+    } else {
+      for (size_t i = 0; i < out_size; i += val_size) {
+        std::memcpy(dst_ptr + i, val_ptr, val_size);
+      }
     }
   } else {
     std::vector<char> host_fill(out.nbytes());
-    const char* val_ptr = static_cast<const char*>(val.data<void>());
-    size_t val_size = size_of(val.dtype());
+    const char* val_ptr = static_cast<const char*>(fill_val.data<void>());
+    size_t val_size = size_of(fill_val.dtype());
     for (size_t i = 0; i < host_fill.size(); i += val_size) {
       std::memcpy(host_fill.data() + i, val_ptr, val_size);
     }
@@ -1531,7 +1597,7 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
         out_buf->buffer,
         out.offset(),
         out.data_shared_ptr());
-    vulkan::retain_array_for_stream(s, val);
+    vulkan::retain_array_for_stream(s, fill_val);
     vulkan::retain_array_for_stream(s, out);
   }
 }

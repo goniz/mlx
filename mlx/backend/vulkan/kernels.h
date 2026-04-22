@@ -660,6 +660,13 @@ void dispatch_arange_op(
     float start,
     float step);
 
+void dispatch_fill_op(
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float value);
+
 void dispatch_sum_rows_op(
     const array& in,
     array& out,

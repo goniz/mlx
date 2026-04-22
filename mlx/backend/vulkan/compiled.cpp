@@ -2,6 +2,7 @@
 
 #include <fmt/format.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -40,6 +41,14 @@ bool trace_compiled_glsl_enabled() {
 bool trace_compiled_runtime_enabled() {
   static const bool enabled = []() {
     const char* env = std::getenv("MLX_VULKAN_TRACE_COMPILED_RUNTIME");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
+bool trace_compiled_timing_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_TRACE_COMPILED_TIMING");
     return env != nullptr && std::string(env) != "0";
   }();
   return enabled;
@@ -1015,6 +1024,8 @@ void Compiled::eval_gpu(
 
   std::vector<uint32_t> spirv;
   if (!existing_shader) {
+    const auto compile_start = std::chrono::steady_clock::now();
+
     // Generate GLSL source
     std::string glsl_source;
     build_glsl_kernel(
@@ -1038,6 +1049,8 @@ void Compiled::eval_gpu(
                 << glsl_source << "\n=== End GLSL ===\n";
     }
 
+    const auto glsl_built_at = std::chrono::steady_clock::now();
+
     // Compile to SPIR-V
     try {
       spirv = vulkan::compile_glsl_to_spirv(glsl_source, kernel_name);
@@ -1049,9 +1062,32 @@ void Compiled::eval_gpu(
       throw;
     }
 
+    const auto spirv_compiled_at = std::chrono::steady_clock::now();
+
     // Register the shader
     manager.register_shader(
         kernel_name, spirv.data(), spirv.size() * sizeof(uint32_t));
+
+    if (trace_compiled_timing_enabled()) {
+      const auto registered_at = std::chrono::steady_clock::now();
+      const auto glsl_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               glsl_built_at - compile_start)
+                               .count();
+      const auto spirv_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                spirv_compiled_at - glsl_built_at)
+                                .count();
+      const auto register_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   registered_at - spirv_compiled_at)
+                                   .count();
+      const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                registered_at - compile_start)
+                                .count();
+      std::cerr << "[vulkan-compiled-timing] kernel=" << kernel_name
+                << " glsl_ms=" << glsl_ms << " spirv_ms=" << spirv_ms
+                << " register_ms=" << register_ms << " total_ms=" << total_ms
+                << " tape_size=" << tape_.size() << " contiguous=" << contiguous
+                << " large=" << large << "\n";
+    }
   }
 
   // Allocate outputs with buffer donation

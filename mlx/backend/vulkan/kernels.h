@@ -302,6 +302,15 @@ struct GenericPushConstants {
   float param4;
 };
 
+struct ArangePushConstants {
+  uint32_t KX;
+  uint32_t KY;
+  int64_t start_i64;
+  int64_t step_i64;
+  float start_f32;
+  float step_f32;
+};
+
 struct SumRowsPushConstants {
   uint32_t n_cols;
   uint32_t ne01;
@@ -657,8 +666,8 @@ void dispatch_arange_op(
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
-    float start,
-    float step);
+    double start,
+    double step);
 
 void dispatch_fill_op(
     array& out,

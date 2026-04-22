@@ -2174,27 +2174,27 @@ void process_shaders() {
        {"DATA_D_BF16", "1"}});
   string_to_spv(
       "arange_i32",
-      "arange.comp",
+      "arange_int.comp",
       {{"A_TYPE", "int"}, {"D_TYPE", "int"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "arange_u32",
-      "arange.comp",
+      "arange_int.comp",
       {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "arange_i16",
-      "arange.comp",
+      "arange_int.comp",
       {{"A_TYPE", "int16_t"}, {"D_TYPE", "int16_t"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "arange_u16",
-      "arange.comp",
+      "arange_int.comp",
       {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "arange_i8",
-      "arange.comp",
+      "arange_int.comp",
       {{"A_TYPE", "int8_t"}, {"D_TYPE", "int8_t"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "arange_u8",
-      "arange.comp",
+      "arange_int.comp",
       {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "fill_f32", "fill.comp", {{"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});

@@ -12,6 +12,18 @@ namespace {
 
 std::optional<vulkan::StaticShaderId> arange_shader_id(Dtype dtype) {
   switch (dtype) {
+    case uint8:
+      return vulkan::StaticShaderId::arange_u8;
+    case uint16:
+      return vulkan::StaticShaderId::arange_u16;
+    case uint32:
+      return vulkan::StaticShaderId::arange_u32;
+    case int8:
+      return vulkan::StaticShaderId::arange_i8;
+    case int16:
+      return vulkan::StaticShaderId::arange_i16;
+    case int32:
+      return vulkan::StaticShaderId::arange_i32;
     case float16:
       return vulkan::StaticShaderId::arange_f16;
     case bfloat16:
@@ -19,8 +31,6 @@ std::optional<vulkan::StaticShaderId> arange_shader_id(Dtype dtype) {
     case float32:
       return vulkan::StaticShaderId::arange_f32;
     default:
-      // Integer arange needs typed scalars; the current float push constants
-      // would silently round large start/step values.
       return std::nullopt;
   }
 }
@@ -52,8 +62,8 @@ bool try_eval_arange_vulkan(
         *shader_id,
         command_buffer,
         s,
-        static_cast<float>(start),
-        static_cast<float>(step));
+        start,
+        step);
     vulkan::end_command_recording(s.index);
 
     return true;

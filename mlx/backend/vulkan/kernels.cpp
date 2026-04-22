@@ -421,7 +421,7 @@ const std::array<KernelSpec, 31> kKernelSpecs = {
         DispatchGridKind::ElementWise),
     make_kernel_spec(
         {0},
-        sizeof(GenericPushConstants),
+        sizeof(ArangePushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1},
@@ -685,6 +685,62 @@ GenericPushConstants make_generic_push_constants(
   push_constants.param2 = param2;
   push_constants.param3 = param3;
   push_constants.param4 = param4;
+  return push_constants;
+}
+
+template <typename T>
+ArangePushConstants make_arange_push_constants_t(
+    uint32_t num_elements,
+    double start,
+    double step) {
+  const T start_t = static_cast<T>(start);
+  const T next_t = static_cast<T>(start + step);
+  const T step_t = static_cast<T>(next_t - start_t);
+
+  ArangePushConstants push_constants{};
+  push_constants.KX = num_elements;
+  push_constants.KY = 1;
+  push_constants.start_i64 = static_cast<int64_t>(start_t);
+  push_constants.step_i64 = static_cast<int64_t>(step_t);
+  push_constants.start_f32 = static_cast<float>(start_t);
+  push_constants.step_f32 = static_cast<float>(step_t);
+  return push_constants;
+}
+
+ArangePushConstants make_arange_push_constants(
+    const array& out,
+    uint32_t num_elements,
+    double start,
+    double step) {
+  switch (out.dtype()) {
+    case uint8:
+      return make_arange_push_constants_t<uint8_t>(num_elements, start, step);
+    case uint16:
+      return make_arange_push_constants_t<uint16_t>(num_elements, start, step);
+    case uint32:
+      return make_arange_push_constants_t<uint32_t>(num_elements, start, step);
+    case int8:
+      return make_arange_push_constants_t<int8_t>(num_elements, start, step);
+    case int16:
+      return make_arange_push_constants_t<int16_t>(num_elements, start, step);
+    case int32:
+      return make_arange_push_constants_t<int32_t>(num_elements, start, step);
+    case float16:
+      return make_arange_push_constants_t<float16_t>(num_elements, start, step);
+    case bfloat16:
+      return make_arange_push_constants_t<bfloat16_t>(num_elements, start, step);
+    case float32:
+      return make_arange_push_constants_t<float>(num_elements, start, step);
+    default:
+      throw std::runtime_error("[vulkan::kernels] Unsupported arange dtype.");
+  }
+}
+
+ArangePushConstants make_fill_push_constants(uint32_t num_elements, float value) {
+  ArangePushConstants push_constants{};
+  push_constants.KX = num_elements;
+  push_constants.KY = 1;
+  push_constants.start_f32 = value;
   return push_constants;
 }
 
@@ -2271,11 +2327,11 @@ void dispatch_arange_op(
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
-    float start,
-    float step) {
+    double start,
+    double step) {
   const auto num_elements = checked_u32(out.size(), "arange element count");
   const auto push_constants =
-      make_generic_push_constants(num_elements, start, step, 0.0f, 0.0f);
+      make_arange_push_constants(out, num_elements, start, step);
   const std::array<BoundArray, 1> bound_arrays = {{{&out, "dst"}}};
 
   dispatch_with_spec(
@@ -2295,8 +2351,7 @@ void dispatch_fill_op(
     const Stream& s,
     float value) {
   const auto num_elements = checked_u32(out.size(), "fill element count");
-  const auto push_constants =
-      make_generic_push_constants(num_elements, value, 0.0f, 0.0f, 0.0f);
+  const auto push_constants = make_fill_push_constants(num_elements, value);
   const std::array<BoundArray, 1> bound_arrays = {{{&out, "dst"}}};
 
   dispatch_with_spec(

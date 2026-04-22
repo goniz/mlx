@@ -23,10 +23,6 @@ void main() {
         return;
     }
 
-    // p.param1 = fill value
-#ifdef DATA_D_BF16
-    data_d[i] = uint16_t(fp32_to_bf16(p.start_f32));
-#else
-    data_d[i] = D_TYPE(p.start_f32);
-#endif
+    int64_t value = p.start_i64 + p.step_i64 * int64_t(i);
+    data_d[i] = D_TYPE(value);
 }

@@ -561,8 +561,8 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  eval_cpu_fallback_with_state_on_stream<Convolution>(
-      inputs, out, stream(), state());
+  throw std::runtime_error(
+      "Convolution has no Vulkan implementation for this input.");
 }
 
 } // namespace mlx::core

@@ -311,8 +311,8 @@ bool try_eval_arg_reduce_vulkan(
 void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axis] = state();
   if (!try_eval_arg_reduce_vulkan(inputs, out, reduce_type, axis, stream())) {
-    eval_cpu_fallback_with_state_on_stream<ArgReduce>(
-        inputs, out, stream(), state());
+    throw std::runtime_error(
+        "ArgReduce has no Vulkan implementation for this input.");
   }
 }
 
@@ -320,8 +320,8 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axes] = state();
   if (!try_eval_reduce_sum_rows_vulkan(
           inputs, out, reduce_type, axes, stream())) {
-    eval_cpu_fallback_with_state_on_stream<Reduce>(
-        inputs, out, stream(), state());
+    throw std::runtime_error(
+        "Reduce has no Vulkan implementation for this input.");
   }
 }
 

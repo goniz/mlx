@@ -1012,14 +1012,6 @@ bool sdpa_vulkan_supported(
   return true;
 }
 
-std::vector<array> eval_fallback_outputs(
-    const std::function<std::vector<array>(std::vector<array>)>& fallback,
-    const std::vector<array>& inputs) {
-  auto outputs = fallback(inputs);
-  eval(outputs);
-  return outputs;
-}
-
 bool is_supported_sdpa_rowwise_layout(const array& arr) {
   return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
       arr.strides().back() == 1;
@@ -1795,6 +1787,10 @@ bool ScaledDotProductAttention::use_fallback(
     bool is_training,
     bool output_logsumexp,
     Stream s) {
+  if (s.device == Device::cpu) {
+    return true;
+  }
+
   std::string reason;
   const bool supported = sdpa_vulkan_supported(
       q,
@@ -1817,7 +1813,7 @@ bool ScaledDotProductAttention::use_fallback(
         << " output_logsumexp=" << output_logsumexp;
     trace_use_fallback("ScaledDotProductAttention", s, reason, oss.str());
   }
-  return !supported;
+  return false;
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
@@ -2229,8 +2225,7 @@ void RMSNormVJP::eval_gpu(
 void ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  eval_cpu_fallback_multi_with_state_on_stream<ConvertFP8>(
-      inputs, outputs, stream(), state());
+  throw std::runtime_error("ConvertFP8 has no Vulkan implementation.");
 }
 
 void Quantize::eval_gpu(
@@ -2253,22 +2248,8 @@ void Quantize::eval_gpu(
         return;
       }
 
-      auto fallback_inputs = inputs;
-      if (fallback_inputs.size() > 1 &&
-          !fallback_inputs[1].flags().row_contiguous) {
-        fallback_inputs[1] = contiguous_copy_gpu(fallback_inputs[1], stream());
-      }
-      auto fallback_outputs = fallback_(fallback_inputs);
-      for (size_t i = 0; i < outputs.size(); ++i) {
-        array staged(
-            fallback_outputs[i].shape(),
-            fallback_outputs[i].dtype(),
-            nullptr,
-            {});
-        copy_gpu(fallback_outputs[i], staged, CopyType::General, stream());
-        outputs[i].overwrite_descriptor(staged);
-      }
-      return;
+      throw std::runtime_error(
+          "Quantize dequantize only supports Affine and Nvfp4 modes on Vulkan.");
     }
     if (inputs.size() != 3) {
       throw std::runtime_error(
@@ -2307,11 +2288,8 @@ void Quantize::eval_gpu(
     copy_gpu(out_f32, out, CopyType::General, s);
   } else {
     if (mode_ != QuantizationMode::Affine) {
-      auto fallback_outputs = eval_fallback_outputs(fallback_, inputs);
-      for (size_t i = 0; i < outputs.size(); ++i) {
-        outputs[i].copy_shared_buffer(fallback_outputs[i]);
-      }
-      return;
+      throw std::runtime_error(
+          "Quantize encode only supports Affine mode on Vulkan.");
     }
     if (outputs.size() != 3 || inputs.size() != 1) {
       throw std::runtime_error(

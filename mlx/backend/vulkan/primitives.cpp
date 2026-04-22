@@ -13,26 +13,24 @@ namespace mlx::core {
 
 #define CPU_FALLBACK(func)                                            \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    eval_cpu_fallback_on_stream<func>(inputs, out, stream());         \
+    throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
 #define CPU_FALLBACK_STATE(func)                                      \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    eval_cpu_fallback_with_state_on_stream<func>(                     \
-        inputs, out, stream(), state());                              \
+    throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
 #define CPU_FALLBACK_MULTI(func)                                        \
   void func::eval_gpu(                                                  \
       const std::vector<array>& inputs, std::vector<array>& outputs) {  \
-    eval_cpu_fallback_multi_on_stream<func>(inputs, outputs, stream()); \
+    throw std::runtime_error(#func " has no Vulkan implementation.");  \
   }
 
 #define CPU_FALLBACK_MULTI_STATE(func)                                 \
   void func::eval_gpu(                                                 \
       const std::vector<array>& inputs, std::vector<array>& outputs) { \
-    eval_cpu_fallback_multi_with_state_on_stream<func>(                \
-        inputs, outputs, stream(), state());                           \
+    throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
 #define NO_GPU_MULTI(func)                                             \
@@ -465,7 +463,7 @@ CPU_FALLBACK(NotEqual)
 CPU_FALLBACK_STATE(Partition)
 void Power::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_power_vulkan(inputs, out, stream())) {
-    eval_cpu_fallback_on_stream<Power>(inputs, out, stream());
+    throw std::runtime_error("Power has no Vulkan implementation for this input.");
   }
 }
 // QuantizedMatmul and QQMatmul are implemented in quantized.cpp.
@@ -526,7 +524,8 @@ CPU_FALLBACK(SegmentedMM)
 
 void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_select_vulkan(inputs, out, stream())) {
-    eval_cpu_fallback_on_stream<Select>(inputs, out, stream());
+    throw std::runtime_error(
+        "Select has no Vulkan implementation for this input.");
   }
 }
 

@@ -80,6 +80,19 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             raise
         self._assert_outputs_close(gpu_out, cpu_out, atol=atol, rtol=rtol)
 
+    def _assert_gpu_unsupported(self, fn, markers=None):
+        if markers is None:
+            markers = ("has no Vulkan implementation", "failed on Vulkan")
+
+        with self.assertRaises(RuntimeError) as exc:
+            self._run_on_device(mx.gpu, fn)
+
+        msg = str(exc.exception)
+        self.assertTrue(
+            any(marker in msg for marker in markers),
+            msg=f"unexpected GPU error: {msg}",
+        )
+
     def test_fast_rms_norm_low_precision_regression(self):
         for dtype, atol, rtol in (
             (mx.float16, 5e-2, 5e-2),
@@ -166,6 +179,93 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             ),
             atol=1e-5,
             rtol=1e-5,
+        )
+
+    def test_arccos_does_not_fallback_to_cpu(self):
+        self._assert_gpu_unsupported(
+            lambda: mx.arccos(
+                mx.array([[-0.75, -0.25], [0.25, 0.75]], dtype=mx.float32)
+            ),
+            markers=("ArcCos has no Vulkan implementation",),
+        )
+
+    def test_equal_int32_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.equal(
+                mx.array([[1, 2], [3, 4]], dtype=mx.int32),
+                mx.array([[1, 0], [3, 5]], dtype=mx.int32),
+            ),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_bitwise_and_int32_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.bitwise_and(
+                mx.array([[7, 3], [12, 5]], dtype=mx.int32),
+                mx.array([[3, 6], [10, 1]], dtype=mx.int32),
+            ),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_logical_ops_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: (
+                mx.logical_not(mx.array([[True, False], [False, True]])),
+                mx.logical_and(
+                    mx.array([[True, False], [True, False]]),
+                    mx.array([[True, True], [False, False]]),
+                ),
+                mx.logical_or(
+                    mx.array([[True, False], [True, False]]),
+                    mx.array([[False, True], [False, False]]),
+                ),
+            ),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_arange_bf16_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.arange(-3, 13, dtype=mx.bfloat16).astype(mx.float32),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_arange_int32_large_start_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.arange(16_777_217, 16_777_221, dtype=mx.int32),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_arange_uint32_large_start_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.arange(16_777_217, 16_777_221, dtype=mx.uint32),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_gather_take_bf16_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.take(
+                mx.arange(1, 1 + 8 * 4, dtype=mx.float32).reshape(8, 4).astype(mx.bfloat16),
+                mx.array([5, 1, 7, 0], dtype=mx.int32),
+                axis=0,
+            ).astype(mx.float32),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_empty_bool_reduce_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: (
+                mx.all(mx.array([], dtype=mx.bool_)),
+                mx.any(mx.array([], dtype=mx.bool_)),
+            ),
+            atol=0.0,
+            rtol=0.0,
         )
 
     def test_scaled_dot_product_attention_causal_gqa(self):

@@ -28,19 +28,6 @@
 
 namespace mlx::core {
 
-inline std::vector<array> materialize_cpu_fallback_inputs(
-    const std::vector<array>& inputs) {
-  auto cpu_stream = default_stream(Device::cpu);
-  std::vector<array> cpu_inputs;
-  cpu_inputs.reserve(inputs.size());
-  for (const auto& in : inputs) {
-    cpu_inputs.push_back(astype(in, in.dtype(), cpu_stream));
-  }
-  eval(cpu_inputs);
-  synchronize(cpu_stream);
-  return cpu_inputs;
-}
-
 // Trace fallback utilities
 bool trace_fallback_enabled();
 void trace_fallback(const std::string& msg);
@@ -147,68 +134,6 @@ bool has_squeezed_axes_shape(
     const array& out,
     const std::vector<int>& axes);
 
-// CPU fallback templates
-template <typename Primitive, typename... Args>
-void eval_cpu_fallback(
-    const std::vector<array>& inputs,
-    array& out,
-    Args&&... args) {
-  if (trace_fallback_enabled()) {
-    std::ostringstream oss;
-    oss << "primitive=" << typeid(Primitive).name() << " kind=unary"
-        << " inputs=" << inputs.size() << " out_shape=" << out.shape();
-    trace_fallback(oss.str());
-  }
-  auto cpu_stream = default_stream(Device::cpu);
-  auto cpu_inputs = materialize_cpu_fallback_inputs(inputs);
-  Primitive cpu_primitive(cpu_stream, std::forward<Args>(args)...);
-  cpu_primitive.eval_cpu(cpu_inputs, out);
-  synchronize(cpu_stream);
-}
-
-template <typename Primitive, typename... Args>
-void eval_cpu_fallback_on_stream(
-    const std::vector<array>& inputs,
-    array& out,
-    Stream stream,
-    Args&&... args) {
-  vulkan::ScopedSyncLabel sync_label(
-      std::string("cpu_fallback:") + typeid(Primitive).name());
-  ::mlx::core::gpu::synchronize(stream);
-  eval_cpu_fallback<Primitive>(inputs, out, std::forward<Args>(args)...);
-}
-
-template <typename Primitive, typename... Args>
-void eval_cpu_fallback_multi(
-    const std::vector<array>& inputs,
-    std::vector<array>& outputs,
-    Args&&... args) {
-  if (trace_fallback_enabled()) {
-    std::ostringstream oss;
-    oss << "primitive=" << typeid(Primitive).name() << " kind=multi"
-        << " inputs=" << inputs.size() << " outputs=" << outputs.size();
-    trace_fallback(oss.str());
-  }
-  auto cpu_stream = default_stream(Device::cpu);
-  auto cpu_inputs = materialize_cpu_fallback_inputs(inputs);
-  Primitive cpu_primitive(cpu_stream, std::forward<Args>(args)...);
-  cpu_primitive.eval_cpu(cpu_inputs, outputs);
-  synchronize(cpu_stream);
-}
-
-template <typename Primitive, typename... Args>
-void eval_cpu_fallback_multi_on_stream(
-    const std::vector<array>& inputs,
-    std::vector<array>& outputs,
-    Stream stream,
-    Args&&... args) {
-  vulkan::ScopedSyncLabel sync_label(
-      std::string("cpu_fallback_multi:") + typeid(Primitive).name());
-  ::mlx::core::gpu::synchronize(stream);
-  eval_cpu_fallback_multi<Primitive>(
-      inputs, outputs, std::forward<Args>(args)...);
-}
-
 template <typename T, typename = void>
 struct is_tuple_like : std::false_type {};
 
@@ -217,86 +142,5 @@ struct is_tuple_like<
     T,
     std::void_t<decltype(std::tuple_size<std::decay_t<T>>::value)>>
     : std::true_type {};
-
-template <typename Primitive, typename State>
-void eval_cpu_fallback_with_state(
-    const std::vector<array>& inputs,
-    array& out,
-    State&& state) {
-  if constexpr (is_tuple_like<State>::value) {
-    std::apply(
-        [&](auto&&... state_args) {
-          eval_cpu_fallback<Primitive>(
-              inputs, out, std::forward<decltype(state_args)>(state_args)...);
-        },
-        std::forward<State>(state));
-  } else {
-    eval_cpu_fallback<Primitive>(inputs, out, std::forward<State>(state));
-  }
-}
-
-template <typename Primitive, typename State>
-void eval_cpu_fallback_with_state_on_stream(
-    const std::vector<array>& inputs,
-    array& out,
-    Stream stream,
-    State&& state) {
-  if constexpr (is_tuple_like<State>::value) {
-    std::apply(
-        [&](auto&&... state_args) {
-          eval_cpu_fallback_on_stream<Primitive>(
-              inputs,
-              out,
-              stream,
-              std::forward<decltype(state_args)>(state_args)...);
-        },
-        std::forward<State>(state));
-  } else {
-    eval_cpu_fallback_on_stream<Primitive>(
-        inputs, out, stream, std::forward<State>(state));
-  }
-}
-
-template <typename Primitive, typename State>
-void eval_cpu_fallback_multi_with_state(
-    const std::vector<array>& inputs,
-    std::vector<array>& outputs,
-    State&& state) {
-  if constexpr (is_tuple_like<State>::value) {
-    std::apply(
-        [&](auto&&... state_args) {
-          eval_cpu_fallback_multi<Primitive>(
-              inputs,
-              outputs,
-              std::forward<decltype(state_args)>(state_args)...);
-        },
-        std::forward<State>(state));
-  } else {
-    eval_cpu_fallback_multi<Primitive>(
-        inputs, outputs, std::forward<State>(state));
-  }
-}
-
-template <typename Primitive, typename State>
-void eval_cpu_fallback_multi_with_state_on_stream(
-    const std::vector<array>& inputs,
-    std::vector<array>& outputs,
-    Stream stream,
-    State&& state) {
-  if constexpr (is_tuple_like<State>::value) {
-    std::apply(
-        [&](auto&&... state_args) {
-          eval_cpu_fallback_multi_on_stream<Primitive>(
-              inputs,
-              outputs,
-              stream,
-              std::forward<decltype(state_args)>(state_args)...);
-        },
-        std::forward<State>(state));
-  } else {
-    eval_cpu_fallback_multi_on_stream<Primitive>(
-        inputs, outputs, stream, std::forward<State>(state));
-  }
-}
 
 } // namespace mlx::core

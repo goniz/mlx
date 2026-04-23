@@ -90,27 +90,10 @@ bool try_eval_reduce_sum_rows_vulkan(
   }
 
   if (logic_reduce && in.size() == 0) {
-    out.set_data(allocator::malloc(out.nbytes()));
-    const uint8_t fill_value =
-        reduce_type == Reduce::And ? uint8_t(1) : uint8_t(0);
-    if (out.nbytes() == 0) {
-      return true;
-    }
-    auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
-    if (vulkan::VulkanContext::get().is_unified_memory() &&
-        out_buf->mapped_ptr != nullptr) {
-      std::memset(out_buf->mapped_ptr, fill_value, out.nbytes());
-      return true;
-    }
-    std::vector<uint8_t> host_values(out.size(), fill_value);
-    vulkan::enqueue_owned_staging_upload(
-        s,
-        host_values.data(),
-        host_values.size(),
-        out_buf->buffer,
-        0,
-        out.data_shared_ptr());
-    vulkan::retain_array_for_stream(s, out);
+    array fill_value(
+        reduce_type == Reduce::And ? true : false,
+        bool_);
+    fill_gpu(fill_value, out, s);
     return true;
   }
 
@@ -311,8 +294,8 @@ bool try_eval_arg_reduce_vulkan(
 void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axis] = state();
   if (!try_eval_arg_reduce_vulkan(inputs, out, reduce_type, axis, stream())) {
-    eval_cpu_fallback_with_state_on_stream<ArgReduce>(
-        inputs, out, stream(), state());
+    throw std::runtime_error(
+        "ArgReduce has no Vulkan implementation for this input.");
   }
 }
 
@@ -320,8 +303,8 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axes] = state();
   if (!try_eval_reduce_sum_rows_vulkan(
           inputs, out, reduce_type, axes, stream())) {
-    eval_cpu_fallback_with_state_on_stream<Reduce>(
-        inputs, out, stream(), state());
+    throw std::runtime_error(
+        "Reduce has no Vulkan implementation for this input.");
   }
 }
 

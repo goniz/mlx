@@ -1,9 +1,18 @@
 #version 450
 
-#include "generic_head.glsl"
 #include "types.glsl"
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter
+{
+    uint KX;
+    uint KY;
+    int64_t start_i64;
+    int64_t step_i64;
+    float start_f32;
+    float step_f32;
+} p;
 
 layout (binding = 0) writeonly buffer D {D_TYPE data_d[];};
 
@@ -14,7 +23,10 @@ void main() {
         return;
     }
 
-    // p.param1 = start, p.param2 = step
-    float value = p.param1 + p.param2 * float(i);
+    float value = p.start_f32 + p.step_f32 * float(i);
+#ifdef DATA_D_BF16
+    data_d[i] = uint16_t(fp32_to_bf16(value));
+#else
     data_d[i] = D_TYPE(value);
+#endif
 }

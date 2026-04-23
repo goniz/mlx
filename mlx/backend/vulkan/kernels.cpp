@@ -421,7 +421,7 @@ const std::array<KernelSpec, 31> kKernelSpecs = {
         DispatchGridKind::ElementWise),
     make_kernel_spec(
         {0},
-        sizeof(GenericPushConstants),
+        sizeof(ArangePushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1},
@@ -685,6 +685,62 @@ GenericPushConstants make_generic_push_constants(
   push_constants.param2 = param2;
   push_constants.param3 = param3;
   push_constants.param4 = param4;
+  return push_constants;
+}
+
+template <typename T>
+ArangePushConstants make_arange_push_constants_t(
+    uint32_t num_elements,
+    double start,
+    double step) {
+  const T start_t = static_cast<T>(start);
+  const T next_t = static_cast<T>(start + step);
+  const T step_t = static_cast<T>(next_t - start_t);
+
+  ArangePushConstants push_constants{};
+  push_constants.KX = num_elements;
+  push_constants.KY = 1;
+  push_constants.start_i64 = static_cast<int64_t>(start_t);
+  push_constants.step_i64 = static_cast<int64_t>(step_t);
+  push_constants.start_f32 = static_cast<float>(start_t);
+  push_constants.step_f32 = static_cast<float>(step_t);
+  return push_constants;
+}
+
+ArangePushConstants make_arange_push_constants(
+    const array& out,
+    uint32_t num_elements,
+    double start,
+    double step) {
+  switch (out.dtype()) {
+    case uint8:
+      return make_arange_push_constants_t<uint8_t>(num_elements, start, step);
+    case uint16:
+      return make_arange_push_constants_t<uint16_t>(num_elements, start, step);
+    case uint32:
+      return make_arange_push_constants_t<uint32_t>(num_elements, start, step);
+    case int8:
+      return make_arange_push_constants_t<int8_t>(num_elements, start, step);
+    case int16:
+      return make_arange_push_constants_t<int16_t>(num_elements, start, step);
+    case int32:
+      return make_arange_push_constants_t<int32_t>(num_elements, start, step);
+    case float16:
+      return make_arange_push_constants_t<float16_t>(num_elements, start, step);
+    case bfloat16:
+      return make_arange_push_constants_t<bfloat16_t>(num_elements, start, step);
+    case float32:
+      return make_arange_push_constants_t<float>(num_elements, start, step);
+    default:
+      throw std::runtime_error("[vulkan::kernels] Unsupported arange dtype.");
+  }
+}
+
+ArangePushConstants make_fill_push_constants(uint32_t num_elements, float value) {
+  ArangePushConstants push_constants{};
+  push_constants.KX = num_elements;
+  push_constants.KY = 1;
+  push_constants.start_f32 = value;
   return push_constants;
 }
 
@@ -2271,11 +2327,31 @@ void dispatch_arange_op(
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
-    float start,
-    float step) {
+    double start,
+    double step) {
   const auto num_elements = checked_u32(out.size(), "arange element count");
   const auto push_constants =
-      make_generic_push_constants(num_elements, start, step, 0.0f, 0.0f);
+      make_arange_push_constants(out, num_elements, start, step);
+  const std::array<BoundArray, 1> bound_arrays = {{{&out, "dst"}}};
+
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Arange,
+      bound_arrays,
+      push_constants,
+      push_constants.KX,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_fill_op(
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    float value) {
+  const auto num_elements = checked_u32(out.size(), "fill element count");
+  const auto push_constants = make_fill_push_constants(num_elements, value);
   const std::array<BoundArray, 1> bound_arrays = {{{&out, "dst"}}};
 
   dispatch_with_spec(
@@ -2608,9 +2684,12 @@ void dispatch_diag_mask_inf_op(
     throw std::runtime_error(
         "[vulkan::kernels] DiagMaskInf requires input rank >= 1.");
   }
-  if (in.dtype() != float32 || out.dtype() != float32) {
+  const bool f32_io = in.dtype() == float32 && out.dtype() == float32;
+  const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
+  const bool bf16_io = in.dtype() == bfloat16 && out.dtype() == bfloat16;
+  if (!f32_io && !f16_io && !bf16_io) {
     throw std::runtime_error(
-        "[vulkan::kernels] DiagMaskInf currently requires float32 IO.");
+        "[vulkan::kernels] DiagMaskInf currently requires matching f32/f16/bf16 IO.");
   }
 
   const uint32_t ncols =
@@ -3637,6 +3716,7 @@ DynamicComputeDispatch dispatch_dynamic_compute_begin(
   }
 
   for (uint32_t i = 0; i < num_bindings; ++i) {
+    retain_array_for_stream(s, *arrays[i].arr);
     write_descriptor_buffer(
         *arrays[i].arr, arrays[i].binding, descriptor_set, infos, writes);
   }
@@ -3698,9 +3778,6 @@ void dispatch_dynamic_compute(
   auto dispatch = dispatch_dynamic_compute_begin(
       shader_name, glsl_source, num_bindings, arrays, 0, s);
   vkCmdDispatch(dispatch.command_buffer, workgroup_x, workgroup_y, workgroup_z);
-  for (uint32_t i = 0; i < num_bindings; ++i) {
-    retain_array_for_stream(s, *arrays[i].arr);
-  }
   end_command_recording(s.index);
 }
 

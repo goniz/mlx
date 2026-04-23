@@ -546,13 +546,12 @@ array make_flash_attention_causal_mask(
     return mask;
   }
 
-  array mask_f32 = zeros(shape, float32, s);
-  if (mask_f32.dtype() != float32) {
+  array mask_f16 = zeros(shape, float16, s);
+  if (mask_f16.dtype() != float16) {
     throw std::runtime_error("Unexpected causal mask dtype.");
   }
   const int n_past = k.shape(2) - q.shape(2);
-  mask_f32 = apply_diag_mask_inf_vulkan(mask_f32, n_past, s);
-  array mask_f16 = astype(mask_f32, float16, s);
+  mask_f16 = apply_diag_mask_inf_vulkan(mask_f16, n_past, s);
   eval(mask_f16);
   copy_gpu_inplace(mask_f16, mask, CopyType::General, s);
   mask.set_status(array::Status::evaluated);
@@ -1012,14 +1011,6 @@ bool sdpa_vulkan_supported(
   return true;
 }
 
-std::vector<array> eval_fallback_outputs(
-    const std::function<std::vector<array>(std::vector<array>)>& fallback,
-    const std::vector<array>& inputs) {
-  auto outputs = fallback(inputs);
-  eval(outputs);
-  return outputs;
-}
-
 bool is_supported_sdpa_rowwise_layout(const array& arr) {
   return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
       arr.strides().back() == 1;
@@ -1477,9 +1468,22 @@ bool try_eval_sdpa_heads_vulkan(
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
   array in = ensure_sdpa_rowwise_layout(scores, s);
 
-  array masked(in.shape(), float32, nullptr, {});
+  array masked(in.shape(), in.dtype(), nullptr, {});
   masked.set_status(array::Status::available);
   masked.set_data(allocator::malloc(masked.nbytes()));
+
+  auto shader_id = [&]() {
+    switch (in.dtype()) {
+      case float32:
+        return vulkan::StaticShaderId::diag_mask_inf_f32;
+      case float16:
+        return vulkan::StaticShaderId::diag_mask_inf_f16;
+      case bfloat16:
+        return vulkan::StaticShaderId::diag_mask_inf_bf16;
+      default:
+        throw std::runtime_error("DiagMaskInf unsupported dtype on Vulkan.");
+    }
+  }();
 
   const std::vector<array> tracked_inputs = {in};
   const std::vector<array> tracked_outputs = {masked};
@@ -1489,7 +1493,7 @@ array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
   vulkan::dispatch_diag_mask_inf_op(
       in,
       masked,
-      vulkan::StaticShaderId::diag_mask_inf_f32,
+      shader_id,
       command_buffer,
       s,
       checked_u32_size(in.shape(in.ndim() - 2), "rows_per_channel"),
@@ -1795,29 +1799,10 @@ bool ScaledDotProductAttention::use_fallback(
     bool is_training,
     bool output_logsumexp,
     Stream s) {
-  std::string reason;
-  const bool supported = sdpa_vulkan_supported(
-      q,
-      k,
-      v,
-      has_mask,
-      has_arr_mask,
-      do_causal,
-      is_training,
-      output_logsumexp,
-      false,
-      s,
-      &reason);
-  if (!supported && trace_fallback_enabled()) {
-    std::ostringstream oss;
-    oss << "q_shape=" << q.shape() << " k_shape=" << k.shape()
-        << " v_shape=" << v.shape() << " has_mask=" << has_mask
-        << " has_arr_mask=" << has_arr_mask << " do_causal=" << do_causal
-        << " is_training=" << is_training
-        << " output_logsumexp=" << output_logsumexp;
-    trace_use_fallback("ScaledDotProductAttention", s, reason, oss.str());
+  if (s.device == Device::cpu) {
+    return true;
   }
-  return !supported;
+  return false;
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
@@ -2229,8 +2214,7 @@ void RMSNormVJP::eval_gpu(
 void ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  eval_cpu_fallback_multi_with_state_on_stream<ConvertFP8>(
-      inputs, outputs, stream(), state());
+  throw std::runtime_error("ConvertFP8 has no Vulkan implementation.");
 }
 
 void Quantize::eval_gpu(
@@ -2253,22 +2237,8 @@ void Quantize::eval_gpu(
         return;
       }
 
-      auto fallback_inputs = inputs;
-      if (fallback_inputs.size() > 1 &&
-          !fallback_inputs[1].flags().row_contiguous) {
-        fallback_inputs[1] = contiguous_copy_gpu(fallback_inputs[1], stream());
-      }
-      auto fallback_outputs = fallback_(fallback_inputs);
-      for (size_t i = 0; i < outputs.size(); ++i) {
-        array staged(
-            fallback_outputs[i].shape(),
-            fallback_outputs[i].dtype(),
-            nullptr,
-            {});
-        copy_gpu(fallback_outputs[i], staged, CopyType::General, stream());
-        outputs[i].overwrite_descriptor(staged);
-      }
-      return;
+      throw std::runtime_error(
+          "Quantize dequantize only supports Affine and Nvfp4 modes on Vulkan.");
     }
     if (inputs.size() != 3) {
       throw std::runtime_error(
@@ -2307,11 +2277,8 @@ void Quantize::eval_gpu(
     copy_gpu(out_f32, out, CopyType::General, s);
   } else {
     if (mode_ != QuantizationMode::Affine) {
-      auto fallback_outputs = eval_fallback_outputs(fallback_, inputs);
-      for (size_t i = 0; i < outputs.size(); ++i) {
-        outputs[i].copy_shared_buffer(fallback_outputs[i]);
-      }
-      return;
+      throw std::runtime_error(
+          "Quantize encode only supports Affine mode on Vulkan.");
     }
     if (outputs.size() != 3 || inputs.size() != 1) {
       throw std::runtime_error(

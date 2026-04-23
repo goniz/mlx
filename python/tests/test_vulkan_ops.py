@@ -221,6 +221,14 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
                     mx.array([[True, False], [True, False]]),
                     mx.array([[False, True], [False, False]]),
                 ),
+                mx.logical_and(
+                    mx.array(True),
+                    mx.array([True, False]),
+                ),
+                mx.logical_or(
+                    mx.array([[False, True]]),
+                    mx.array([[False, False], [True, False]]),
+                ),
             ),
             atol=0.0,
             rtol=0.0,

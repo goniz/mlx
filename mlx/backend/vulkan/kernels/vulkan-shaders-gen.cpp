@@ -1848,6 +1848,8 @@ void process_shaders() {
   string_to_spv("affine_dequantize_f32", "affine_dequantize.comp", {});
   string_to_spv("affine_quantize_f32", "affine_quantize.comp", {});
   string_to_spv("dequant_nvfp4_f32", "dequant_nvfp4.comp", {});
+  string_to_spv("quantize_nvfp4_f32", "quantize_nvfp4.comp", {});
+  string_to_spv("mul_mm_nvfp4_f32", "mul_mm_nvfp4.comp", {});
 
   string_to_spv(
       "fused_affine_matmul_f32_f32",

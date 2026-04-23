@@ -25,6 +25,17 @@ bool is_supported_quantized_output_dtype(Dtype dtype) {
   return dtype == float16 || dtype == bfloat16 || dtype == float32;
 }
 
+bool fused_nvfp4_qqmm_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_NVFP4_QQMM");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
 std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
     Dtype x_dtype) {
   switch (x_dtype) {
@@ -40,6 +51,9 @@ std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
 }
 
 bool is_row_contiguous_zero_offset(const array& arr) {
+  if (arr.ndim() == 0) {
+    return arr.offset() == 0;
+  }
   return arr.flags().row_contiguous && arr.offset() == 0 &&
       arr.strides(-1) == 1;
 }
@@ -232,17 +246,25 @@ bool affine_dequantize_to_float32(
 bool nvfp4_dequantize_to_float32(
     const array& w,
     const array& scales,
+    const std::optional<array>& global_scale,
     array& out,
     Stream s) {
   if (w.dtype() != uint32 || scales.dtype() != uint8 ||
       out.dtype() != float32) {
     return false;
   }
+  if (global_scale.has_value() && global_scale->dtype() != float32) {
+    return false;
+  }
 
   array w_work = ensure_row_contiguous_zero_offset(w, s);
   array scales_work = ensure_row_contiguous_zero_offset(scales, s);
+  array global_scale_work = global_scale.has_value()
+      ? ensure_float32_row_contiguous(*global_scale, s)
+      : scales_work;
   if (!is_row_contiguous_zero_offset(w_work) ||
-      !is_row_contiguous_zero_offset(scales_work)) {
+      !is_row_contiguous_zero_offset(scales_work) ||
+      !is_row_contiguous_zero_offset(global_scale_work)) {
     return false;
   }
 
@@ -253,17 +275,67 @@ bool nvfp4_dequantize_to_float32(
 
   Nvfp4DequantPushConstants push_constants{};
   push_constants.ne = static_cast<uint32_t>(out.size());
+  push_constants.has_global_scale = global_scale.has_value() ? 1u : 0u;
 
   auto command_buffer = vulkan::begin_command_recording(s.index);
   dispatch_nvfp4_dequant_op(
       w_work,
       scales_work,
+      global_scale_work,
       out,
       StaticShaderId::dequant_nvfp4_f32,
       command_buffer,
       s,
       push_constants,
       {(push_constants.ne + 255u) / 256u, 1, 1});
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
+bool nvfp4_quantize_from_float32(
+    const array& in,
+    array& w,
+    array& scales,
+    const std::optional<array>& global_scale,
+    Stream s) {
+  if (in.dtype() != float32 || w.dtype() != uint32 || scales.dtype() != uint8) {
+    return false;
+  }
+  if (global_scale.has_value() && global_scale->dtype() != float32) {
+    return false;
+  }
+
+  array in_work = ensure_row_contiguous_zero_offset(in, s);
+  array global_scale_work = global_scale.has_value()
+      ? ensure_float32_row_contiguous(*global_scale, s)
+      : in_work;
+  if (!is_row_contiguous_zero_offset(in_work) ||
+      !is_row_contiguous_zero_offset(global_scale_work)) {
+    return false;
+  }
+
+  w.set_data(allocator::malloc(w.nbytes()));
+  scales.set_data(allocator::malloc(scales.nbytes()));
+  if (in.size() == 0) {
+    return true;
+  }
+
+  Nvfp4QuantPushConstants push_constants{};
+  push_constants.ne = static_cast<uint32_t>(in.size());
+  push_constants.has_global_scale = global_scale.has_value() ? 1u : 0u;
+  const uint32_t num_groups = static_cast<uint32_t>(scales.size());
+
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  dispatch_nvfp4_quant_op(
+      in_work,
+      w,
+      scales,
+      global_scale_work,
+      StaticShaderId::quantize_nvfp4_f32,
+      command_buffer,
+      s,
+      push_constants,
+      {num_groups, 1, 1});
   vulkan::end_command_recording(s.index);
   return true;
 }
@@ -310,9 +382,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         x, make_contiguous_strides(flat_shape), x.flags(), x.size());
   }
 
-  if (x_mat.dtype() == bfloat16 &&
-      !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
-    x_mat = ensure_float16_row_contiguous(x_mat, s);
+  if (x_mat.dtype() == bfloat16) {
+    x_mat = ensure_float32_row_contiguous(x_mat, s);
   }
 
   auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype());
@@ -493,6 +564,63 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (mode_ != QuantizationMode::Nvfp4) {
     throw std::runtime_error(
         "[QQMatmul::eval_gpu] Only nvfp4 mode is implemented on Vulkan.");
+  }
+
+  if (fused_nvfp4_qqmm_enabled() && inputs[0].ndim() == 2 &&
+      inputs[1].ndim() == 2 && inputs[2].ndim() == 2) {
+    array x = ensure_float32_row_contiguous(inputs[0], s);
+    array w = ensure_row_contiguous_zero_offset(inputs[1], s);
+    array scales = ensure_row_contiguous_zero_offset(inputs[2], s);
+    array global_x = global_scale_x.has_value()
+        ? ensure_float32_row_contiguous(*global_scale_x, s)
+        : x;
+    array global_w = global_scale_w.has_value()
+        ? ensure_float32_row_contiguous(*global_scale_w, s)
+        : x;
+    const uint32_t rows = static_cast<uint32_t>(x.shape(0));
+    const uint32_t cols = static_cast<uint32_t>(w.shape(0));
+    const uint32_t k = static_cast<uint32_t>(x.shape(1));
+    if (w.dtype() == uint32 && scales.dtype() == uint8 &&
+        w.shape(1) * 8 == x.shape(1) && scales.shape(0) == w.shape(0) &&
+        scales.shape(1) * 16 == x.shape(1) && out.shape(0) == x.shape(0) &&
+        out.shape(1) == w.shape(0) && is_row_contiguous_zero_offset(x) &&
+        is_row_contiguous_zero_offset(w) &&
+        is_row_contiguous_zero_offset(scales) &&
+        is_row_contiguous_zero_offset(global_x) &&
+        is_row_contiguous_zero_offset(global_w)) {
+      array out_work(out.shape(), float32, nullptr, {});
+      out_work.set_data(allocator::malloc(out_work.nbytes()));
+      if (out_work.size() != 0) {
+        vulkan::Nvfp4QMatmulPushConstants push_constants{};
+        push_constants.rows = rows;
+        push_constants.cols = cols;
+        push_constants.K = k;
+        push_constants.packed_row_words = static_cast<uint32_t>(w.strides(-2));
+        push_constants.x_row_stride = static_cast<uint32_t>(x.strides(-2));
+        push_constants.out_row_stride = static_cast<uint32_t>(out_work.strides(-2));
+        push_constants.scale_row_stride =
+            static_cast<uint32_t>(scales.strides(-2));
+        push_constants.has_global_scales =
+            global_scale_x.has_value() && global_scale_w.has_value() ? 1u : 0u;
+        auto command_buffer = vulkan::begin_command_recording(s.index);
+        vulkan::dispatch_nvfp4_qmatmul_op(
+            w,
+            scales,
+            x,
+            global_x,
+            global_w,
+            out_work,
+            vulkan::StaticShaderId::mul_mm_nvfp4_f32,
+            command_buffer,
+            s,
+            push_constants,
+            {cols, rows, 1u});
+        vulkan::end_command_recording(s.index);
+      }
+      out.set_data(allocator::malloc(out.nbytes()));
+      copy_gpu(out_work, out, CopyType::General, s);
+      return;
+    }
   }
 
   array xhat = nvfp4_quantize_dequantize(inputs[0], s, global_scale_x);

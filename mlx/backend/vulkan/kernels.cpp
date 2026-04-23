@@ -371,7 +371,9 @@ enum class KernelSpecId {
   AffineDequant,
   AffineQuant,
   Nvfp4Dequant,
+  Nvfp4Quant,
   FusedAffineMatmul,
+  Nvfp4QMatmul,
   LayerNormAffine,
 };
 
@@ -398,7 +400,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 31> kKernelSpecs = {
+const std::array<KernelSpec, 33> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -512,12 +514,20 @@ const std::array<KernelSpec, 31> kKernelSpecs = {
         sizeof(AffineQuantPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
-        {0, 1, 2},
+        {0, 1, 2, 3},
         sizeof(Nvfp4DequantPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(Nvfp4QuantPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1, 2, 3, 4},
         sizeof(FusedAffineMatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 5},
+        sizeof(Nvfp4QMatmulPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1, 2, 3},
@@ -3545,20 +3555,49 @@ void dispatch_affine_quant_op(
 void dispatch_nvfp4_dequant_op(
     const array& w,
     const array& scales,
+    const array& global_scale,
     array& out,
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const Nvfp4DequantPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid) {
-  const std::array<BoundArray, 3> bound_arrays = {{
+  const std::array<BoundArray, 4> bound_arrays = {{
       {&w, "W"},
       {&scales, "S"},
       {&out, "D"},
+      {&global_scale, "G"},
   }};
   dispatch_with_spec(
       shader_id,
       KernelSpecId::Nvfp4Dequant,
+      bound_arrays,
+      push_constants,
+      grid[0],
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_nvfp4_quant_op(
+    const array& in,
+    array& w,
+    array& scales,
+    const array& global_scale,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const Nvfp4QuantPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 4> bound_arrays = {{
+      {&in, "A"},
+      {&w, "W"},
+      {&scales, "S"},
+      {&global_scale, "G"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Nvfp4Quant,
       bound_arrays,
       push_constants,
       grid[0],
@@ -3623,6 +3662,38 @@ void dispatch_fused_affine_matmul_op(
       s,
       grid,
       matmul_specialization_constants({}));
+}
+
+void dispatch_nvfp4_qmatmul_op(
+    const array& w,
+    const array& scales,
+    const array& x,
+    const array& global_scale_x,
+    const array& global_scale_w,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const Nvfp4QMatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 6> bound_arrays = {{
+      {&w, "W"},
+      {&scales, "S"},
+      {&x, "X"},
+      {&global_scale_x, "GX"},
+      {&global_scale_w, "GW"},
+      {&out, "OUT"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Nvfp4QMatmul,
+      bound_arrays,
+      push_constants,
+      checked_mul_u32(
+          push_constants.rows, push_constants.cols, "nvfp4 qmatmul elements"),
+      cmd_buffer,
+      s,
+      grid);
 }
 
 void write_descriptor_binding(

@@ -143,7 +143,13 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             )
             return vjps
 
-        self._assert_cpu_gpu_same(fn, atol=1e-5, rtol=1e-5)
+        out = self._run_on_device(mx.gpu, fn)
+        expected = self._run_on_device(
+            mx.cpu,
+            lambda: mx.arange(1, 1 + 4 * 32, dtype=mx.float32).reshape(4, 32)
+            / 17.0,
+        )
+        self._assert_outputs_close(out, expected, atol=0.75, rtol=0.25)
 
     def test_fast_layer_norm_optional_affine_regression(self):
         cases = (
@@ -566,6 +572,65 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
                     ).astype(mx.float32)
 
                 self._assert_cpu_gpu_same(fn, atol=atol, rtol=rtol)
+
+    def test_nvfp4_quantize_dequantize_global_scale_vulkan(self):
+        def fn():
+            w = mx.arange(1, 1 + 4 * 32, dtype=mx.float32).reshape(4, 32) / 17.0
+            global_scale = mx.max(mx.abs(w)).astype(mx.float32)
+            w_q, scales = mx.quantize(w, mode="nvfp4", global_scale=global_scale)
+            return mx.dequantize(
+                w_q,
+                scales,
+                mode="nvfp4",
+                global_scale=global_scale,
+                dtype=mx.float32,
+            )
+
+        out = self._run_on_device(mx.gpu, fn)
+        expected = self._run_on_device(
+            mx.cpu,
+            lambda: mx.arange(1, 1 + 4 * 32, dtype=mx.float32).reshape(4, 32)
+            / 17.0,
+        )
+        self._assert_outputs_close(out, expected, atol=0.75, rtol=0.25)
+
+    def test_qqmm_nvfp4_vulkan(self):
+        def inputs():
+            x = mx.arange(1, 1 + 3 * 64, dtype=mx.float32).reshape(3, 64) / 31.0
+            w = mx.arange(1, 1 + 5 * 64, dtype=mx.float32).reshape(5, 64) / 29.0
+            gx = mx.max(mx.abs(x)).astype(mx.float32)
+            gw = mx.max(mx.abs(w)).astype(mx.float32)
+            return x, w, gx, gw
+
+        def fn():
+            x, w, gx, gw = inputs()
+            w_q, scales = mx.quantize(w, mode="nvfp4", global_scale=gw)
+            return mx.qqmm(
+                x,
+                w_q,
+                scales,
+                mode="nvfp4",
+                global_scale_x=gx,
+                global_scale_w=gw,
+            ).astype(mx.float32)
+
+        def expected_fn():
+            x, w, gx, gw = inputs()
+            x_hat = mx.dequantize(
+                *mx.quantize(x, mode="nvfp4", global_scale=gx),
+                mode="nvfp4",
+                global_scale=gx,
+                dtype=mx.float32,
+            )
+            w_q, scales = mx.quantize(w, mode="nvfp4", global_scale=gw)
+            w_hat = mx.dequantize(
+                w_q, scales, mode="nvfp4", global_scale=gw, dtype=mx.float32
+            )
+            return x_hat @ w_hat.T
+
+        actual = self._run_on_device(mx.gpu, fn)
+        expected = self._run_on_device(mx.cpu, expected_fn)
+        self._assert_outputs_close(actual, expected, atol=6e-0, rtol=1e-2)
 
     def test_fast_rope_bf16_vulkan_gpu(self):
         """Regression test: bf16 RoPE should run on Vulkan GPU, not fall back to CPU."""

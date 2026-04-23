@@ -2222,12 +2222,16 @@ void Quantize::eval_gpu(
     std::vector<array>& outputs) {
   if (dequantize_) {
     if (mode_ != QuantizationMode::Affine) {
-      if (mode_ == QuantizationMode::Nvfp4 && inputs.size() == 2 &&
+      if (mode_ == QuantizationMode::Nvfp4 &&
+          (inputs.size() == 2 || inputs.size() == 3) &&
           outputs.size() == 1) {
         auto& out = outputs[0];
         array out_f32(out.shape(), float32, nullptr, {});
+        std::optional<array> global_scale = inputs.size() == 3
+            ? std::make_optional(inputs[2])
+            : std::nullopt;
         if (!vulkan::nvfp4_dequantize_to_float32(
-                inputs[0], inputs[1], out_f32, stream())) {
+                inputs[0], inputs[1], global_scale, out_f32, stream())) {
           throw std::runtime_error(
               "[Quantize::eval_gpu] Nvfp4 dequantize failed on Vulkan.");
         }
@@ -2277,8 +2281,27 @@ void Quantize::eval_gpu(
     copy_gpu(out_f32, out, CopyType::General, s);
   } else {
     if (mode_ != QuantizationMode::Affine) {
+      if (mode_ == QuantizationMode::Nvfp4 &&
+          (inputs.size() == 1 || inputs.size() == 2) && outputs.size() == 2) {
+        auto& s = stream();
+        array in_f32 = inputs[0];
+        if (in_f32.dtype() != float32) {
+          in_f32 = array(inputs[0].shape(), float32, nullptr, {});
+          in_f32.set_data(allocator::malloc(in_f32.nbytes()));
+          copy_gpu(inputs[0], in_f32, CopyType::General, s);
+        }
+        std::optional<array> global_scale = inputs.size() == 2
+            ? std::make_optional(inputs[1])
+            : std::nullopt;
+        if (!vulkan::nvfp4_quantize_from_float32(
+                in_f32, outputs[0], outputs[1], global_scale, s)) {
+          throw std::runtime_error(
+              "[Quantize::eval_gpu] Nvfp4 quantize failed on Vulkan.");
+        }
+        return;
+      }
       throw std::runtime_error(
-          "Quantize encode only supports Affine mode on Vulkan.");
+          "Quantize encode only supports Affine and Nvfp4 modes on Vulkan.");
     }
     if (outputs.size() != 3 || inputs.size() != 1) {
       throw std::runtime_error(

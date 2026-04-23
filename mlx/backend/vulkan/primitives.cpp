@@ -986,6 +986,26 @@ bool try_eval_bitwise_binary_vulkan(
     return false;
   }
 
+  auto materialize_broadcast_input = [&](array& in) {
+    if (in.shape() == out.shape()) {
+      return true;
+    }
+    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
+      return false;
+    }
+    if (!ensure_vulkan_buffer_compare(in, s)) {
+      return false;
+    }
+    array view(out.shape(), in.dtype(), nullptr, {});
+    broadcast(in, view);
+    in = view;
+    return true;
+  };
+
+  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+    return false;
+  }
+
   if (!is_supported_elementwise_layout(a)) {
     a = contiguous_copy_gpu(a, s);
   }

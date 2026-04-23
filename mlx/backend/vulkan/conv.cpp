@@ -639,10 +639,6 @@ bool try_eval_conv1d_vulkan(
     return true;
   }
 
-  if (groups > 32) {
-    return false;
-  }
-
   const auto& in_strides = in.strides();
   auto patches = as_strided(
       in,

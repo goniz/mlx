@@ -1868,6 +1868,23 @@ void process_shaders() {
        {"D_TYPE", "float"}});
 
   string_to_spv(
+      "fused_affine_matvec8_f32_f32",
+      "mul_mv_affine8.comp",
+      {{"B_TYPE", "float"}});
+  string_to_spv(
+      "fused_affine_matvec8_f16_f32",
+      "mul_mv_affine8.comp",
+      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}});
+  string_to_spv(
+      "fused_affine_matvec_f32_f32",
+      "mul_mv_affine.comp",
+      {{"B_TYPE", "float"}});
+  string_to_spv(
+      "fused_affine_matvec_f16_f32",
+      "mul_mv_affine.comp",
+      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}});
+
+  string_to_spv(
       "mul_f32",
       "mul.comp",
       {{"A_TYPE", "float"},

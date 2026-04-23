@@ -1,0 +1,85 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#ifdef FLOAT16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#include "types.glsl"
+
+#if !defined(TO_FLOAT_TYPE)
+#define TO_FLOAT_TYPE float
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W {
+    uint8_t data_w[];
+};
+layout(binding = 1) readonly buffer SCALES {
+    float data_scales[];
+};
+layout(binding = 2) readonly buffer BIASES {
+    float data_biases[];
+};
+layout(binding = 3) readonly buffer X {
+    B_TYPE data_x[];
+};
+layout(binding = 4) writeonly buffer OUT {
+    float data_out[];
+};
+
+layout(push_constant) uniform parameter {
+    uint rows;
+    uint cols;
+    uint K;
+    uint packed_row_bytes;
+    uint x_row_stride;
+    uint out_row_stride;
+    uint scale_row_stride;
+    uint bias_row_stride;
+    uint bits;
+    uint group_size;
+    uint num_groups;
+} p;
+
+shared float partial[256];
+
+void main() {
+    const uint col = gl_WorkGroupID.x;
+    const uint row = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.rows || col >= p.cols) {
+        return;
+    }
+
+    const uint w_row_base = col * p.packed_row_bytes;
+    const uint scale_row_base = col * p.scale_row_stride;
+    const uint bias_row_base = col * p.bias_row_stride;
+    const uint x_row_base = row * p.x_row_stride;
+
+    float acc = 0.0f;
+    for (uint k = tid; k < p.K; k += gl_WorkGroupSize.x) {
+        const uint group = k / p.group_size;
+        const float w = data_scales[scale_row_base + group] *
+            float(data_w[w_row_base + k]) + data_biases[bias_row_base + group];
+        acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k]), w, acc);
+    }
+
+    partial[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        data_out[row * p.out_row_stride + col] = partial[0];
+    }
+}

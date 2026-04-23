@@ -50,6 +50,30 @@ std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
   }
 }
 
+std::optional<vulkan::StaticShaderId> fused_affine_matvec8_shader_id(
+    Dtype x_dtype) {
+  switch (x_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::fused_affine_matvec8_f32_f32;
+    case float16:
+      return vulkan::StaticShaderId::fused_affine_matvec8_f16_f32;
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<vulkan::StaticShaderId> fused_affine_matvec_shader_id(
+    Dtype x_dtype) {
+  switch (x_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::fused_affine_matvec_f32_f32;
+    case float16:
+      return vulkan::StaticShaderId::fused_affine_matvec_f16_f32;
+    default:
+      return std::nullopt;
+  }
+}
+
 bool is_row_contiguous_zero_offset(const array& arr) {
   if (arr.ndim() == 0) {
     return arr.offset() == 0;
@@ -386,7 +410,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     x_mat = ensure_float32_row_contiguous(x_mat, s);
   }
 
-  auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype());
+  auto fused_shader = bits_ == 8
+      ? fused_affine_matvec8_shader_id(x_mat.dtype())
+      : fused_affine_matvec_shader_id(x_mat.dtype());
   const bool enable_fused_decode_qmm = []() {
     if (const char* env = std::getenv("MLX_VULKAN_FUSED_AFFINE_QMM");
         env != nullptr) {
@@ -443,7 +469,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.num_groups = num_groups;
 
           const std::array<uint32_t, 3> grid = {
-              (cols + 15u) / 16u, (rows + 15u) / 16u, 1u};
+              cols, rows, 1u};
 
           auto command_buffer = vulkan::begin_command_recording(s.index);
           vulkan::dispatch_fused_affine_matmul_op(

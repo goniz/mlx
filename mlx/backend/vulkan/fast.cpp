@@ -1604,7 +1604,8 @@ bool try_eval_rms_norm_vulkan(
         s,
         vulkan::BinaryDispatchVariant::Standard,
         std::array<uint32_t, 3>{nrows, nchannels, nsamples},
-        {0u, has_weight ? 1u : 0u});
+        {0u, has_weight ? 1u : 0u},
+        eps);
     vulkan::end_command_recording(s.index);
     end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
     if (staged_output) {

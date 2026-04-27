@@ -490,10 +490,6 @@ bool try_eval_conv1d_vulkan(
     return true;
   }
 
-  const bool is_depthwise =
-      groups == in_channels && channels_per_group == 1 &&
-      out_channels == in_channels;
-
   in = dilate_input_1d(in, input_dilation[0], s);
   in =
       pad(in,
@@ -505,137 +501,38 @@ bool try_eval_conv1d_vulkan(
 
   auto wt_work = flip ? reverse_kernel_1d(wt, s) : wt;
 
-  if (is_depthwise) {
-    if ((in.dtype() != float32 && in.dtype() != float16 && in.dtype() != bfloat16) ||
-        (out.dtype() != float32 && out.dtype() != float16 && out.dtype() != bfloat16) ||
-        (wt_work.dtype() != float32 && wt_work.dtype() != float16 &&
-         wt_work.dtype() != bfloat16)) {
-      return false;
-    }
-
-    auto in_compute = in.dtype() == float32 ? in : astype(in, float32, s);
-    auto wt_compute = wt_work;
-    if (wt_compute.dtype() == bfloat16) {
-      wt_compute = astype(wt_compute, float16, s);
-    }
-
-    auto in_4d = reshape(in_compute, {batch, 1, in_compute.shape(1), in_channels}, s);
-    auto in_work = make_tracked_contiguous_copy(in_4d, s, "conv1d_dw.copy_input");
-
-    auto wt_kwc = transpose(wt_compute, {1, 0, 2}, s);
-    wt_kwc = reshape(wt_kwc, {1, kernel, in_channels}, s);
-    auto wt_depthwise =
-        make_tracked_contiguous_copy(wt_kwc, s, "conv1d_dw.copy_weight");
-
-    array out_work({batch, 1, out_len, out_channels}, float32, nullptr, {});
-    out_work.set_data(vulkan::allocator().malloc(out_work.nbytes()));
-
-    const auto shader_id = wt_depthwise.dtype() == float16
-        ? vulkan::StaticShaderId::conv2d_dw_cwhn_f16_f32
-        : vulkan::StaticShaderId::conv2d_dw_cwhn_f32;
-
-    auto bindings = conv_layout_bindings();
-    auto& manager = vulkan::KernelManager::get();
-    auto* pipeline = manager.get_pipeline(
-        shader_id,
-        bindings,
-        static_cast<uint32_t>(sizeof(DepthwiseConv2dPushConstants)));
-    if (pipeline == nullptr) {
-      return false;
-    }
-
-    const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
-    vk::DescriptorSet descriptor_set =
-        manager.allocate_descriptor_set(pipeline->descriptor_layout);
-    manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
-
-    std::array<VkDescriptorBufferInfo, 3> descriptor_infos = {{
-        descriptor_buffer_info(wt_depthwise, "weights"),
-        descriptor_buffer_info(in_work, "input"),
-        descriptor_buffer_info(out_work, "output"),
-    }};
-    std::array<VkWriteDescriptorSet, 3> descriptor_writes{};
-    for (uint32_t i = 0; i < descriptor_writes.size(); ++i) {
-      descriptor_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      descriptor_writes[i].dstSet = descriptor_set;
-      descriptor_writes[i].dstBinding = i;
-      descriptor_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      descriptor_writes[i].descriptorCount = 1;
-      descriptor_writes[i].pBufferInfo = &descriptor_infos[i];
-    }
-    vkUpdateDescriptorSets(
-        vulkan::VulkanContext::get().device(),
-        static_cast<uint32_t>(descriptor_writes.size()),
-        descriptor_writes.data(),
+  // NOTE: The optimized depthwise conv shaders (conv2d_dw_*) have a
+  // correctness bug where the inner kernel loop does not execute all
+  // iterations. Use element-wise multiply + reduce for depthwise, which
+  // batches all channels into a single set of ops instead of per-group
+  // matmuls. This matches the Metal backend's unfold+gemm approach.
+  if (groups == in_channels && channels_per_group == 1 &&
+      out_channels == in_channels) {
+    const auto& dw_in_strides = in.strides();
+    auto patches = as_strided(
+        in,
+        {batch, out_len, kernel, in_channels},
+        {
+            dw_in_strides[0],
+            dw_in_strides[1] * kernel_strides[0],
+            dw_in_strides[1] * kernel_dilation[0],
+            dw_in_strides[2],
+        },
         0,
-        nullptr);
+        s);
 
-    DepthwiseConv2dPushConstants push_constants{};
-    push_constants.ne = checked_u32_size(num_elements(out_work.shape()), "conv1d_dw elements");
-    push_constants.batches = checked_u32_size(batch, "conv1d_dw batches");
-    push_constants.channels = checked_u32_size(in_channels, "conv1d_dw channels");
-    push_constants.dst_w = checked_u32_size(out_len, "conv1d_dw dst width");
-    push_constants.dst_h = 1;
-    push_constants.src_w = checked_u32_size(in_compute.shape(1), "conv1d_dw src width");
-    push_constants.src_h = 1;
-    push_constants.knl_w = checked_u32_size(kernel, "conv1d_dw kernel width");
-    push_constants.knl_h = 1;
-    push_constants.stride_x = kernel_strides[0];
-    push_constants.stride_y = 1;
-    push_constants.pad_x = 0;
-    push_constants.pad_y = 0;
-    push_constants.dilation_x = kernel_dilation[0];
-    push_constants.dilation_y = 1;
+    // patches: (B, out_len, kernel, C)
+    // Transpose to (B, out_len, C, kernel) then reshape to (B*out_len, C, kernel)
+    // so that each channel's kernel values are contiguous along the last dim
+    auto patches_bc = transpose(patches, {0, 1, 3, 2}, s);
+    patches_bc = reshape(patches_bc, {batch * out_len, in_channels, kernel}, s);
+    auto wt_flat = reshape(wt_work, {in_channels, kernel}, s);
+    auto wt_bc = expand_dims(wt_flat, 0, s); // (1, C, kernel)
 
-    const uint32_t grid_x = div_up_u32(push_constants.ne, 512u);
-    vulkan::record_primitive_for_stream(s, "conv1d_dw.direct");
-    vulkan::begin_primitive_tracking(s, {wt_depthwise, in_work}, {out_work});
-    auto command_buffer = vulkan::begin_command_recording(s.index);
-    vkCmdBindPipeline(
-        command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-    VkDescriptorSet vk_descriptor_set = static_cast<VkDescriptorSet>(descriptor_set);
-    vkCmdBindDescriptorSets(
-        command_buffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline->layout,
-        0,
-        1,
-        &vk_descriptor_set,
-        0,
-        nullptr);
-    vkCmdPushConstants(
-        command_buffer,
-        pipeline->layout,
-        VK_SHADER_STAGE_COMPUTE_BIT,
-        0,
-        sizeof(push_constants),
-        &push_constants);
-    vkCmdDispatch(command_buffer, grid_x, 1, 1);
-    vulkan::end_command_recording(s.index);
-    vulkan::end_primitive_tracking(s, {wt_depthwise, in_work}, {out_work});
-
-    array out_3d(out.shape(), out_work.dtype(), nullptr, {});
-    const auto [data_size, row_contiguous, col_contiguous] =
-        check_contiguity(out.shape(), out.strides());
-    out_3d.copy_shared_buffer(
-        out_work,
-        out.strides(),
-        {data_size == out_work.data_size(), row_contiguous, col_contiguous},
-        out_work.data_size(),
-        out_work.offset());
-    vulkan::retain_array_for_stream(s, in_work);
-    vulkan::retain_array_for_stream(s, wt_depthwise);
-    vulkan::retain_array_for_stream(s, out_work);
-    if (out.dtype() == float32) {
-      out.copy_shared_buffer(out_3d);
-      return true;
-    }
-
-    out.set_data(vulkan::allocator().malloc(out.nbytes()));
-    vulkan::record_primitive_for_stream(s, "conv1d_dw.copy_output");
-    vulkan::begin_primitive_tracking(s, {out_3d}, {out});
-    copy_gpu(out_3d, out, CopyType::General, s);
-    vulkan::end_primitive_tracking(s, {out_3d}, {out});
+    auto elem_mul = multiply(patches_bc, wt_bc, s); // (B*out_len, C, kernel)
+    auto summed = sum(elem_mul, {2}, false, s); // (B*out_len, C)
+    auto result = reshape(summed, {batch, out_len, out_channels}, s);
+    copy_gpu(result, out, CopyType::General, s);
     return true;
   }
 

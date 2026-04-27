@@ -349,6 +349,18 @@ struct SoftmaxPushConstants {
   uint32_t has_sinks;
 };
 
+struct ArgsortPushConstants {
+  uint32_t ncols;
+  uint32_t ncols_padded;
+  uint32_t ncols_padded_log2;
+  uint32_t nrows;
+  uint32_t order;
+  uint32_t outer_start;
+  uint32_t outer_end;
+  uint32_t inner_start;
+  uint32_t inner_end;
+};
+
 struct DiagMaskInfPushConstants {
   uint32_t ncols;
   uint32_t rows_per_channel;
@@ -702,6 +714,13 @@ void dispatch_sum_rows_op(
     float weight = 1.0f);
 
 void dispatch_argmax_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s);
+
+void dispatch_argsort_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,

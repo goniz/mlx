@@ -375,6 +375,7 @@ enum class KernelSpecId {
   FusedAffineMatmul,
   Nvfp4QMatmul,
   LayerNormAffine,
+  Argsort,
 };
 
 struct KernelSpec {
@@ -400,7 +401,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 33> kKernelSpecs = {
+const std::array<KernelSpec, 34> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -533,6 +534,10 @@ const std::array<KernelSpec, 33> kKernelSpecs = {
         {0, 1, 2, 3},
         sizeof(LayerNormAffinePushConstants),
         DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 2},
+        sizeof(ArgsortPushConstants),
+        DispatchGridKind::RowWise),
 };
 
 size_t kernel_spec_index(KernelSpecId id) {
@@ -2440,6 +2445,61 @@ void dispatch_argmax_op(
       s,
       std::nullopt,
       {32u});
+}
+
+void dispatch_argsort_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (in.ndim() == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Argsort requires input rank >= 1.");
+  }
+
+  const uint32_t ncols =
+      checked_u32(in.shape(in.ndim() - 1), "argsort column count");
+  if (ncols > 1024) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Argsort requires ncols <= 1024.");
+  }
+
+  const uint32_t nrows = checked_u32(out.size() / ncols, "argsort row count");
+
+  const uint32_t ncols_padded = 1024u;
+  const uint32_t ncols_padded_log2 = 10u;
+  const uint32_t order = 0u;
+
+  ArgsortPushConstants push_constants{};
+  push_constants.ncols = ncols;
+  push_constants.ncols_padded = ncols_padded;
+  push_constants.ncols_padded_log2 = ncols_padded_log2;
+  push_constants.nrows = nrows;
+  push_constants.order = order;
+  push_constants.outer_start = 0u;
+  push_constants.outer_end = ncols_padded_log2;
+  push_constants.inner_start = 0u;
+  push_constants.inner_end = ncols_padded_log2 + 1u;
+
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst0"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Argsort,
+      bound_arrays,
+      push_constants,
+      nrows,
+      cmd_buffer,
+      s,
+      std::nullopt,
+      {1024u, 10u});
 }
 
 void dispatch_softmax_op(

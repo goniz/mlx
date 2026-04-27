@@ -1475,6 +1475,110 @@ void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
   throw std::runtime_error("[Load::eval_gpu] Not implemented.");
 }
 
+// ArgPartition / ArgSort - implemented using bitonic argsort shader
+void eval_argpartition_or_argsort_gpu(
+    const std::vector<array>& inputs,
+    array& out,
+    int axis,
+    int kth,
+    Stream s) {
+  assert(inputs.size() == 1);
+  array in = inputs[0];
+
+  // Allocate output
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  // Convert non-float32 inputs to float32 for the argsort_f32 shader.
+  // The indices produced by the sort are type-agnostic (just positions).
+  // Complex types are not supported since their ordering is not well-defined.
+  if (issubdtype(in.dtype(), complexfloating)) {
+    throw std::runtime_error(
+        "ArgPartition/ArgSort Vulkan does not support complex inputs.");
+  }
+  if (in.dtype() != float32) {
+    array in_f32(in.shape(), float32, nullptr, {});
+    copy_gpu(in, in_f32, CopyType::General, s);
+    in = in_f32;
+  }
+
+  if (out.dtype() != uint32) {
+    throw std::runtime_error(
+        "ArgPartition/ArgSort output must be uint32.");
+  }
+
+  // Normalize axis
+  axis = normalize_axis(axis, in.ndim());
+
+  // Ensure sort axis is the last dimension
+  array in_kernel = in;
+  if (axis != in.ndim() - 1) {
+    in_kernel = swapaxes_in_eval(in, axis, in.ndim() - 1);
+  }
+
+  // Make input contiguous with row-contiguous layout
+  if (!in_kernel.flags().row_contiguous || in_kernel.offset() != 0 ||
+      !is_supported_unary_layout(in_kernel)) {
+    in_kernel = contiguous_copy_gpu(in_kernel, s);
+  }
+
+  const uint32_t ncols = static_cast<uint32_t>(in_kernel.shape().back());
+  if (ncols > 1024) {
+    throw std::runtime_error(
+        "ArgPartition/ArgSort Vulkan requires sort axis <= 1024 elements.");
+  }
+
+  // Prepare output in kernel layout (same shape as in_kernel, dtype uint32)
+  array kernel_out(in_kernel.shape(), uint32, nullptr, {});
+  const bool staged_output = !kernel_out.flags().row_contiguous ||
+      kernel_out.offset() != 0 || !is_supported_unary_layout(kernel_out);
+  array out_work = staged_output
+      ? array(kernel_out.shape(), kernel_out.dtype(), nullptr, {})
+      : kernel_out;
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu_inplace(out_work, kernel_out, CopyType::Vector, s);
+    }
+    if (axis != in.ndim() - 1) {
+      array restored = swapaxes_in_eval(kernel_out, in.ndim() - 1, axis);
+      copy_gpu(restored, out, CopyType::GeneralGeneral, s);
+    } else {
+      copy_gpu(kernel_out, out, CopyType::GeneralGeneral, s);
+    }
+    return;
+  }
+
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_argsort_op(
+      in_kernel,
+      out_work,
+      vulkan::StaticShaderId::argsort_partition_f32,
+      command_buffer,
+      s);
+  vulkan::end_command_recording(s.index);
+
+  if (staged_output) {
+    copy_gpu_inplace(out_work, kernel_out, CopyType::Vector, s);
+  }
+
+  if (axis != in.ndim() - 1) {
+    array restored = swapaxes_in_eval(kernel_out, in.ndim() - 1, axis);
+    copy_gpu(restored, out, CopyType::GeneralGeneral, s);
+  } else {
+    copy_gpu(kernel_out, out, CopyType::GeneralGeneral, s);
+  }
+}
+
+void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto [kth, axis] = state();
+  eval_argpartition_or_argsort_gpu(inputs, out, axis, kth, stream());
+}
+
+void ArgSort::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval_argpartition_or_argsort_gpu(inputs, out, axis_, 0, stream());
+}
+
 // CPU fallbacks for primitives not implemented on Vulkan
 NYI_OP(ArcCos)
 NYI_OP(ArcCosh)
@@ -1483,8 +1587,6 @@ NYI_OP(ArcSinh)
 NYI_OP(ArcTan)
 NYI_OP(ArcTan2)
 NYI_OP(ArcTanh)
-NYI_OP_STATE(ArgPartition)
-NYI_OP_STATE(ArgSort)
 NYI_OP(BitwiseInvert)
 NYI_OP(Conjugate)
 NYI_OP(Cosh)

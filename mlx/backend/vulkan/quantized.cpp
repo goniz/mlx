@@ -79,8 +79,6 @@ std::optional<vulkan::StaticShaderId> fused_affine_qmm_shader_id(
       return vulkan::StaticShaderId::fused_affine_qmm_f32_f32;
     case float16:
       return vulkan::StaticShaderId::fused_affine_qmm_f16_f32;
-    case bfloat16:
-      return vulkan::StaticShaderId::fused_affine_matmul_bf16_f32;
     default:
       return std::nullopt;
   }
@@ -444,13 +442,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   const uint32_t qmm_rows = x_mat.ndim() == 2
       ? static_cast<uint32_t>(x_mat.shape(-2))
       : 0u;
-  if (x_mat.dtype() == bfloat16) {
-    x_mat = ensure_float32_row_contiguous(x_mat, s);
-  }
-  auto fused_shader = qmm_rows > 1 && fused_affine_qmm_prefill_enabled()
-      ? fused_affine_qmm_shader_id(x_mat.dtype())
-      : (bits_ == 8 ? fused_affine_matvec8_shader_id(x_mat.dtype())
-                    : fused_affine_matvec_shader_id(x_mat.dtype()));
+
   const bool enable_fused_decode_qmm = []() {
     if (const char* env = std::getenv("MLX_VULKAN_FUSED_AFFINE_QMM");
         env != nullptr) {
@@ -458,6 +450,97 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
     return true;
   }();
+
+  if (enable_fused_decode_qmm && transpose_ && bits_ == 8 &&
+      x_mat.dtype() == bfloat16 && out.dtype() == bfloat16 &&
+      inputs[2].dtype() == bfloat16 && inputs[3].dtype() == bfloat16 &&
+      x_mat.ndim() == 2 && w.ndim() == 2) {
+    array scales_bf16 = ensure_row_contiguous_zero_offset(inputs[2], s);
+    array biases_bf16 = ensure_row_contiguous_zero_offset(inputs[3], s);
+    if (scales_bf16.ndim() == 2 && biases_bf16.ndim() == 2 &&
+        is_row_contiguous_zero_offset(x_mat) &&
+        is_row_contiguous_zero_offset(w) &&
+        is_row_contiguous_zero_offset(scales_bf16) &&
+        is_row_contiguous_zero_offset(biases_bf16)) {
+      const uint32_t rows = static_cast<uint32_t>(x_mat.shape(-2));
+      const uint32_t cols = static_cast<uint32_t>(w.shape(-2));
+      const uint32_t k = static_cast<uint32_t>(x_mat.shape(-1));
+      const uint32_t num_groups = static_cast<uint32_t>(scales_bf16.shape(-1));
+      if (cols == static_cast<uint32_t>(out.shape(-1)) &&
+          num_groups ==
+              static_cast<uint32_t>((k + group_size_ - 1) / group_size_)) {
+        array out_work(
+            (vector_lhs || flatten_lhs_batches)
+                ? Shape{static_cast<int>(rows), out.shape(-1)}
+                : out.shape(),
+            bfloat16,
+            nullptr,
+            {});
+        out_work.set_data(allocator::malloc(out_work.nbytes()));
+        if (out_work.size() != 0) {
+          vulkan::FusedAffineMatmulPushConstants push_constants{};
+          push_constants.rows = rows;
+          push_constants.cols = cols;
+          push_constants.K = k;
+          push_constants.packed_row_bytes =
+              static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
+          push_constants.x_row_stride = static_cast<uint32_t>(x_mat.strides(-2));
+          push_constants.out_row_stride =
+              static_cast<uint32_t>(out_work.strides(-2));
+          push_constants.scale_row_stride =
+              static_cast<uint32_t>(scales_bf16.strides(-2));
+          push_constants.bias_row_stride =
+              static_cast<uint32_t>(biases_bf16.strides(-2));
+          push_constants.bits = static_cast<uint32_t>(bits_);
+          push_constants.group_size = static_cast<uint32_t>(group_size_);
+          push_constants.num_groups = num_groups;
+
+          auto command_buffer = vulkan::begin_command_recording(s.index);
+          vulkan::dispatch_fused_affine_matmul_op(
+              w,
+              scales_bf16,
+              biases_bf16,
+              x_mat,
+              out_work,
+              vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16,
+              command_buffer,
+              s,
+              push_constants,
+              {(cols + 15u) / 16u, (rows + 15u) / 16u, 1u});
+          vulkan::end_command_recording(s.index);
+        }
+
+        if (vector_lhs || flatten_lhs_batches) {
+          array::Flags flags = out.flags();
+          flags.contiguous = true;
+          flags.row_contiguous = true;
+          if (vector_lhs) {
+            flags.col_contiguous = true;
+          } else {
+            auto max_dim =
+                std::max_element(out.shape().begin(), out.shape().end());
+            flags.col_contiguous = out.size() <= 1 || out.size() == *max_dim;
+          }
+          out.copy_shared_buffer(
+              out_work, make_contiguous_strides(out.shape()), flags, out.size());
+          out.detach();
+          out.set_status(array::Status::evaluated);
+          return;
+        }
+
+        out.copy_shared_buffer(out_work);
+        return;
+      }
+    }
+  }
+
+  if (x_mat.dtype() == bfloat16) {
+    x_mat = ensure_float32_row_contiguous(x_mat, s);
+  }
+  auto fused_shader = qmm_rows > 1 && fused_affine_qmm_prefill_enabled()
+      ? fused_affine_qmm_shader_id(x_mat.dtype())
+      : (bits_ == 8 ? fused_affine_matvec8_shader_id(x_mat.dtype())
+                    : fused_affine_matvec_shader_id(x_mat.dtype()));
   const Dtype out_work_dtype = float32;
 
   array out_work(

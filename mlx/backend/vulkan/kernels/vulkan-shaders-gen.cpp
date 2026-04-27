@@ -1866,6 +1866,10 @@ void process_shaders() {
        {"B_TYPE", "uint16_t"},
        {"TO_FLOAT_TYPE", "bf16_to_fp32"},
        {"D_TYPE", "float"}});
+  string_to_spv(
+      "fused_affine_qmm_bf16_bf16",
+      "mul_mm_affine_bf16_acc.comp",
+      {});
 
   string_to_spv(
       "fused_affine_matvec8_f32_f32",

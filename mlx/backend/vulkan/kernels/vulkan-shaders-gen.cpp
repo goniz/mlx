@@ -1891,6 +1891,14 @@ void process_shaders() {
       "fused_affine_qmm_f16_f32",
       "mul_mm_affine_tiled.comp",
       {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}});
+  string_to_spv(
+      "gather_affine_qmm_f32_f32",
+      "gather_mm_affine.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "gather_affine_qmm_f16_f32",
+      "gather_mm_affine.comp",
+      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}});
 
   string_to_spv(
       "mul_f32",

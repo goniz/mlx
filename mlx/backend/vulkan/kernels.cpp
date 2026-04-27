@@ -373,6 +373,7 @@ enum class KernelSpecId {
   Nvfp4Dequant,
   Nvfp4Quant,
   FusedAffineMatmul,
+  GatherAffineMatmul,
   Nvfp4QMatmul,
   LayerNormAffine,
   Argsort,
@@ -401,7 +402,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 34> kKernelSpecs = {
+const std::array<KernelSpec, 35> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -525,6 +526,10 @@ const std::array<KernelSpec, 34> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4},
         sizeof(FusedAffineMatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 5, 6},
+        sizeof(GatherAffineMatmulPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1, 2, 3, 4, 5},
@@ -3718,6 +3723,44 @@ void dispatch_fused_affine_matmul_op(
       bound_arrays,
       push_constants,
       num_elements,
+      cmd_buffer,
+      s,
+      grid,
+      matmul_specialization_constants({}));
+}
+
+void dispatch_gather_affine_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& x,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const GatherAffineMatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 7> bound_arrays = {{
+      {&w, "W"},
+      {&scales, "SCALES"},
+      {&biases, "BIASES"},
+      {&x, "X"},
+      {&lhs_indices, "LHS_INDICES"},
+      {&rhs_indices, "RHS_INDICES"},
+      {&out, "OUT"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GatherAffineMatmul,
+      bound_arrays,
+      push_constants,
+      checked_mul_u32(
+          checked_mul_u32(
+              push_constants.rows, push_constants.cols, "gather qmm matrix"),
+          grid[2],
+          "gather qmm elements"),
       cmd_buffer,
       s,
       grid,

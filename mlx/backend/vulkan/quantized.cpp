@@ -43,8 +43,6 @@ std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
       return vulkan::StaticShaderId::fused_affine_matmul_f32_f32;
     case float16:
       return vulkan::StaticShaderId::fused_affine_matmul_f16_f32;
-    case bfloat16:
-      return vulkan::StaticShaderId::fused_affine_matmul_bf16_f32;
     default:
       return std::nullopt;
   }
@@ -79,6 +77,22 @@ std::optional<vulkan::StaticShaderId> fused_affine_qmm_shader_id(
   switch (x_dtype) {
     case float32:
       return vulkan::StaticShaderId::fused_affine_qmm_f32_f32;
+    case float16:
+      return vulkan::StaticShaderId::fused_affine_qmm_f16_f32;
+    case bfloat16:
+      return vulkan::StaticShaderId::fused_affine_matmul_bf16_f32;
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<vulkan::StaticShaderId> gather_affine_qmm_shader_id(
+    Dtype x_dtype) {
+  switch (x_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::gather_affine_qmm_f32_f32;
+    case float16:
+      return vulkan::StaticShaderId::gather_affine_qmm_f16_f32;
     default:
       return std::nullopt;
   }
@@ -427,13 +441,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         x, make_contiguous_strides(flat_shape), x.flags(), x.size());
   }
 
-  if (x_mat.dtype() == bfloat16) {
-    x_mat = ensure_float32_row_contiguous(x_mat, s);
-  }
-
   const uint32_t qmm_rows = x_mat.ndim() == 2
       ? static_cast<uint32_t>(x_mat.shape(-2))
       : 0u;
+  if (x_mat.dtype() == bfloat16) {
+    x_mat = ensure_float32_row_contiguous(x_mat, s);
+  }
   auto fused_shader = qmm_rows > 1 && fused_affine_qmm_prefill_enabled()
       ? fused_affine_qmm_shader_id(x_mat.dtype())
       : (bits_ == 8 ? fused_affine_matvec8_shader_id(x_mat.dtype())
@@ -697,6 +710,128 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
   eval(result);
   out.copy_shared_buffer(result);
+}
+
+void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (mode_ != QuantizationMode::Affine) {
+    throw std::runtime_error(
+        "[GatherQMM::eval_gpu] Only affine mode is implemented on Vulkan.");
+  }
+  if (!transpose_) {
+    throw std::runtime_error(
+        "[GatherQMM::eval_gpu] Only transposed weights are implemented on Vulkan.");
+  }
+  if (!is_supported_quantized_bits(bits_)) {
+    throw std::runtime_error(
+        "[GatherQMM::eval_gpu] Unsupported quantization bits on Vulkan.");
+  }
+
+  if (!is_supported_quantized_output_dtype(inputs[0].dtype()) ||
+      !is_supported_quantized_output_dtype(out.dtype())) {
+    throw std::runtime_error(
+        "[GatherQMM::eval_gpu] Only float16, bfloat16, and float32 are supported.");
+  }
+
+  auto& s = stream();
+  array x = ensure_row_contiguous_zero_offset(inputs[0], s);
+  if (x.dtype() == bfloat16) {
+    x = ensure_float32_row_contiguous(x, s);
+  }
+  array w = ensure_row_contiguous_zero_offset(inputs[1], s);
+  array scales = ensure_float32_row_contiguous(inputs[2], s);
+  array biases = ensure_float32_row_contiguous(inputs[3], s);
+  array lhs_indices = ensure_row_contiguous_zero_offset(inputs[inputs.size() - 2], s);
+  array rhs_indices = ensure_row_contiguous_zero_offset(inputs[inputs.size() - 1], s);
+
+  if (x.ndim() < 3 || w.ndim() != 3 || scales.ndim() != 3 ||
+      biases.ndim() != 3 || lhs_indices.shape() != rhs_indices.shape() ||
+      out.ndim() != lhs_indices.ndim() + 2) {
+    std::ostringstream msg;
+    msg << "[GatherQMM::eval_gpu] Expected rank-compatible x/w/scales/biases, "
+        << "matching indices, and output rank indices+2 but got x=" << x.shape()
+        << " w=" << w.shape() << " scales=" << scales.shape()
+        << " biases=" << biases.shape() << " lhs_indices="
+        << lhs_indices.shape() << " rhs_indices=" << rhs_indices.shape()
+        << " out=" << out.shape() << ".";
+    throw std::runtime_error(msg.str());
+  }
+  if (lhs_indices.dtype() != uint32 || rhs_indices.dtype() != uint32) {
+    throw std::runtime_error(
+        "[GatherQMM::eval_gpu] Expected uint32 gather indices.");
+  }
+
+  const auto shader_id = gather_affine_qmm_shader_id(x.dtype());
+  if (!shader_id.has_value()) {
+    throw std::runtime_error(
+        "[GatherQMM::eval_gpu] Unsupported activation dtype for Vulkan gather qmm.");
+  }
+
+  const uint32_t batches = static_cast<uint32_t>(lhs_indices.size());
+  const uint32_t rows = static_cast<uint32_t>(out.shape(-2));
+  const uint32_t cols = static_cast<uint32_t>(out.shape(-1));
+  const uint32_t k = static_cast<uint32_t>(x.shape(-1));
+  const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
+  if (rows != static_cast<uint32_t>(x.shape(-2)) ||
+      cols != static_cast<uint32_t>(w.shape(-2)) ||
+      static_cast<uint32_t>(w.shape(-1) * 32 / bits_) != k ||
+      num_groups != static_cast<uint32_t>((k + group_size_ - 1) / group_size_) ||
+      x.size() / (x.shape(-2) * x.shape(-1)) <= 0) {
+    throw std::runtime_error(
+        "[GatherQMM::eval_gpu] Incompatible gather qmm shapes.");
+  }
+
+  const auto x_batch_count = x.size() / (x.shape(-2) * x.shape(-1));
+  if (x_batch_count <= 0) {
+    throw std::runtime_error("[GatherQMM::eval_gpu] Invalid x batch count.");
+  }
+
+  array out_work(out.shape(), float32, nullptr, {});
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  if (out_work.size() != 0) {
+    vulkan::GatherAffineMatmulPushConstants push_constants{};
+    push_constants.rows = rows;
+    push_constants.cols = cols;
+    push_constants.K = k;
+    push_constants.packed_row_bytes =
+        static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
+    push_constants.x_batch_stride =
+        static_cast<uint32_t>(x.shape(-2) * x.shape(-1));
+    push_constants.x_row_stride = static_cast<uint32_t>(x.strides(-2));
+    push_constants.out_batch_stride = rows * cols;
+    push_constants.out_row_stride = static_cast<uint32_t>(out_work.strides(-2));
+    push_constants.scale_matrix_stride = static_cast<uint32_t>(scales.strides(0));
+    push_constants.scale_row_stride = static_cast<uint32_t>(scales.strides(-2));
+    push_constants.bias_matrix_stride = static_cast<uint32_t>(biases.strides(0));
+    push_constants.bias_row_stride = static_cast<uint32_t>(biases.strides(-2));
+    push_constants.w_matrix_stride_bytes =
+        static_cast<uint32_t>(w.strides(0) * sizeof(uint32_t));
+    push_constants.bits = static_cast<uint32_t>(bits_);
+    push_constants.group_size = static_cast<uint32_t>(group_size_);
+    push_constants.num_groups = num_groups;
+
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_gather_affine_matmul_op(
+        w,
+        scales,
+        biases,
+        x,
+        lhs_indices,
+        rhs_indices,
+        out_work,
+        *shader_id,
+        command_buffer,
+        s,
+        push_constants,
+        {(cols + 15u) / 16u, (rows + 15u) / 16u, batches});
+    vulkan::end_command_recording(s.index);
+  }
+
+  if (out.dtype() == float32) {
+    out.copy_shared_buffer(out_work);
+    return;
+  }
+  out.set_data(allocator::malloc(out.nbytes()));
+  copy_gpu(out_work, out, CopyType::General, s);
 }
 
 } // namespace mlx::core

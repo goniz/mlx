@@ -594,6 +594,25 @@ struct FusedAffineMatmulPushConstants {
   uint32_t num_groups;
 };
 
+struct GatherAffineMatmulPushConstants {
+  uint32_t rows;
+  uint32_t cols;
+  uint32_t K;
+  uint32_t packed_row_bytes;
+  uint32_t x_batch_stride;
+  uint32_t x_row_stride;
+  uint32_t out_batch_stride;
+  uint32_t out_row_stride;
+  uint32_t scale_matrix_stride;
+  uint32_t scale_row_stride;
+  uint32_t bias_matrix_stride;
+  uint32_t bias_row_stride;
+  uint32_t w_matrix_stride_bytes;
+  uint32_t bits;
+  uint32_t group_size;
+  uint32_t num_groups;
+};
+
 struct Nvfp4QMatmulPushConstants {
   uint32_t rows;
   uint32_t cols;
@@ -1022,6 +1041,20 @@ void dispatch_fused_affine_matmul_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const FusedAffineMatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
+
+void dispatch_gather_affine_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& x,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const GatherAffineMatmulPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);
 
 void dispatch_nvfp4_qmatmul_op(

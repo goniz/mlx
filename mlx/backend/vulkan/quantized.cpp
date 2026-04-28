@@ -85,7 +85,11 @@ std::optional<vulkan::StaticShaderId> fused_affine_qmm_shader_id(
 }
 
 std::optional<vulkan::StaticShaderId> gather_affine_qmm_shader_id(
-    Dtype x_dtype) {
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return vulkan::StaticShaderId::gather_affine_qmm_bf16_bf16;
+  }
   switch (x_dtype) {
     case float32:
       return vulkan::StaticShaderId::gather_affine_qmm_f32_f32;
@@ -817,12 +821,16 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto& s = stream();
   array x = ensure_row_contiguous_zero_offset(inputs[0], s);
-  if (x.dtype() == bfloat16) {
+  const bool native_bf16 = x.dtype() == bfloat16 && out.dtype() == bfloat16 &&
+      inputs[2].dtype() == bfloat16 && inputs[3].dtype() == bfloat16;
+  if (x.dtype() == bfloat16 && !native_bf16) {
     x = ensure_float32_row_contiguous(x, s);
   }
   array w = ensure_row_contiguous_zero_offset(inputs[1], s);
-  array scales = ensure_float32_row_contiguous(inputs[2], s);
-  array biases = ensure_float32_row_contiguous(inputs[3], s);
+  array scales = native_bf16 ? ensure_row_contiguous_zero_offset(inputs[2], s)
+                             : ensure_float32_row_contiguous(inputs[2], s);
+  array biases = native_bf16 ? ensure_row_contiguous_zero_offset(inputs[3], s)
+                             : ensure_float32_row_contiguous(inputs[3], s);
   array lhs_indices = ensure_row_contiguous_zero_offset(inputs[inputs.size() - 2], s);
   array rhs_indices = ensure_row_contiguous_zero_offset(inputs[inputs.size() - 1], s);
 
@@ -843,7 +851,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         "[GatherQMM::eval_gpu] Expected uint32 gather indices.");
   }
 
-  const auto shader_id = gather_affine_qmm_shader_id(x.dtype());
+  const auto shader_id = gather_affine_qmm_shader_id(x.dtype(), out.dtype());
   if (!shader_id.has_value()) {
     throw std::runtime_error(
         "[GatherQMM::eval_gpu] Unsupported activation dtype for Vulkan gather qmm.");
@@ -868,7 +876,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     throw std::runtime_error("[GatherQMM::eval_gpu] Invalid x batch count.");
   }
 
-  array out_work(out.shape(), float32, nullptr, {});
+  array out_work(out.shape(), native_bf16 ? bfloat16 : float32, nullptr, {});
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (out_work.size() != 0) {
     vulkan::GatherAffineMatmulPushConstants push_constants{};
@@ -909,7 +917,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     vulkan::end_command_recording(s.index);
   }
 
-  if (out.dtype() == float32) {
+  if (out.dtype() == out_work.dtype()) {
     out.copy_shared_buffer(out_work);
     return;
   }

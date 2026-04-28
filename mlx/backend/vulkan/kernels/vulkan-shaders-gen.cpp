@@ -1981,6 +1981,23 @@ void process_shaders() {
        {"TO_FLOAT_TYPE", "bf16_to_fp32"},
        {"SCALE_TO_FLOAT_TYPE(x)", "bf16_to_fp32(uint(x))"},
        {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
+  string_to_spv(
+      "gather_affine_matvec8_smallk_f32_f32",
+      "gather_mv_affine8_smallk.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "gather_affine_matvec8_smallk_f16_f32",
+      "gather_mv_affine8_smallk.comp",
+      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "gather_affine_matvec8_smallk_bf16_bf16",
+      "gather_mv_affine8_smallk.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"S_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"SCALE_TO_FLOAT_TYPE(x)", "bf16_to_fp32(uint(x))"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
 
   string_to_spv(
       "mul_f32",

@@ -116,6 +116,22 @@ std::optional<vulkan::StaticShaderId> gather_affine_matvec8_shader_id(
   }
 }
 
+std::optional<vulkan::StaticShaderId> gather_affine_matvec8_smallk_shader_id(
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return vulkan::StaticShaderId::gather_affine_matvec8_smallk_bf16_bf16;
+  }
+  switch (x_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::gather_affine_matvec8_smallk_f32_f32;
+    case float16:
+      return vulkan::StaticShaderId::gather_affine_matvec8_smallk_f16_f32;
+    default:
+      return std::nullopt;
+  }
+}
+
 bool fused_affine_qmm_prefill_enabled() {
   static const bool enabled = []() {
     if (const char* env = std::getenv("MLX_VULKAN_AFFINE_QMM");
@@ -130,6 +146,17 @@ bool fused_affine_qmm_prefill_enabled() {
 bool gather_affine_matvec8_enabled() {
   static const bool enabled = []() {
     if (const char* env = std::getenv("MLX_VULKAN_GATHER_MATVEC8");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
+bool gather_affine_matvec8_smallk_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_GATHER_MATVEC8_SMALLK");
         env != nullptr) {
       return std::string_view(env) != "0";
     }
@@ -907,8 +934,12 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
 
   const bool gather_decode_rows = rows <= 8;
-  auto matvec8_shader =
-      (bits_ == 8 && gather_decode_rows && gather_affine_matvec8_enabled())
+  const bool use_smallk_matvec8 = bits_ == 8 && gather_decode_rows &&
+      k <= 512 && gather_affine_matvec8_enabled() &&
+      gather_affine_matvec8_smallk_enabled();
+  auto matvec8_shader = use_smallk_matvec8
+      ? gather_affine_matvec8_smallk_shader_id(x.dtype(), out.dtype())
+      : (bits_ == 8 && gather_decode_rows && gather_affine_matvec8_enabled())
       ? gather_affine_matvec8_shader_id(x.dtype(), out.dtype())
       : std::optional<vulkan::StaticShaderId>{};
   const auto shader_id = matvec8_shader.has_value()

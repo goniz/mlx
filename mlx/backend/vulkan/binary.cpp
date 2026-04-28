@@ -239,10 +239,10 @@ bool try_eval_binary_op_vulkan(
     return false;
   }
 
-  if (!is_supported_elementwise_layout(a)) {
+  if (!is_supported_elementwise_layout(a) && !is_supported_unary_layout(a)) {
     a = contiguous_copy_gpu(a, s);
   }
-  if (!is_supported_elementwise_layout(b)) {
+  if (!is_supported_elementwise_layout(b) && !is_supported_unary_layout(b)) {
     b = contiguous_copy_gpu(b, s);
   }
   a = collapse_binary_leading_dims(a, s);
@@ -269,8 +269,8 @@ bool try_eval_binary_op_vulkan(
     set_binary_op_output_data(a, b, out_work, bopt);
   }
   array out_kernel = collapse_binary_leading_dims(out_work, s);
-  if (!is_supported_elementwise_layout(a) ||
-      !is_supported_elementwise_layout(b) ||
+  if ((!is_supported_elementwise_layout(a) && !is_supported_unary_layout(a)) ||
+      (!is_supported_elementwise_layout(b) && !is_supported_unary_layout(b)) ||
       !is_supported_elementwise_layout(out_kernel)) {
     trace_binary_unsupported("unsupported_elementwise_layout", a, b);
     return false;

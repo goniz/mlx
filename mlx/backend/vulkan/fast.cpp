@@ -94,6 +94,19 @@ void trace_flash_attention_array(const char* label, const array& arr) {
   trace_flash_attention_debug(oss.str());
 }
 
+std::optional<vulkan::StaticShaderId> rms_norm_shader_id(Dtype dtype) {
+  switch (dtype) {
+    case float32:
+      return vulkan::StaticShaderId::rms_norm_f32;
+    case float16:
+      return vulkan::StaticShaderId::rms_norm_f16;
+    case bfloat16:
+      return vulkan::StaticShaderId::rms_norm_bf16;
+    default:
+      return std::nullopt;
+  }
+}
+
 void begin_tracked_manual_op(
     Stream s,
     const char* name,
@@ -1526,8 +1539,14 @@ bool try_eval_rms_norm_vulkan(
     return false;
   }
 
-  const bool use_f32_staging_io =
-      x.dtype() != float32 || w.dtype() != float32 || out.dtype() != float32;
+  const bool native_lowp_2048 = x.shape(-1) == 2048 &&
+      (x.dtype() == float16 || x.dtype() == bfloat16) && x.dtype() == w.dtype() &&
+      x.dtype() == out.dtype();
+  auto shader_id = (x.dtype() == float32 && w.dtype() == float32 &&
+                    out.dtype() == float32) || native_lowp_2048
+      ? rms_norm_shader_id(x.dtype())
+      : std::nullopt;
+  const bool use_f32_staging_io = !shader_id.has_value();
   if (use_f32_staging_io) {
     array x_f32(x.shape(), float32, nullptr, {});
     array w_f32(w.shape(), float32, nullptr, {});
@@ -1535,6 +1554,7 @@ bool try_eval_rms_norm_vulkan(
     copy_gpu(w, w_f32, CopyType::General, s);
     x = x_f32;
     w = w_f32;
+    shader_id = vulkan::StaticShaderId::rms_norm_f32;
   }
 
   if (w.ndim() > 4) {
@@ -1561,7 +1581,7 @@ bool try_eval_rms_norm_vulkan(
   const bool staged_output = use_f32_staging_io || !out.flags().contiguous ||
       out.offset() != 0 || out.strides().back() != 1;
   array out_work =
-      staged_output ? array(out.shape(), float32, nullptr, {}) : out;
+      staged_output ? array(out.shape(), x.dtype(), nullptr, {}) : out;
   set_unary_output_data(x, out_work);
   if (!out_work.flags().contiguous || out_work.offset() != 0 ||
       out_work.strides().back() != 1 || !is_supported_unary_layout(out_work)) {
@@ -1599,7 +1619,7 @@ bool try_eval_rms_norm_vulkan(
         x,
         w,
         out_work,
-        vulkan::StaticShaderId::rms_norm_f32,
+        *shader_id,
         command_buffer,
         s,
         vulkan::BinaryDispatchVariant::Standard,

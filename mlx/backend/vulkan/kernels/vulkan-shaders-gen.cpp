@@ -1389,6 +1389,26 @@ void process_shaders() {
           base_dict,
           {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv(
+      "rms_norm_f16",
+      "rms_norm.comp",
+      merge_maps(
+          base_dict,
+          {{"FLOAT16", "1"},
+           {"A_TYPE", "float16_t"},
+           {"B_TYPE", "float16_t"},
+           {"D_TYPE", "float16_t"}}));
+  string_to_spv(
+      "rms_norm_bf16",
+      "rms_norm.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"B_TYPE", "uint16_t"},
+           {"D_TYPE", "uint16_t"},
+           {"LOAD_A(x)", "FLOAT_TYPE(bf16_to_fp32(uint(x)))"},
+           {"LOAD_B(x)", "FLOAT_TYPE(bf16_to_fp32(uint(x)))"},
+           {"STORE_D(x)", "uint16_t(fp32_to_bf16(float(x)))"}}));
+  string_to_spv(
       "rms_norm_partials_f32",
       "rms_norm_partials.comp",
       merge_maps(

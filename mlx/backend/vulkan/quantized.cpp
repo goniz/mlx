@@ -165,6 +165,17 @@ bool gather_affine_matvec8_smallk_enabled() {
   return enabled;
 }
 
+bool fused_affine_bf16_tiled_prefill_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_AFFINE_BF16_TILED_PREFILL");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
 bool is_row_contiguous_zero_offset(const array& arr) {
   if (arr.ndim() == 0) {
     return arr.offset() == 0;
@@ -569,6 +580,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.group_size = static_cast<uint32_t>(group_size_);
           push_constants.num_groups = num_groups;
 
+          const auto shader_id =
+              rows > 1 && fused_affine_bf16_tiled_prefill_enabled()
+              ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
+              : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16;
+          const std::array<uint32_t, 3> grid = shader_id ==
+                  vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
+              ? std::array<uint32_t, 3>{
+                    (cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
+              : std::array<uint32_t, 3>{
+                    (cols + 15u) / 16u, (rows + 15u) / 16u, 1u};
+
           auto command_buffer = vulkan::begin_command_recording(s.index);
           vulkan::dispatch_fused_affine_matmul_op(
               w,
@@ -576,11 +598,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
               biases_bf16,
               x_mat,
               out_work,
-              vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16,
+              shader_id,
               command_buffer,
               s,
               push_constants,
-              {(cols + 15u) / 16u, (rows + 15u) / 16u, 1u});
+              grid);
           vulkan::end_command_recording(s.index);
         }
 

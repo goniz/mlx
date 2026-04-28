@@ -1921,6 +1921,10 @@ void process_shaders() {
        {"D_TYPE", "float"}});
   string_to_spv(
       "fused_affine_qmm_bf16_bf16", "mul_mm_affine_bf16_acc.comp", {});
+  string_to_spv(
+      "fused_affine_qmm_bf16_bf16_tiled",
+      "mul_mm_affine_bf16_tiled.comp",
+      {});
 
   string_to_spv(
       "fused_affine_matvec8_f32_f32",

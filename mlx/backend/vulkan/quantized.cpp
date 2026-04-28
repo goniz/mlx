@@ -100,9 +100,36 @@ std::optional<vulkan::StaticShaderId> gather_affine_qmm_shader_id(
   }
 }
 
+std::optional<vulkan::StaticShaderId> gather_affine_matvec8_shader_id(
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return vulkan::StaticShaderId::gather_affine_matvec8_bf16_bf16;
+  }
+  switch (x_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::gather_affine_matvec8_f32_f32;
+    case float16:
+      return vulkan::StaticShaderId::gather_affine_matvec8_f16_f32;
+    default:
+      return std::nullopt;
+  }
+}
+
 bool fused_affine_qmm_prefill_enabled() {
   static const bool enabled = []() {
     if (const char* env = std::getenv("MLX_VULKAN_AFFINE_QMM");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
+bool gather_affine_matvec8_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_GATHER_MATVEC8");
         env != nullptr) {
       return std::string_view(env) != "0";
     }
@@ -873,17 +900,26 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         "[GatherQMM::eval_gpu] Expected uint32 gather indices.");
   }
 
-  const auto shader_id = gather_affine_qmm_shader_id(x.dtype(), out.dtype());
-  if (!shader_id.has_value()) {
-    throw std::runtime_error(
-        "[GatherQMM::eval_gpu] Unsupported activation dtype for Vulkan gather qmm.");
-  }
-
   const uint32_t batches = static_cast<uint32_t>(lhs_indices.size());
   const uint32_t rows = static_cast<uint32_t>(out.shape(-2));
   const uint32_t cols = static_cast<uint32_t>(out.shape(-1));
   const uint32_t k = static_cast<uint32_t>(x.shape(-1));
   const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
+
+  const bool gather_decode_rows = rows <= 8;
+  auto matvec8_shader =
+      (bits_ == 8 && gather_decode_rows && gather_affine_matvec8_enabled())
+      ? gather_affine_matvec8_shader_id(x.dtype(), out.dtype())
+      : std::optional<vulkan::StaticShaderId>{};
+  const auto shader_id = matvec8_shader.has_value()
+      ? matvec8_shader
+      : gather_affine_qmm_shader_id(x.dtype(), out.dtype());
+  if (!shader_id.has_value()) {
+    std::string mode = matvec8_shader.has_value() ? "matvec8" : "qmm";
+    throw std::runtime_error(
+        "[GatherQMM::eval_gpu] Unsupported activation dtype for Vulkan gather " +
+        mode + ".");
+  }
   if (rows != static_cast<uint32_t>(x.shape(-2)) ||
       cols != static_cast<uint32_t>(w.shape(-2)) ||
       static_cast<uint32_t>(w.shape(-1) * 32 / bits_) != k ||
@@ -935,7 +971,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         command_buffer,
         s,
         push_constants,
-        {(cols + 15u) / 16u, (rows + 15u) / 16u, batches});
+        matvec8_shader.has_value()
+            ? std::array<uint32_t, 3>{cols, rows, batches}
+            : std::array<uint32_t, 3>{
+                  (cols + 15u) / 16u, (rows + 15u) / 16u, batches});
     vulkan::end_command_recording(s.index);
   }
 

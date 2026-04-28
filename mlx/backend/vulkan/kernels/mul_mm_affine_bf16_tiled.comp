@@ -46,16 +46,8 @@ const uint TN = 2u;
 
 shared float xs[BM][BK];
 shared float ws[BN][BK];
-
-float dequant_w(const uint col, const uint k) {
-    const uint group = k / p.group_size;
-    const uint row_base = col * p.packed_row_bytes;
-    const uint scale_base = col * p.scale_row_stride;
-    const uint bias_base = col * p.bias_row_stride;
-    return bf16_to_fp32(uint(data_scales[scale_base + group])) *
-        float(data_w[row_base + k]) +
-        bf16_to_fp32(uint(data_biases[bias_base + group]));
-}
+shared float tile_scales[BN];
+shared float tile_biases[BN];
 
 void main() {
     const uint lx = gl_LocalInvocationID.x;
@@ -73,6 +65,21 @@ void main() {
 
     const uint thread_count = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
     for (uint kb = 0u; kb < p.K; kb += BK) {
+        if (linear < BN) {
+            const uint src_col = gl_WorkGroupID.x * BN + linear;
+            const uint group = kb / p.group_size;
+            if (src_col < p.cols) {
+                const uint scale_base = src_col * p.scale_row_stride;
+                const uint bias_base = src_col * p.bias_row_stride;
+                tile_scales[linear] = bf16_to_fp32(uint(data_scales[scale_base + group]));
+                tile_biases[linear] = bf16_to_fp32(uint(data_biases[bias_base + group]));
+            } else {
+                tile_scales[linear] = 0.0f;
+                tile_biases[linear] = 0.0f;
+            }
+        }
+        barrier();
+
         for (uint i = linear; i < BM * BK; i += thread_count) {
             const uint r = i / BK;
             const uint kk = i - r * BK;
@@ -88,7 +95,7 @@ void main() {
             const uint src_col = gl_WorkGroupID.x * BN + c;
             const uint src_k = kb + kk;
             ws[c][kk] = (src_col < p.cols && src_k < p.K)
-                ? dequant_w(src_col, src_k)
+                ? tile_scales[c] * float(data_w[src_col * p.packed_row_bytes + src_k]) + tile_biases[c]
                 : 0.0f;
         }
         barrier();

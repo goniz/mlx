@@ -580,8 +580,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.group_size = static_cast<uint32_t>(group_size_);
           push_constants.num_groups = num_groups;
 
-          const auto shader_id =
-              rows > 1 && fused_affine_bf16_tiled_prefill_enabled()
+          const bool use_tiled_prefill = rows > 1 &&
+              group_size_ >= 32 && (group_size_ % 32) == 0 &&
+              fused_affine_bf16_tiled_prefill_enabled();
+          const auto shader_id = use_tiled_prefill
               ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
               : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16;
           const std::array<uint32_t, 3> grid = shader_id ==

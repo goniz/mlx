@@ -22,7 +22,22 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03);
 
-        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) - FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+#if defined(DATA_A_BF16)
+        float a = bf16_to_fp32(uint(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]));
+#else
+        FLOAT_TYPE a = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]);
+#endif
+#if defined(DATA_B_BF16)
+        float b = bf16_to_fp32(uint(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+#else
+        FLOAT_TYPE b = FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
+#endif
+        const FLOAT_TYPE v = FLOAT_TYPE(a) - FLOAT_TYPE(b);
+#if defined(DATA_D_BF16)
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(fp32_to_bf16(v));
+#else
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(v);
+#endif
 
         idx += num_threads;
     }

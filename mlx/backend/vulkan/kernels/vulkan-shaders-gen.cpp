@@ -1692,12 +1692,32 @@ void process_shaders() {
          {"RTE16", "1"}});
   }
 
-  auto get_type_str = [](bool f16) { return f16 ? "float16_t" : "float"; };
-  auto get_suffix = [](bool src0_f16, bool src1_f16, bool dst_f16) {
+  auto get_type_str = [](const std::string& type) {
+    if (type == "f16") {
+      return std::string("float16_t");
+    }
+    if (type == "bf16") {
+      return std::string("uint16_t");
+    }
+    return std::string("float");
+  };
+  auto get_type_defs = [](char name, const std::string& type) {
+    std::map<std::string, std::string> defs;
+    defs[std::string(1, name) + "_TYPE"] = type == "f16" ? "float16_t"
+        : type == "bf16"                                 ? "uint16_t"
+                                                         : "float";
+    if (type == "bf16") {
+      defs[std::string("DATA_") + name + "_BF16"] = "1";
+    }
+    return defs;
+  };
+  auto get_suffix = [](const std::string& src0,
+                       const std::string& src1,
+                       const std::string& dst) {
     std::string s;
-    s += std::string(src0_f16 ? "_f16" : "_f32");
-    s += std::string(src1_f16 ? "_f16" : "_f32");
-    s += std::string(dst_f16 ? "_f16" : "_f32");
+    s += "_" + src0;
+    s += "_" + src1;
+    s += "_" + dst;
     return s;
   };
   for (std::string op : {
@@ -1709,9 +1729,20 @@ void process_shaders() {
            "minimum",
            "maximum",
        }) {
-    for (auto src0_f16 : {false, true}) {
-      for (auto src1_f16 : {false, true}) {
-        for (auto dst_f16 : {false, true}) {
+    for (const auto& src0 :
+         {std::string("f32"), std::string("f16"), std::string("bf16")}) {
+      for (const auto& src1 :
+           {std::string("f32"), std::string("f16"), std::string("bf16")}) {
+        for (const auto& dst :
+             {std::string("f32"), std::string("f16"), std::string("bf16")}) {
+          if (op == "div" &&
+              (src0 == "bf16" || src1 == "bf16" || dst == "bf16")) {
+            continue;
+          }
+          if (op == "add_rms" &&
+              (src0 == "bf16" || src1 == "bf16" || dst == "bf16")) {
+            continue;
+          }
           for (auto rte : {false, true}) {
             std::string source;
             std::string add_rms = "0";
@@ -1723,19 +1754,19 @@ void process_shaders() {
             } else {
               source = op;
             }
-            auto name = op + get_suffix(src0_f16, src1_f16, dst_f16) +
-                (rte ? "_rte" : "");
-            string_to_spv(
-                name.c_str(),
-                source + ".comp",
-                {{"A_TYPE", get_type_str(src0_f16)},
-                 {"B_TYPE", get_type_str(src1_f16)},
-                 {"D_TYPE", get_type_str(dst_f16)},
-                 {"FLOAT_TYPE", "float"},
-                 {"NAN_GUARD",
-                  (op == "minimum" || op == "maximum") ? "1" : "0"},
-                 {"RTE16", rte ? "1" : "0"},
-                 {"ADD_RMS", add_rms}});
+            auto name = op + get_suffix(src0, src1, dst) + (rte ? "_rte" : "");
+            auto defs = get_type_defs('A', src0);
+            auto b_defs = get_type_defs('B', src1);
+            auto d_defs = get_type_defs('D', dst);
+            defs.insert(b_defs.begin(), b_defs.end());
+            defs.insert(d_defs.begin(), d_defs.end());
+            defs.insert({
+                {"FLOAT_TYPE", "float"},
+                {"NAN_GUARD", (op == "minimum" || op == "maximum") ? "1" : "0"},
+                {"RTE16", rte ? "1" : "0"},
+                {"ADD_RMS", add_rms},
+            });
+            string_to_spv(name.c_str(), source + ".comp", defs);
           }
         }
       }
@@ -1790,8 +1821,8 @@ void process_shaders() {
         string_to_spv(
             name.c_str(),
             op + ".comp",
-            {{"A_TYPE", get_type_str(src0_f16)},
-             {"B_TYPE", get_type_str(src1_f16)},
+            {{"A_TYPE", get_type_str(src0_f16 ? "f16" : "f32")},
+             {"B_TYPE", get_type_str(src1_f16 ? "f16" : "f32")},
              {"D_TYPE", "uint8_t"},
              {"FLOAT_TYPE", "float"},
              {"RTE16", "0"},
@@ -1889,9 +1920,7 @@ void process_shaders() {
        {"TO_FLOAT_TYPE", "bf16_to_fp32"},
        {"D_TYPE", "float"}});
   string_to_spv(
-      "fused_affine_qmm_bf16_bf16",
-      "mul_mm_affine_bf16_acc.comp",
-      {});
+      "fused_affine_qmm_bf16_bf16", "mul_mm_affine_bf16_acc.comp", {});
 
   string_to_spv(
       "fused_affine_matvec8_f32_f32",
@@ -2234,7 +2263,9 @@ void process_shaders() {
   string_to_spv(
       "arange_f16",
       "arange.comp",
-      {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
+      {{"A_TYPE", "float16_t"},
+       {"D_TYPE", "float16_t"},
+       {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "arange_bf16",
       "arange.comp",
@@ -2257,7 +2288,9 @@ void process_shaders() {
   string_to_spv(
       "arange_u16",
       "arange_int.comp",
-      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}, {"FLOAT_TYPE", "float"}});
+      {{"A_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "arange_i8",
       "arange_int.comp",
@@ -2277,9 +2310,7 @@ void process_shaders() {
       "fill.comp",
       {{"D_TYPE", "uint16_t"}, {"FLOAT_TYPE", "float"}, {"DATA_D_BF16", "1"}});
   string_to_spv(
-      "fill_u8",
-      "fill.comp",
-      {{"D_TYPE", "uint8_t"}, {"FLOAT_TYPE", "float"}});
+      "fill_u8", "fill.comp", {{"D_TYPE", "uint8_t"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "step_f16",
       "step.comp",
@@ -2595,9 +2626,7 @@ void process_shaders() {
 
   string_to_spv("argsort_f32", "argsort.comp", {{"A_TYPE", "float"}});
   string_to_spv(
-      "argsort_partition_f32",
-      "argsort_partition.comp",
-      {{"A_TYPE", "float"}});
+      "argsort_partition_f32", "argsort_partition.comp", {{"A_TYPE", "float"}});
   string_to_spv(
       "argsort_large_f32", "argsort_large.comp", {{"A_TYPE", "float"}});
 
@@ -2756,9 +2785,8 @@ void process_shaders() {
         if (unroll) {
           auto coopmat_defines = defines;
           coopmat_defines["COOPMAT"] = "1";
-         coopmat_defines.erase("COOPMAT2");
-          string_to_spv(
-              name + "_cm1", "conv2d_mm.comp", coopmat_defines);
+          coopmat_defines.erase("COOPMAT2");
+          string_to_spv(name + "_cm1", "conv2d_mm.comp", coopmat_defines);
         }
       }
     }

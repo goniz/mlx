@@ -2457,7 +2457,8 @@ void dispatch_argsort_op(
     array& out,
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
-    const Stream& s) {
+    const Stream& s,
+    uint32_t order) {
   if (out.size() == 0) {
     return;
   }
@@ -2478,8 +2479,6 @@ void dispatch_argsort_op(
 
   const uint32_t ncols_padded = 1024u;
   const uint32_t ncols_padded_log2 = 10u;
-  const uint32_t order = 0u;
-
   ArgsortPushConstants push_constants{};
   push_constants.ncols = ncols;
   push_constants.ncols_padded = ncols_padded;

@@ -1527,6 +1527,11 @@ void eval_argpartition_or_argsort_gpu(
         "ArgPartition/ArgSort Vulkan requires sort axis <= 1024 elements.");
   }
 
+  const int normalized_kth = kth < 0 ? static_cast<int>(ncols) + kth : kth;
+  const bool topk_suffix_partition = kth < 0 && normalized_kth >= 0 &&
+      normalized_kth >= static_cast<int>(ncols) - 16 && axis == in.ndim() - 1 &&
+      in_kernel.dtype() == float32 && ncols == 256;
+
   // Prepare output in kernel layout (same shape as in_kernel, dtype uint32)
   array kernel_out(in_kernel.shape(), uint32, nullptr, {});
   const bool staged_output = !kernel_out.flags().row_contiguous ||
@@ -1555,7 +1560,8 @@ void eval_argpartition_or_argsort_gpu(
       out_work,
       vulkan::StaticShaderId::argsort_partition_f32,
       command_buffer,
-      s);
+      s,
+      topk_suffix_partition ? static_cast<uint32_t>(kth) : 0u);
   vulkan::end_command_recording(s.index);
 
   if (staged_output) {

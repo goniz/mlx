@@ -744,7 +744,8 @@ void dispatch_argsort_op(
     array& out,
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
-    const Stream& s);
+    const Stream& s,
+    uint32_t order = 0u);
 
 void dispatch_softmax_op(
     const array& in,

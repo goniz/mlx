@@ -1390,6 +1390,7 @@ bool try_eval_sdpa_heads_vulkan(
 
   // Build output shape in head layout (not collapsed batch_heads layout).
   const Shape out_head_shape = {batch, n_q_heads, q_len, v_dim};
+  const Shape score_head_shape = {batch, n_q_heads, q_len, kv_len};
 
   if (is_decode) {
     // --- Decode GQA path: avoid broadcast copies on K/V -----------------------
@@ -1424,7 +1425,7 @@ bool try_eval_sdpa_heads_vulkan(
 
     // --- QK matvec via NC dispatch (matrix = k_f16, vec = q_heads) ----------
     stage = "scores_matmul_decode";
-    array scores_head(out_head_shape, float32, nullptr, {});
+    array scores_head(score_head_shape, float32, nullptr, {});
     scores_head.set_data(allocator::malloc(scores_head.nbytes()));
 
     {
@@ -1472,10 +1473,10 @@ bool try_eval_sdpa_heads_vulkan(
       stage = "prepare_mask_decode";
       array mask = cast_to_f32_sdpa(inputs[3], s);
       if (mask.ndim() == 4 && mask.shape(1) == 1) {
-        mask = broadcast_to(mask, out_head_shape, s);
+        mask = broadcast_to(mask, score_head_shape, s);
       }
       mask = ensure_sdpa_rowwise_layout(mask, s);
-      mask = reshape_sdpa_contiguous_view(mask, out_head_shape);
+      mask = reshape_sdpa_contiguous_view(mask, score_head_shape);
       mask = ensure_sdpa_rowwise_layout(mask, s);
       mask.set_status(array::Status::evaluated);
       mask_work = mask;
@@ -1489,14 +1490,14 @@ bool try_eval_sdpa_heads_vulkan(
 
     if (mask_work.has_value()) {
       stage = "add_mask_decode";
-      array masked(out_head_shape, float32, nullptr, {});
+      array masked(score_head_shape, float32, nullptr, {});
       eval_sdpa_binary_add_vulkan(scores_head, *mask_work, masked, s);
       scores_head = masked;
     }
 
     if (logsumexp_out != nullptr) {
       stage = "logsumexp_decode";
-      Shape logsumexp_shape = out_head_shape;
+      Shape logsumexp_shape = score_head_shape;
       logsumexp_shape.back() = 1;
       array logsumexp_f32(logsumexp_shape, float32, nullptr, {});
       eval_sdpa_logsumexp_vulkan(scores_head, logsumexp_f32, s);
@@ -1509,7 +1510,7 @@ bool try_eval_sdpa_heads_vulkan(
     }
 
     stage = "softmax_decode";
-    array probs_head(out_head_shape, float32, nullptr, {});
+    array probs_head(score_head_shape, float32, nullptr, {});
     eval_sdpa_softmax_vulkan(scores_head, probs_head, s);
 
     // --- Scores×V matvec via NC dispatch (matrix = v_f16, vec = probs) ------

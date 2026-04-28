@@ -6,6 +6,7 @@
 layout(constant_id = 0) const int BLOCK_SIZE = 1024;
 layout(constant_id = 1) const int NCOLS_PADDED_LOG2 = 10;
 #define ASC 0
+#define SIGNED_MIN_AS_UINT 2147483648u
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -97,7 +98,7 @@ void argsort(bool needs_bounds_check, const uint row, const uint output_order) {
 }
 
 void main() {
-    if (p.order > 2147483648u && p.ncols == 256u && p.ncols_padded == 256u) {
+    if (p.order > SIGNED_MIN_AS_UINT && p.ncols == 256u && p.ncols_padded == 256u) {
         uint row = gl_WorkGroupID.y;
         while (row < p.nrows) {
             topk_suffix_partition(row);

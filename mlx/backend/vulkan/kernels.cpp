@@ -2477,8 +2477,10 @@ void dispatch_argsort_op(
 
   const uint32_t nrows = checked_u32(out.size() / ncols, "argsort row count");
 
-  const uint32_t ncols_padded = 1024u;
-  const uint32_t ncols_padded_log2 = 10u;
+  constexpr uint32_t signed_min_as_u32 = 1u << 31;
+  const bool topk_suffix_partition = order > signed_min_as_u32 && ncols == 256u;
+  const uint32_t ncols_padded = topk_suffix_partition ? 256u : 1024u;
+  const uint32_t ncols_padded_log2 = topk_suffix_partition ? 8u : 10u;
   ArgsortPushConstants push_constants{};
   push_constants.ncols = ncols;
   push_constants.ncols_padded = ncols_padded;
@@ -2503,7 +2505,7 @@ void dispatch_argsort_op(
       cmd_buffer,
       s,
       std::nullopt,
-      {1024u, 10u});
+      {ncols_padded, ncols_padded_log2});
 }
 
 void dispatch_softmax_op(

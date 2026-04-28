@@ -423,6 +423,22 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   auto& s = stream();
+  auto trace_qmm = [&](std::string_view kind, std::string_view detail) {
+    if (!trace_fallback_enabled()) {
+      return;
+    }
+    std::ostringstream oss;
+    oss << "primitive=QuantizedMatmul kind=" << kind
+        << " x_shape=" << inputs[0].shape() << " x_dtype=" << inputs[0].dtype()
+        << " w_shape=" << inputs[1].shape() << " scales_dtype="
+        << inputs[2].dtype() << " out_shape=" << out.shape()
+        << " out_dtype=" << out.dtype() << " bits=" << bits_
+        << " group_size=" << group_size_ << " transpose=" << transpose_;
+    if (!detail.empty()) {
+      oss << ' ' << detail;
+    }
+    trace_fallback(oss.str());
+  };
   array x = ensure_row_contiguous_zero_offset(inputs[0], s);
   array w = ensure_row_contiguous_zero_offset(inputs[1], s);
   array scales = ensure_float32_row_contiguous(inputs[2], s);
@@ -529,10 +545,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
               out_work, make_contiguous_strides(out.shape()), flags, out.size());
           out.detach();
           out.set_status(array::Status::evaluated);
+          trace_qmm("fused_bf16", "reshaped_output=1");
           return;
         }
 
         out.copy_shared_buffer(out_work);
+        trace_qmm("fused_bf16", "reshaped_output=0");
         return;
       }
     }
@@ -616,6 +634,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           vulkan::end_command_recording(s.index);
         }
         fused_dispatched = true;
+        trace_qmm(
+            prefill_like_rows ? "fused_prefill" : "fused_decode",
+            "staged_float32=1");
       } catch (const std::runtime_error&) {
         fused_dispatched = false;
       }
@@ -623,6 +644,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   if (!fused_dispatched) {
+    trace_qmm("dequant_fallback", "reason=fused_conditions_not_met");
     array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
     if (!vulkan::affine_dequantize_to_float32(
             w, scales, biases, w_deq, s, group_size_, bits_)) {

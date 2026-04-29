@@ -1326,6 +1326,60 @@ void process_shaders() {
   indexing_shaders("gather_pair", "gather_pair.comp");
   indexing_shaders("gather_axis", "gather_axis.comp");
   indexing_shaders("scatter_take", "scatter_take.comp");
+  // scatter_sum_take: f32, i32, u32 use atomicAdd with VALUE_TYPE
+  // parameterization
+  auto scatter_sum_take_shaders =
+      [&](const std::string& value_tag,
+          const std::string& value_type,
+          const std::string& shader,
+          const std::map<std::string, std::string>& extra_value_defines) {
+        auto add_variant =
+            [&](const std::string& index_tag,
+                const std::map<std::string, std::string>& extra_index_defines) {
+              auto defines = merge_maps(
+                  {{"VALUE_TYPE", value_type}}, extra_value_defines);
+              defines =
+                  merge_maps(defines, extra_index_defines);
+              string_to_spv(
+                  "scatter_sum_take_" + value_tag + "_" + index_tag,
+                  shader,
+                  defines);
+            };
+        add_variant("i32", {});
+        add_variant("i64", {{"INDEX_IS_I64", "1"}});
+        add_variant("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+        add_variant("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+      };
+
+  scatter_sum_take_shaders("f32", "float", "scatter_sum_take.comp", {{"VALUE_IS_FLOAT", "1"}});
+  scatter_sum_take_shaders("i32", "int", "scatter_sum_take.comp", {{"VALUE_IS_INT", "1"}});
+  scatter_sum_take_shaders("u32", "uint", "scatter_sum_take.comp", {{"VALUE_IS_UINT", "1"}});
+
+  // scatter_sum_take: f16 uses CAS loop on packed uint
+  auto scatter_sum_take_f16_shaders = [&](const std::string& index_tag,
+                                          const std::map<std::string, std::string>& index_defines) {
+    string_to_spv(
+        "scatter_sum_take_f16_" + index_tag,
+        "scatter_sum_take_f16.comp",
+        merge_maps({{"VALUE_IS_F16", "1"}}, index_defines));
+  };
+  scatter_sum_take_f16_shaders("i32", {});
+  scatter_sum_take_f16_shaders("i64", {{"INDEX_IS_I64", "1"}});
+  scatter_sum_take_f16_shaders("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+  scatter_sum_take_f16_shaders("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+
+  // scatter_sum_take: bf16 uses CAS loop on packed uint with bf16<->f32 conversion
+  auto scatter_sum_take_bf16_shaders = [&](const std::string& index_tag,
+                                            const std::map<std::string, std::string>& index_defines) {
+    string_to_spv(
+        "scatter_sum_take_bf16_" + index_tag,
+        "scatter_sum_take_bf16.comp",
+        merge_maps({{"VALUE_IS_BF16", "1"}}, index_defines));
+  };
+  scatter_sum_take_bf16_shaders("i32", {});
+  scatter_sum_take_bf16_shaders("i64", {{"INDEX_IS_I64", "1"}});
+  scatter_sum_take_bf16_shaders("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+  scatter_sum_take_bf16_shaders("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
   indexing_shaders("scatter_pair", "scatter_pair.comp");
   indexing_shaders("scatter_axis", "scatter_axis.comp");
 

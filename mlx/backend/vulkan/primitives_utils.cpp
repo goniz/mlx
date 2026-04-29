@@ -417,6 +417,32 @@ std::optional<vulkan::StaticShaderId> scatter_shader_id(
   return std::nullopt;
 }
 
+std::optional<vulkan::StaticShaderId> scatter_sum_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, scatter_sum_take_f32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, scatter_sum_take_f32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, scatter_sum_take_f32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, scatter_sum_take_f32_u64);
+  MLX_VK_GATHER_CASE(float16, int32, scatter_sum_take_f16_i32);
+  MLX_VK_GATHER_CASE(float16, int64, scatter_sum_take_f16_i64);
+  MLX_VK_GATHER_CASE(float16, uint32, scatter_sum_take_f16_u32);
+  MLX_VK_GATHER_CASE(float16, uint64, scatter_sum_take_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, int32, scatter_sum_take_bf16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int64, scatter_sum_take_bf16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, scatter_sum_take_bf16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, scatter_sum_take_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, int32, scatter_sum_take_i32_i32);
+  MLX_VK_GATHER_CASE(int32, int64, scatter_sum_take_i32_i64);
+  MLX_VK_GATHER_CASE(int32, uint32, scatter_sum_take_i32_u32);
+  MLX_VK_GATHER_CASE(int32, uint64, scatter_sum_take_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, int32, scatter_sum_take_u32_i32);
+  MLX_VK_GATHER_CASE(uint32, int64, scatter_sum_take_u32_i64);
+  MLX_VK_GATHER_CASE(uint32, uint32, scatter_sum_take_u32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint64, scatter_sum_take_u32_u64);
+  return std::nullopt;
+}
+
 std::optional<vulkan::StaticShaderId> scatter_pair_shader_id(
     Dtype value_dtype,
     Dtype index_dtype) {

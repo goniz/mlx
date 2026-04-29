@@ -61,6 +61,8 @@ bool try_eval_scatter_vulkan(
   const auto& src = inputs[0];
   if (src.ndim() == 0 || out.shape() != src.shape() ||
       out.dtype() != src.dtype()) {
+    trace_vulkan_unsupported(
+        "Scatter", "source/output shape or dtype mismatch");
     return false;
   }
 
@@ -183,7 +185,9 @@ bool try_eval_scatter_vulkan(
     }
   }
 
-  if (reduce_type != Scatter::None || axes.size() != 1) {
+  if ((reduce_type != Scatter::None && reduce_type != Scatter::Sum) ||
+      axes.size() != 1) {
+    trace_vulkan_unsupported("Scatter", "scatter mode or axes unsupported");
     return false;
   }
 
@@ -191,10 +195,15 @@ bool try_eval_scatter_vulkan(
   array idx = inputs[1];
   array upd = inputs[2];
   if (axis < 0 || axis >= src.ndim()) {
+    trace_vulkan_unsupported("Scatter", "axis is out of range");
     return false;
   }
-  const auto shader_id = scatter_shader_id(out.dtype(), idx.dtype());
+  const auto shader_id = reduce_type == Scatter::Sum
+      ? scatter_sum_shader_id(out.dtype(), idx.dtype())
+      : scatter_shader_id(out.dtype(), idx.dtype());
   if (!shader_id.has_value()) {
+    trace_vulkan_unsupported(
+        "Scatter", "value/index dtype combination is not supported");
     return false;
   }
 
@@ -209,11 +218,17 @@ bool try_eval_scatter_vulkan(
       src, axis + 1, src.ndim(), "scatter_take size_post");
   const uint32_t index_count =
       checked_u32_size(idx.size(), "scatter_take index_count");
-  const uint32_t slice_size =
-      checked_mul_u32(size_pre, size_post, "scatter_take expected_update_size");
+  uint32_t slice_size = 1;
+  for (int i = 0; i < src.ndim(); ++i) {
+    slice_size = checked_mul_u32(
+        slice_size,
+        checked_u32_size(upd.shape(idx.ndim() + i), "scatter_take slice_size"),
+        "scatter_take expected_update_size");
+  }
   const uint32_t expected_update_size = checked_mul_u32(
       index_count, slice_size, "scatter_take expected_update_size");
   if (upd.size() != expected_update_size) {
+    trace_vulkan_unsupported("Scatter", "update size does not match indices");
     return false;
   }
 

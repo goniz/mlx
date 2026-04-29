@@ -106,6 +106,9 @@ std::optional<vulkan::StaticShaderId> gather_axis_shader_id(
 std::optional<vulkan::StaticShaderId> scatter_shader_id(
     Dtype value_dtype,
     Dtype index_dtype);
+std::optional<vulkan::StaticShaderId> scatter_sum_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype);
 std::optional<vulkan::StaticShaderId> scatter_pair_shader_id(
     Dtype value_dtype,
     Dtype index_dtype);

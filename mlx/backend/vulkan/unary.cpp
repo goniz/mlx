@@ -238,6 +238,7 @@ VULKAN_GENERIC_UNARY_GPU(Floor, GenericUnaryShaderOp::Floor)
 VULKAN_GENERIC_UNARY_GPU(Negative, GenericUnaryShaderOp::Negative)
 VULKAN_GENERIC_UNARY_GPU(Round, GenericUnaryShaderOp::Round)
 VULKAN_GENERIC_UNARY_GPU(Sigmoid, GenericUnaryShaderOp::Sigmoid)
+VULKAN_GENERIC_UNARY_GPU(Sign, GenericUnaryShaderOp::Sign)
 VULKAN_GENERIC_UNARY_GPU(Tanh, GenericUnaryShaderOp::Tanh)
 
 // Specialized unary ops

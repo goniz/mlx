@@ -2225,6 +2225,12 @@ void process_shaders() {
       "sigmoid.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
   string_to_spv(
+      "sign_f16",
+      "sign.comp",
+      {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+  string_to_spv(
+      "sign_f32", "sign.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
       "hardsigmoid_f16",
       "hardsigmoid.comp",
       {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});

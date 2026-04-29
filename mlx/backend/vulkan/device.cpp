@@ -205,14 +205,10 @@ bool submit_on_hazard_boundary() {
 }
 
 bool trace_sync_enabled() {
-  static const bool enabled = []() {
-    if (const char* env = std::getenv("MLX_VULKAN_TRACE_SYNC");
-        env != nullptr) {
-      return std::string(env) != "0";
-    }
-    return false;
-  }();
-  return enabled;
+  if (const char* env = std::getenv("MLX_VULKAN_TRACE_SYNC"); env != nullptr) {
+    return std::string(env) != "0";
+  }
+  return false;
 }
 
 bool decode_batch_enabled() {

@@ -267,6 +267,8 @@ generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte) {
   MLX_VK_GENERIC_UNARY_CASE(Round, float16, false, round_f16);
   MLX_VK_GENERIC_UNARY_CASE(Sigmoid, float32, false, sigmoid_f32);
   MLX_VK_GENERIC_UNARY_CASE(Sigmoid, float16, false, sigmoid_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Sign, float32, false, sign_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Sign, float16, false, sign_f16);
   MLX_VK_GENERIC_UNARY_CASE(Tanh, float32, false, tanh_f32);
   MLX_VK_GENERIC_UNARY_CASE(Tanh, float16, false, tanh_f16);
   return std::nullopt;

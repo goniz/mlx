@@ -1623,7 +1623,6 @@ void Power::eval_gpu(const std::vector<array>& inputs, array& out) {
 // QuantizedMatmul and QQMatmul are implemented in quantized.cpp.
 
 NYI_OP(Real)
-NYI_OP(Sign)
 NYI_OP(Sinh)
 NYI_OP_STATE(Sort)
 NYI_OP(Tan)

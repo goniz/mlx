@@ -68,6 +68,7 @@ enum class GenericUnaryShaderOp {
   Negative,
   Round,
   Sigmoid,
+  Sign,
   Tanh,
 };
 

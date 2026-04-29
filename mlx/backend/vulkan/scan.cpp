@@ -6,7 +6,7 @@ namespace mlx::core {
 
 namespace {
 
-bool try_eval_scan_cumsum_vulkan(
+bool try_eval_scan_vulkan(
     const std::vector<array>& inputs,
     array& out,
     Scan::ReduceType reduce_type,
@@ -14,7 +14,8 @@ bool try_eval_scan_cumsum_vulkan(
     bool reverse,
     bool inclusive,
     Stream s) {
-  if (inputs.size() != 1 || reduce_type != Scan::Sum) {
+  if (inputs.size() != 1 ||
+      (reduce_type != Scan::Sum && reduce_type != Scan::Prod)) {
     return false;
   }
 
@@ -33,26 +34,19 @@ bool try_eval_scan_cumsum_vulkan(
     in_kernel = swapaxes_in_eval(in, normalized_axis, in.ndim() - 1);
   }
 
-  auto reverse_last_axis_contiguous = [&](const array& arr) {
-    Shape starts(arr.ndim(), 0);
-    Shape strides(arr.ndim(), 1);
-    starts[arr.ndim() - 1] = arr.shape(arr.ndim() - 1) - 1;
-    strides[arr.ndim() - 1] = -1;
-    array reversed_view(arr.shape(), arr.dtype(), nullptr, {});
-    slice_gpu(arr, reversed_view, starts, strides, s);
-    return contiguous_copy_gpu(reversed_view, s);
-  };
-
-  array scan_input =
-      reverse ? reverse_last_axis_contiguous(in_kernel) : in_kernel;
+  array scan_input = in_kernel;
 
   if (!scan_input.flags().contiguous || scan_input.offset() != 0 ||
-      scan_input.strides().back() != 1 ||
+      scan_input.strides().back() != 1 || scan_input.strides().back() < 0 ||
       !is_supported_unary_layout(scan_input)) {
     scan_input = contiguous_copy_gpu(scan_input, s);
   }
 
-  if (scan_input.shape() != out.shape()) {
+  Shape scan_shape = out.shape();
+  if (normalized_axis != in.ndim() - 1) {
+    std::swap(scan_shape[normalized_axis], scan_shape[in.ndim() - 1]);
+  }
+  if (scan_input.shape() != scan_shape) {
     return false;
   }
 
@@ -72,15 +66,26 @@ bool try_eval_scan_cumsum_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
 
-    vulkan::dispatch_cumsum_op(
-        scan_input,
-        inclusive_out,
-        vulkan::StaticShaderId::cumsum_f32,
-        command_buffer,
-        s);
+    if (reduce_type == Scan::Sum) {
+      vulkan::dispatch_cumsum_op(
+          scan_input,
+          inclusive_out,
+          vulkan::StaticShaderId::cumsum_f32,
+          command_buffer,
+          s);
+    } else {
+      vulkan::dispatch_cumprod_op(
+          scan_input,
+          inclusive_out,
+          vulkan::StaticShaderId::cumprod_f32,
+          command_buffer,
+          s,
+          reverse,
+          inclusive);
+    }
 
     array scan_result = inclusive_out;
-    if (!inclusive) {
+    if (!inclusive && reduce_type == Scan::Sum) {
       array exclusive_out(scan_input.shape(), scan_input.dtype(), nullptr, {});
       exclusive_out.set_data(allocator::malloc(exclusive_out.nbytes()));
       vulkan::dispatch_binary_op(
@@ -96,15 +101,23 @@ bool try_eval_scan_cumsum_vulkan(
 
     vulkan::end_command_recording(s.index);
 
-    array restored =
-        reverse ? reverse_last_axis_contiguous(scan_result) : scan_result;
+    array restored = scan_result;
     if (normalized_axis != in.ndim() - 1) {
       restored = swapaxes_in_eval(restored, normalized_axis, in.ndim() - 1);
+    }
+    if (!is_supported_unary_layout(restored)) {
+      restored = contiguous_copy_gpu(restored, s);
     }
 
     copy_gpu(restored, out, CopyType::GeneralGeneral, s);
     return true;
-  } catch (const std::runtime_error&) {
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "scan_dispatch_failed reduce_type="
+          << static_cast<int>(reduce_type) << " reason=" << e.what();
+      trace_fallback(oss.str());
+    }
     return false;
   }
 }
@@ -113,7 +126,7 @@ bool try_eval_scan_cumsum_vulkan(
 
 void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axis, reverse, inclusive] = state();
-  if (!try_eval_scan_cumsum_vulkan(
+  if (!try_eval_scan_vulkan(
           inputs, out, reduce_type, axis, reverse, inclusive, stream())) {
     throw std::runtime_error(
         "Scan operation failed on Vulkan (unsupported dtype or layout).");

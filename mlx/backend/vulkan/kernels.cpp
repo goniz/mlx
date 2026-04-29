@@ -3082,6 +3082,60 @@ void dispatch_cumsum_op(
   mark_scratch_array_written(s, kCumsumMultipassScratchLane);
 }
 
+void dispatch_cumprod_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    bool reverse,
+    bool inclusive) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (in.ndim() == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumprod requires input rank >= 1.");
+  }
+
+  const uint32_t row_width =
+      checked_u32(in.shape(in.ndim() - 1), "cumprod n_cols");
+  if (row_width == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumprod requires non-zero row width.");
+  }
+
+  const uint32_t total_elements = checked_u32(out.size(), "cumprod elements");
+  if (total_elements % row_width != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumprod elements are not divisible by row width.");
+  }
+  const uint32_t row_count = total_elements / row_width;
+  const uint32_t block_size = 128u;
+  const uint32_t num_workgroups_x = (row_width + block_size - 1) / block_size;
+  if (num_workgroups_x > 1) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumprod multipass is not implemented.");
+  }
+
+  const auto push_constants = make_sum_rows_push_constants(in, out, 1.0f);
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::SumRows,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s,
+      std::nullopt,
+      {128u, 32u, 4u, reverse ? 1u : 0u, inclusive ? 1u : 0u});
+}
+
 void dispatch_mul_mm_op(
     const array& a,
     const array& b,

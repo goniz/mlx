@@ -2714,6 +2714,10 @@ void process_shaders() {
       "cumsum.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv(
+      "cumprod_f32",
+      "cumprod.comp",
+      merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv(
       "cumsum_multipass1_f32",
       "cumsum_multipass1.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

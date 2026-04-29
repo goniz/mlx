@@ -26,6 +26,7 @@
 namespace {
 
 using mlx::core::Dtype;
+using mlx::core::array;
 using mlx::core::Shape;
 using mlx::core::Strides;
 namespace vulkan = mlx::core::vulkan;

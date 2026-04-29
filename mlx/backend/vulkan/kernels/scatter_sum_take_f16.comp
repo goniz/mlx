@@ -1,0 +1,80 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+#if defined(INDEX_IS_I64)
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#if defined(INDEX_IS_UNSIGNED)
+#define INDEX_TYPE uint64_t
+#else
+#define INDEX_TYPE int64_t
+#endif
+#elif defined(INDEX_IS_UNSIGNED)
+#define INDEX_TYPE uint
+#else
+#define INDEX_TYPE int
+#endif
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint size_pre;
+    uint size_axis;
+    uint size_post;
+    uint idx_axis_size;
+} p;
+
+layout(scalar, binding = 0) readonly buffer U { float16_t data_u[]; };
+layout(scalar, binding = 1) readonly buffer I { INDEX_TYPE data_i[]; };
+layout(scalar, binding = 2) buffer D { uint data_d[]; };
+
+uint get_idx() {
+    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+}
+
+uint normalize_index(INDEX_TYPE idx) {
+#if defined(INDEX_IS_UNSIGNED)
+    return uint(idx);
+#elif defined(INDEX_IS_I64)
+    return uint(idx < 0 ? idx + int64_t(p.size_axis) : idx);
+#else
+    return uint(idx < 0 ? idx + int(p.size_axis) : idx);
+#endif
+}
+
+void main() {
+    const uint linear_idx = get_idx();
+
+    if (linear_idx >= p.ne) {
+        return;
+    }
+
+    const uint suffix = linear_idx % p.size_post;
+    const uint tmp = linear_idx / p.size_post;
+    const uint prefix = tmp % p.size_pre;
+    const uint index_pos = tmp / p.size_pre;
+    const uint scatter_idx = normalize_index(data_i[index_pos]);
+    const uint dst_idx = (prefix * p.size_axis + scatter_idx) * p.size_post + suffix;
+
+    const uint word_idx = dst_idx >> 1u;
+    const uint lane = dst_idx & 1u;
+    const float add_val = float(data_u[linear_idx]);
+
+    uint old_packed = data_d[word_idx];
+    while (true) {
+        vec2 halves = unpackHalf2x16(old_packed);
+        if (lane == 0u) {
+            halves.x += add_val;
+        } else {
+            halves.y += add_val;
+        }
+        uint new_packed = packHalf2x16(halves);
+        uint returned = atomicCompSwap(data_d[word_idx], old_packed, new_packed);
+        if (returned == old_packed) {
+            break;
+        }
+        old_packed = returned;
+    }
+}

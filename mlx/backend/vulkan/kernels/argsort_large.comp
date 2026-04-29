@@ -27,6 +27,21 @@ layout (push_constant) uniform parameter {
     uint inner_end;
 } p;
 
+bool argsort_should_swap(ivec2 lhs, ivec2 rhs) {
+    float lhs_val = intBitsToFloat(lhs.y);
+    float rhs_val = intBitsToFloat(rhs.y);
+    bool lhs_nan = isnan(lhs_val);
+    bool rhs_nan = isnan(rhs_val);
+
+    if (lhs_nan != rhs_nan) {
+        return lhs_nan;
+    }
+    if (lhs_nan) {
+        return lhs.x > rhs.x;
+    }
+    return lhs_val > rhs_val || (lhs_val == rhs_val && lhs.x > rhs.x);
+}
+
 void argsort(bool needs_bounds_check, const uint row) {
     // bitonic sort
     int col = int(gl_GlobalInvocationID.x);
@@ -39,10 +54,12 @@ void argsort(bool needs_bounds_check, const uint row) {
 
     // initialize indices
     if (p.outer_start == 0 && p.inner_start == 0) {
-        [[unroll]] for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
+        for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
             uint c = u*BLOCK_SIZE + col;
             if (c < p.ncols_padded) {
-                ivec2 v = ivec2(c, floatBitsToInt(data_a[row_offset + c]));
+                ivec2 v = c < p.ncols
+                    ? ivec2(c, floatBitsToInt(data_a[row_offset + c]))
+                    : ivec2(int(p.ncols), 0);
                 tmp_idx[idx_offset + c] = v;
             }
         }
@@ -56,7 +73,7 @@ void argsort(bool needs_bounds_check, const uint row) {
                 controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
             }
             need_barrier = true;
-            [[unroll]] for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
+            for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
                 int c = u*BLOCK_SIZE + col;
                 const int ixj = int(c ^ j);
 
@@ -73,7 +90,7 @@ void argsort(bool needs_bounds_check, const uint row) {
                 bool idx_1_oob = needs_bounds_check ? sh_idx_1.x >= p.ncols : false;
 
                 if ((idx_0_oob ||
-                    (!idx_1_oob && intBitsToFloat(sh_idx_0.y) > intBitsToFloat(sh_idx_1.y)))) {
+                    (!idx_1_oob && argsort_should_swap(sh_idx_0, sh_idx_1)))) {
                     tmp_idx[idx_offset + idx_0] = sh_idx_1;
                     tmp_idx[idx_offset + idx_1] = sh_idx_0;
                 }
@@ -84,7 +101,7 @@ void argsort(bool needs_bounds_check, const uint row) {
     if (p.outer_end == p.ncols_padded_log2 &&
         p.inner_end >= p.ncols_padded_log2 + 1) {
         controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
-        [[unroll]] for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
+        for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
             uint c = u*BLOCK_SIZE + col;
             if (c < p.ncols) {
                 if (p.order == ASC) {

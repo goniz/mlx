@@ -563,6 +563,15 @@ layout(push_constant) uniform PushConstants {
     os += "  uint idx = base_idx;\n";
   }
 
+  if (!contiguous) {
+    os += "    uint rem_idx = idx;\n";
+    for (int axis = ndim - 1; axis >= 0; --axis) {
+      os += fmt::format(
+          "    uint coord_{} = rem_idx % p[{}u];\n", axis, shape_base + axis);
+      os += fmt::format("    rem_idx /= p[{}u];\n", shape_base + axis);
+    }
+  }
+
   // Declare and load inputs into temps
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& x = inputs[i];
@@ -628,17 +637,9 @@ layout(push_constant) uniform PushConstants {
       }
       uint32_t input_strides_offset = input_strides_base + stride_set * ndim;
       os += fmt::format("    uint loc_{} = p[{}u];\n", xname, param_offset);
-      os += fmt::format("    uint rem_{} = idx;\n", xname);
       for (int axis = ndim - 1; axis >= 0; --axis) {
         os += fmt::format(
-            "    uint coord_{0}_{1} = rem_{0} % p[{2}u];\n",
-            xname,
-            axis,
-            shape_base + axis);
-        os +=
-            fmt::format("    rem_{0} /= p[{1}u];\n", xname, shape_base + axis);
-        os += fmt::format(
-            "    loc_{0} += coord_{0}_{1} * p[{2}u];\n",
+            "    loc_{0} += coord_{1} * p[{2}u];\n",
             xname,
             axis,
             input_strides_offset + axis);
@@ -843,17 +844,9 @@ layout(push_constant) uniform PushConstants {
       }
     } else {
       os += fmt::format("    uint loc_out_{} = p[{}u];\n", xname, param_offset);
-      os += fmt::format("    uint rem_out_{} = idx;\n", xname);
       for (int axis = ndim - 1; axis >= 0; --axis) {
         os += fmt::format(
-            "    uint coord_out_{0}_{1} = rem_out_{0} % p[{2}u];\n",
-            xname,
-            axis,
-            shape_base + axis);
-        os += fmt::format(
-            "    rem_out_{0} /= p[{1}u];\n", xname, shape_base + axis);
-        os += fmt::format(
-            "    loc_out_{0} += coord_out_{0}_{1} * p[{2}u];\n",
+            "    loc_out_{0} += coord_{1} * p[{2}u];\n",
             xname,
             axis,
             output_strides_base + axis);

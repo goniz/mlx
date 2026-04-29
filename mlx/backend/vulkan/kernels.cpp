@@ -131,6 +131,32 @@ uint32_t checked_mul_u32(uint32_t a, uint32_t b, const char* name) {
   return static_cast<uint32_t>(product);
 }
 
+uint32_t next_power_of_two_u32(uint32_t value) {
+  if (value <= 1u) {
+    return 1u;
+  }
+  if (value > (1u << 31)) {
+    throw std::runtime_error(
+        "[vulkan::kernels] value is too large for power-of-two padding.");
+  }
+  value--;
+  value |= value >> 1;
+  value |= value >> 2;
+  value |= value >> 4;
+  value |= value >> 8;
+  value |= value >> 16;
+  return value + 1;
+}
+
+uint32_t log2_exact_u32(uint32_t value) {
+  uint32_t result = 0;
+  while (value > 1u) {
+    value >>= 1;
+    result++;
+  }
+  return result;
+}
+
 std::vector<uint32_t> copy_spirv_code(const void* data, size_t size_bytes) {
   if ((size_bytes % sizeof(uint32_t)) != 0) {
     throw std::runtime_error(
@@ -377,6 +403,7 @@ enum class KernelSpecId {
   Nvfp4QMatmul,
   LayerNormAffine,
   Argsort,
+  ArgsortLarge,
 };
 
 struct KernelSpec {
@@ -402,7 +429,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 35> kKernelSpecs = {
+const std::array<KernelSpec, 36> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -541,6 +568,10 @@ const std::array<KernelSpec, 35> kKernelSpecs = {
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 2},
+        sizeof(ArgsortPushConstants),
+        DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 2},
         sizeof(ArgsortPushConstants),
         DispatchGridKind::RowWise),
 };
@@ -2397,6 +2428,9 @@ void dispatch_sum_rows_op(
 
   const auto push_constants = make_sum_rows_push_constants(in, out, weight);
   const auto row_count = checked_u32(out.size(), "sum_rows output rows");
+  const uint32_t block_size = push_constants.n_cols <= 32u ? 32u
+      : push_constants.n_cols <= 64u                      ? 64u
+                                                           : 128u;
 
   const std::array<BoundArray, 2> bound_arrays = {{
       {&in, "src0"},
@@ -2411,7 +2445,7 @@ void dispatch_sum_rows_op(
       cmd_buffer,
       s,
       std::nullopt,
-      {32u});
+      {block_size});
 }
 
 void dispatch_argmax_op(
@@ -2470,17 +2504,24 @@ void dispatch_argsort_op(
 
   const uint32_t ncols =
       checked_u32(in.shape(in.ndim() - 1), "argsort column count");
-  if (ncols > 1024) {
+  constexpr uint32_t kMaxLargeArgsortCols = 262144u;
+  if (ncols > kMaxLargeArgsortCols) {
     throw std::runtime_error(
-        "[vulkan::kernels] Argsort requires ncols <= 1024.");
+        "[vulkan::kernels] Argsort requires ncols <= 262144.");
   }
 
   const uint32_t nrows = checked_u32(out.size() / ncols, "argsort row count");
 
   constexpr uint32_t signed_min_as_u32 = 1u << 31;
   const bool topk_suffix_partition = order > signed_min_as_u32 && ncols == 256u;
-  const uint32_t ncols_padded = topk_suffix_partition ? 256u : 1024u;
-  const uint32_t ncols_padded_log2 = topk_suffix_partition ? 8u : 10u;
+  const bool large_sort = ncols > 1024u;
+  const uint32_t large_ncols_padded = large_sort ? next_power_of_two_u32(ncols) : 0u;
+  const uint32_t ncols_padded = topk_suffix_partition ? 256u
+      : large_sort                              ? large_ncols_padded
+                                                : 1024u;
+  const uint32_t ncols_padded_log2 = topk_suffix_partition ? 8u
+      : large_sort                                   ? log2_exact_u32(ncols_padded)
+                                                     : 10u;
   ArgsortPushConstants push_constants{};
   push_constants.ncols = ncols;
   push_constants.ncols_padded = ncols_padded;
@@ -2491,6 +2532,32 @@ void dispatch_argsort_op(
   push_constants.outer_end = ncols_padded_log2;
   push_constants.inner_start = 0u;
   push_constants.inner_end = ncols_padded_log2 + 1u;
+
+  const auto row_groups = std::min(nrows, 65535u);
+  const std::array<uint32_t, 3> grid = {1u, row_groups, 1u};
+
+  if (large_sort) {
+    const uint32_t wg_unroll = ncols_padded / 1024u;
+    array tmp({static_cast<int>(nrows), static_cast<int>(ncols_padded), 2}, int32, nullptr, {});
+    tmp.set_data(allocator::malloc(tmp.nbytes()));
+
+    const std::array<BoundArray, 3> bound_arrays = {{
+        {&in, "src0"},
+        {&tmp, "tmp"},
+        {&out, "dst0"},
+    }};
+    dispatch_with_spec(
+        StaticShaderId::argsort_large_f32,
+        KernelSpecId::ArgsortLarge,
+        bound_arrays,
+        push_constants,
+        nrows,
+        cmd_buffer,
+        s,
+        grid,
+        {1024u, wg_unroll});
+    return;
+  }
 
   const std::array<BoundArray, 2> bound_arrays = {{
       {&in, "src0"},
@@ -2504,7 +2571,7 @@ void dispatch_argsort_op(
       nrows,
       cmd_buffer,
       s,
-      std::nullopt,
+      grid,
       {ncols_padded, ncols_padded_log2});
 }
 

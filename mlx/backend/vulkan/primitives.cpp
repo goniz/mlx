@@ -1522,9 +1522,9 @@ void eval_argpartition_or_argsort_gpu(
   }
 
   const uint32_t ncols = static_cast<uint32_t>(in_kernel.shape().back());
-  if (ncols > 1024) {
+  if (ncols > 262144) {
     throw std::runtime_error(
-        "ArgPartition/ArgSort Vulkan requires sort axis <= 1024 elements.");
+        "ArgPartition/ArgSort Vulkan requires sort axis <= 262144 elements.");
   }
 
   const int normalized_kth = kth < 0 ? static_cast<int>(ncols) + kth : kth;

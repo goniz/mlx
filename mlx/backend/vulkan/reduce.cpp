@@ -40,17 +40,19 @@ bool try_eval_reduce_sum_rows_vulkan(
   const bool f32_io = in.dtype() == float32 && out.dtype() == float32;
   const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
   const bool bf16_io = in.dtype() == bfloat16 && out.dtype() == bfloat16;
+  const bool bool_sum =
+      sum_reduce && in.dtype() == bool_ && out.dtype() == int32;
   const bool bool_io = in.dtype() == bool_ && out.dtype() == bool_;
   if ((sum_reduce || max_reduce || min_reduce) && !f32_io && !f16_io &&
-      !bf16_io) {
+      !bf16_io && !bool_sum) {
     return false;
   }
   if (logic_reduce && !bool_io) {
     return false;
   }
 
-  const bool use_f32_staging_io =
-      (sum_reduce || max_reduce || min_reduce) && (f16_io || bf16_io);
+  const bool use_f32_staging_io = (sum_reduce || max_reduce || min_reduce) &&
+      (f16_io || bf16_io || bool_sum);
   const bool use_u8_staging_io = logic_reduce;
   if (use_f32_staging_io) {
     if (in.offset() > 0xFFFF && in.flags().row_contiguous) {
@@ -90,9 +92,7 @@ bool try_eval_reduce_sum_rows_vulkan(
   }
 
   if (logic_reduce && in.size() == 0) {
-    array fill_value(
-        reduce_type == Reduce::And ? true : false,
-        bool_);
+    array fill_value(reduce_type == Reduce::And ? true : false, bool_);
     fill_gpu(fill_value, out, s);
     return true;
   }

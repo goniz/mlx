@@ -621,7 +621,8 @@ struct Nvfp4QMatmulPushConstants {
   uint32_t x_row_stride;
   uint32_t out_row_stride;
   uint32_t scale_row_stride;
-  uint32_t has_global_scales;
+  uint32_t has_global_scale_x;
+  uint32_t has_global_scale_w;
 };
 
 struct LayerNormAffinePushConstants {

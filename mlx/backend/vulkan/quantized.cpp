@@ -495,8 +495,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     std::ostringstream oss;
     oss << "primitive=QuantizedMatmul kind=" << kind
         << " x_shape=" << inputs[0].shape() << " x_dtype=" << inputs[0].dtype()
-        << " w_shape=" << inputs[1].shape() << " scales_dtype="
-        << inputs[2].dtype() << " out_shape=" << out.shape()
+        << " w_shape=" << inputs[1].shape()
+        << " scales_dtype=" << inputs[2].dtype() << " out_shape=" << out.shape()
         << " out_dtype=" << out.dtype() << " bits=" << bits_
         << " group_size=" << group_size_ << " transpose=" << transpose_;
     if (!detail.empty()) {
@@ -524,9 +524,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         x, make_contiguous_strides(flat_shape), x.flags(), x.size());
   }
 
-  const uint32_t qmm_rows = x_mat.ndim() == 2
-      ? static_cast<uint32_t>(x_mat.shape(-2))
-      : 0u;
+  const uint32_t qmm_rows =
+      x_mat.ndim() == 2 ? static_cast<uint32_t>(x_mat.shape(-2)) : 0u;
 
   const bool enable_fused_decode_qmm = []() {
     if (const char* env = std::getenv("MLX_VULKAN_FUSED_AFFINE_QMM");
@@ -552,6 +551,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const uint32_t k = static_cast<uint32_t>(x_mat.shape(-1));
       const uint32_t num_groups = static_cast<uint32_t>(scales_bf16.shape(-1));
       if (cols == static_cast<uint32_t>(out.shape(-1)) &&
+          static_cast<uint32_t>(w.shape(-1) * 32 / bits_) == k &&
           num_groups ==
               static_cast<uint32_t>((k + group_size_ - 1) / group_size_)) {
         array out_work(
@@ -569,7 +569,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.K = k;
           push_constants.packed_row_bytes =
               static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
-          push_constants.x_row_stride = static_cast<uint32_t>(x_mat.strides(-2));
+          push_constants.x_row_stride =
+              static_cast<uint32_t>(x_mat.strides(-2));
           push_constants.out_row_stride =
               static_cast<uint32_t>(out_work.strides(-2));
           push_constants.scale_row_stride =
@@ -580,16 +581,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.group_size = static_cast<uint32_t>(group_size_);
           push_constants.num_groups = num_groups;
 
-          const bool use_tiled_prefill = rows > 1 &&
-              group_size_ >= 32 && (group_size_ % 32) == 0 &&
+          const bool use_tiled_prefill = rows > 1 && group_size_ >= 32 &&
+              (group_size_ % 32) == 0 &&
               fused_affine_bf16_tiled_prefill_enabled();
           const auto shader_id = use_tiled_prefill
               ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
               : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16;
           const std::array<uint32_t, 3> grid = shader_id ==
                   vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
-              ? std::array<uint32_t, 3>{
-                    (cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
+              ? std::array<
+                    uint32_t,
+                    3>{(cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
               : std::array<uint32_t, 3>{
                     (cols + 15u) / 16u, (rows + 15u) / 16u, 1u};
 
@@ -620,7 +622,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
             flags.col_contiguous = out.size() <= 1 || out.size() == *max_dim;
           }
           out.copy_shared_buffer(
-              out_work, make_contiguous_strides(out.shape()), flags, out.size());
+              out_work,
+              make_contiguous_strides(out.shape()),
+              flags,
+              out.size());
           out.detach();
           out.set_status(array::Status::evaluated);
           trace_qmm("fused_bf16", "reshaped_output=1");
@@ -663,7 +668,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     const uint32_t k = static_cast<uint32_t>(x_mat.shape(-1));
     const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
     const bool decode_like_rows = rows == 1;
-    const bool prefill_like_rows = rows > 1 && fused_affine_qmm_prefill_enabled();
+    const bool prefill_like_rows =
+        rows > 1 && fused_affine_qmm_prefill_enabled();
 
     if ((decode_like_rows || prefill_like_rows) &&
         rows == static_cast<uint32_t>(x_mat.shape(-2)) &&
@@ -692,9 +698,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.num_groups = num_groups;
 
           const std::array<uint32_t, 3> grid = prefill_like_rows
-              ? std::array<uint32_t, 3>{(cols + 15u) / 16u,
-                                        (rows + 31u) / 32u,
-                                        1u}
+              ? std::array<
+                    uint32_t,
+                    3>{(cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
               : std::array<uint32_t, 3>{cols, rows, 1u};
 
           auto command_buffer = vulkan::begin_command_recording(s.index);
@@ -746,7 +752,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         copy_gpu(out_lowp, out_work, CopyType::General, s);
         lowp_dispatched = true;
       }
-
     }
 
     if (!lowp_dispatched) {
@@ -853,11 +858,14 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         push_constants.K = k;
         push_constants.packed_row_words = static_cast<uint32_t>(w.strides(-2));
         push_constants.x_row_stride = static_cast<uint32_t>(x.strides(-2));
-        push_constants.out_row_stride = static_cast<uint32_t>(out_work.strides(-2));
+        push_constants.out_row_stride =
+            static_cast<uint32_t>(out_work.strides(-2));
         push_constants.scale_row_stride =
             static_cast<uint32_t>(scales.strides(-2));
-        push_constants.has_global_scales =
-            global_scale_x.has_value() && global_scale_w.has_value() ? 1u : 0u;
+        push_constants.has_global_scale_x =
+            global_scale_x.has_value() ? 1u : 0u;
+        push_constants.has_global_scale_w =
+            global_scale_w.has_value() ? 1u : 0u;
         auto command_buffer = vulkan::begin_command_recording(s.index);
         vulkan::dispatch_nvfp4_qmatmul_op(
             w,
@@ -931,8 +939,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
                              : ensure_float32_row_contiguous(inputs[2], s);
   array biases = native_bf16 ? ensure_row_contiguous_zero_offset(inputs[3], s)
                              : ensure_float32_row_contiguous(inputs[3], s);
-  array lhs_indices = ensure_row_contiguous_zero_offset(inputs[inputs.size() - 2], s);
-  array rhs_indices = ensure_row_contiguous_zero_offset(inputs[inputs.size() - 1], s);
+  array lhs_indices =
+      ensure_row_contiguous_zero_offset(inputs[inputs.size() - 2], s);
+  array rhs_indices =
+      ensure_row_contiguous_zero_offset(inputs[inputs.size() - 1], s);
 
   if (x.ndim() < 3 || w.ndim() != 3 || scales.ndim() != 3 ||
       biases.ndim() != 3 || lhs_indices.shape() != rhs_indices.shape() ||
@@ -941,9 +951,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     msg << "[GatherQMM::eval_gpu] Expected rank-compatible x/w/scales/biases, "
         << "matching indices, and output rank indices+2 but got x=" << x.shape()
         << " w=" << w.shape() << " scales=" << scales.shape()
-        << " biases=" << biases.shape() << " lhs_indices="
-        << lhs_indices.shape() << " rhs_indices=" << rhs_indices.shape()
-        << " out=" << out.shape() << ".";
+        << " biases=" << biases.shape()
+        << " lhs_indices=" << lhs_indices.shape()
+        << " rhs_indices=" << rhs_indices.shape() << " out=" << out.shape()
+        << ".";
     throw std::runtime_error(msg.str());
   }
   if (lhs_indices.dtype() != uint32 || rhs_indices.dtype() != uint32) {
@@ -978,7 +989,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (rows != static_cast<uint32_t>(x.shape(-2)) ||
       cols != static_cast<uint32_t>(w.shape(-2)) ||
       static_cast<uint32_t>(w.shape(-1) * 32 / bits_) != k ||
-      num_groups != static_cast<uint32_t>((k + group_size_ - 1) / group_size_) ||
+      num_groups !=
+          static_cast<uint32_t>((k + group_size_ - 1) / group_size_) ||
       x.size() / (x.shape(-2) * x.shape(-1)) <= 0) {
     throw std::runtime_error(
         "[GatherQMM::eval_gpu] Incompatible gather qmm shapes.");
@@ -1003,9 +1015,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     push_constants.x_row_stride = static_cast<uint32_t>(x.strides(-2));
     push_constants.out_batch_stride = rows * cols;
     push_constants.out_row_stride = static_cast<uint32_t>(out_work.strides(-2));
-    push_constants.scale_matrix_stride = static_cast<uint32_t>(scales.strides(0));
+    push_constants.scale_matrix_stride =
+        static_cast<uint32_t>(scales.strides(0));
     push_constants.scale_row_stride = static_cast<uint32_t>(scales.strides(-2));
-    push_constants.bias_matrix_stride = static_cast<uint32_t>(biases.strides(0));
+    push_constants.bias_matrix_stride =
+        static_cast<uint32_t>(biases.strides(0));
     push_constants.bias_row_stride = static_cast<uint32_t>(biases.strides(-2));
     push_constants.w_matrix_stride_bytes =
         static_cast<uint32_t>(w.strides(0) * sizeof(uint32_t));

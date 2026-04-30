@@ -6,6 +6,7 @@
 layout(constant_id = 0) const int BLOCK_SIZE = 1024;
 layout(constant_id = 1) const int NCOLS_PADDED_LOG2 = 10;
 #define ASC 0
+#define SIGNED_MIN_AS_UINT 2147483648u
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -26,6 +27,19 @@ layout (push_constant) uniform parameter {
 
 shared ivec2 dst_row[BLOCK_SIZE];
 
+bool argsort_less(float lhs, uint lhs_idx, float rhs, uint rhs_idx) {
+    bool lhs_nan = isnan(lhs);
+    bool rhs_nan = isnan(rhs);
+
+    if (lhs_nan != rhs_nan) {
+        return rhs_nan;
+    }
+    if (lhs_nan) {
+        return lhs_idx < rhs_idx;
+    }
+    return lhs < rhs || (lhs == rhs && lhs_idx < rhs_idx);
+}
+
 bool argsort_should_swap(ivec2 lhs, ivec2 rhs) {
     float lhs_val = intBitsToFloat(lhs.y);
     float rhs_val = intBitsToFloat(rhs.y);
@@ -41,14 +55,38 @@ bool argsort_should_swap(ivec2 lhs, ivec2 rhs) {
     return lhs_val > rhs_val || (lhs_val == rhs_val && lhs.x > rhs.x);
 }
 
-void argsort(bool needs_bounds_check, const uint row) {
+void topk_suffix_partition(const uint row) {
+    const int col = int(gl_LocalInvocationID.x);
+    const uint row_offset = row * p.ncols;
+    const uint k = uint(-int(p.order));
+    const uint split = p.ncols - k;
+
+    if (col < p.ncols) {
+        const float val = data_a[row_offset + col];
+        uint less_count = 0;
+        for (uint other = 0; other < p.ncols; ++other) {
+            const float other_val = data_a[row_offset + other];
+            if (argsort_less(other_val, other, val, uint(col))) {
+                less_count++;
+            }
+        }
+        const uint ascending_rank = less_count;
+        data_d[row_offset + ascending_rank] = col;
+    }
+}
+
+void argsort(bool needs_bounds_check, const uint row, const uint output_order) {
     // bitonic sort
     const int col = int(gl_LocalInvocationID.x);
 
     const uint row_offset = row * p.ncols;
 
-    // initialize indices
-    dst_row[col] = ivec2(col, floatBitsToInt(data_a[row_offset + col]));
+    // initialize indices with safe OOB handling
+    if (col < p.ncols) {
+        dst_row[col] = ivec2(col, floatBitsToInt(data_a[row_offset + col]));
+    } else {
+        dst_row[col] = ivec2(int(p.ncols), 0);
+    }
     barrier();
 
     uint num_outer_loop_iters = NCOLS_PADDED_LOG2;
@@ -76,7 +114,7 @@ void argsort(bool needs_bounds_check, const uint row) {
     }
 
     if (col < p.ncols) {
-        if (p.order == ASC) {
+        if (output_order == ASC) {
             data_d[row_offset + col] = dst_row[col].x;
         } else {
             data_d[row_offset + p.ncols - col - 1] = dst_row[col].x;
@@ -85,16 +123,30 @@ void argsort(bool needs_bounds_check, const uint row) {
 }
 
 void main() {
+    if (p.order > SIGNED_MIN_AS_UINT && p.ncols == 256u && p.ncols_padded == 256u) {
+        uint row = gl_WorkGroupID.y;
+        while (row < p.nrows) {
+            topk_suffix_partition(row);
+            row += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+        }
+        return;
+    }
+
+    uint output_order = p.order;
+    if (output_order > 0u && output_order <= p.ncols) {
+        output_order = output_order - 1u;
+    }
+
     if (p.ncols == BLOCK_SIZE) {
         uint row = gl_WorkGroupID.y;
         while (row < p.nrows) {
-            argsort(false, row);
+            argsort(false, row, output_order);
             row += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
         }
     } else {
         uint row = gl_WorkGroupID.y;
         while (row < p.nrows) {
-            argsort(true, row);
+            argsort(true, row, output_order);
             row += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
         }
     }

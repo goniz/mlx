@@ -1,0 +1,99 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint has_global_scale;
+} p;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) writeonly buffer W { uint data_w[]; };
+layout(binding = 2) writeonly buffer S { uint8_t data_s[]; };
+layout(binding = 3) readonly buffer G { float data_global_scale[]; };
+
+float fp8_e4m3_to_fp32(uint8_t x) {
+    uint v = (uint(x) & 127u) << 7;
+    float val = unpackHalf2x16(v).x * 256.0;
+    return (x & uint8_t(128u)) != 0u ? -val : val;
+}
+
+uint8_t fp32_to_fp8_e4m3_positive(float x) {
+    if (x <= 0.0) {
+        return uint8_t(0u);
+    }
+    uint best = 0u;
+    float best_err = abs(x - fp8_e4m3_to_fp32(uint8_t(0u)));
+    for (uint code = 1u; code < 128u; ++code) {
+        float v = fp8_e4m3_to_fp32(uint8_t(code));
+        float err = abs(x - v);
+        if (err < best_err) {
+            best_err = err;
+            best = code;
+        }
+    }
+    return uint8_t(best);
+}
+
+float nvfp4_lut(uint q) {
+    const float lut[16] = float[16](
+        +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+    return lut[q];
+}
+
+uint quant_nvfp4(float x) {
+    uint best = 0u;
+    float best_err = abs(x - nvfp4_lut(0u));
+    for (uint q = 1u; q < 16u; ++q) {
+        float err = abs(x - nvfp4_lut(q));
+        if (err <= best_err) {
+            best_err = err;
+            best = q;
+        }
+    }
+    return best;
+}
+
+void main() {
+    const uint group = gl_GlobalInvocationID.x;
+    const uint group_base = group * 16u;
+    if (group_base >= p.ne) {
+        return;
+    }
+
+    float amax = 0.0;
+    for (uint i = 0u; i < 16u; ++i) {
+        const uint idx = group_base + i;
+        if (idx < p.ne) {
+            amax = max(amax, abs(data_a[idx]));
+        }
+    }
+
+    const float raw_scale = amax / 6.0;
+    const float scale_encode = p.has_global_scale != 0u
+        ? (448.0 * 6.0) / data_global_scale[0]
+        : 1.0;
+    const uint8_t scale_enc = fp32_to_fp8_e4m3_positive(raw_scale * scale_encode);
+    data_s[group] = scale_enc;
+    const float scale = fp8_e4m3_to_fp32(scale_enc) / scale_encode;
+    const float inv_scale = scale != 0.0 ? 1.0 / scale : 0.0;
+
+    uint word0 = 0u;
+    uint word1 = 0u;
+    for (uint i = 0u; i < 8u; ++i) {
+        const uint idx = group_base + i;
+        const uint q = idx < p.ne ? quant_nvfp4(data_a[idx] * inv_scale) : 0u;
+        word0 |= q << (4u * i);
+    }
+    for (uint i = 0u; i < 8u; ++i) {
+        const uint idx = group_base + 8u + i;
+        const uint q = idx < p.ne ? quant_nvfp4(data_a[idx] * inv_scale) : 0u;
+        word1 |= q << (4u * i);
+    }
+    data_w[group * 2u + 0u] = word0;
+    data_w[group * 2u + 1u] = word1;
+}

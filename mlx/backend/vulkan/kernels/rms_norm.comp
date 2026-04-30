@@ -38,6 +38,18 @@ layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
 
+#if !defined(LOAD_A)
+#define LOAD_A(x) FLOAT_TYPE(x)
+#endif
+
+#if !defined(LOAD_B)
+#define LOAD_B(x) FLOAT_TYPE(x)
+#endif
+
+#if !defined(STORE_D)
+#define STORE_D(x) D_TYPE(x)
+#endif
+
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
     const uint nrows     = gl_NumWorkGroups.x;
@@ -65,7 +77,7 @@ void rms_norm(uint num_iters) {
     [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
         FLOAT_TYPE xi = FLOAT_TYPE(0);
         if (col < ncols) {
-            xi = FLOAT_TYPE(data_a[a_offset + col]);
+            xi = LOAD_A(data_a[a_offset + col]);
         }
         sum += xi * xi;
     }
@@ -91,14 +103,14 @@ void rms_norm(uint num_iters) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+                data_d[d_offset + col] = STORE_D(scale * LOAD_A(data_a[a_offset + col]) * LOAD_B(data_b[b_offset + fastmod(col, p.ne10)]));
             }
         } else {
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+                data_d[d_offset + col] = STORE_D(scale * LOAD_A(data_a[a_offset + col]) * LOAD_B(data_b[b_offset + col]));
             }
         }
     } else {
@@ -106,7 +118,7 @@ void rms_norm(uint num_iters) {
             if (col >= ncols) {
                 continue;
             }
-            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            data_d[d_offset + col] = STORE_D(scale * LOAD_A(data_a[a_offset + col]));
         }
     }
 #if RMS_NORM_ROPE_FUSION

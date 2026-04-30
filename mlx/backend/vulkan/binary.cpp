@@ -129,17 +129,19 @@ bool try_eval_binary_op_vulkan(
     array& out,
     const char* op_name,
     Stream s) {
-  auto trace_binary_unsupported = [&](std::string_view reason, const array& lhs, const array& rhs) {
-    if (!trace_fallback_enabled()) {
-      return;
-    }
-    std::ostringstream oss;
-    oss << "binary_vulkan_unsupported op=" << op_name << " reason=" << reason
-        << " lhs_shape=" << lhs.shape() << " lhs_dtype=" << lhs.dtype()
-        << " rhs_shape=" << rhs.shape() << " rhs_dtype=" << rhs.dtype()
-        << " out_shape=" << out.shape() << " out_dtype=" << out.dtype();
-    trace_fallback(oss.str());
-  };
+  auto trace_binary_unsupported =
+      [&](std::string_view reason, const array& lhs, const array& rhs) {
+        if (!trace_fallback_enabled()) {
+          return;
+        }
+        std::ostringstream oss;
+        oss << "binary_vulkan_unsupported op=" << op_name
+            << " reason=" << reason << " lhs_shape=" << lhs.shape()
+            << " lhs_dtype=" << lhs.dtype() << " rhs_shape=" << rhs.shape()
+            << " rhs_dtype=" << rhs.dtype() << " out_shape=" << out.shape()
+            << " out_dtype=" << out.dtype();
+        trace_fallback(oss.str());
+      };
 
   if (inputs.size() != 2) {
     return false;
@@ -203,12 +205,10 @@ bool try_eval_binary_op_vulkan(
     b = b_u32;
   }
 
-  const bool low_precision_div = std::string_view(op_name) == "div" &&
+  const bool use_f32_staging_io = std::string_view(op_name) == "div" &&
       (a.dtype() == float16 || b.dtype() == float16 || out.dtype() == float16 ||
        a.dtype() == bfloat16 || b.dtype() == bfloat16 ||
        out.dtype() == bfloat16);
-  const bool use_f32_staging_io = low_precision_div || a.dtype() == bfloat16 ||
-      b.dtype() == bfloat16 || out.dtype() == bfloat16;
   if (use_f32_staging_io) {
     array a_f32(a.shape(), float32, nullptr, {});
     array b_f32(b.shape(), float32, nullptr, {});
@@ -239,10 +239,10 @@ bool try_eval_binary_op_vulkan(
     return false;
   }
 
-  if (!is_supported_elementwise_layout(a)) {
+  if (!is_supported_elementwise_layout(a) && !is_supported_unary_layout(a)) {
     a = contiguous_copy_gpu(a, s);
   }
-  if (!is_supported_elementwise_layout(b)) {
+  if (!is_supported_elementwise_layout(b) && !is_supported_unary_layout(b)) {
     b = contiguous_copy_gpu(b, s);
   }
   a = collapse_binary_leading_dims(a, s);
@@ -269,8 +269,8 @@ bool try_eval_binary_op_vulkan(
     set_binary_op_output_data(a, b, out_work, bopt);
   }
   array out_kernel = collapse_binary_leading_dims(out_work, s);
-  if (!is_supported_elementwise_layout(a) ||
-      !is_supported_elementwise_layout(b) ||
+  if ((!is_supported_elementwise_layout(a) && !is_supported_unary_layout(a)) ||
+      (!is_supported_elementwise_layout(b) && !is_supported_unary_layout(b)) ||
       !is_supported_elementwise_layout(out_kernel)) {
     trace_binary_unsupported("unsupported_elementwise_layout", a, b);
     return false;

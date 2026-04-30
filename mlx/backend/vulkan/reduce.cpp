@@ -104,7 +104,7 @@ bool try_eval_reduce_sum_rows_vulkan(
       in_kernel = swapaxes_in_eval(reduced, axis, reduced.ndim() - 1);
     }
 
-    if (!in_kernel.flags().row_contiguous ||
+    if (in_kernel.ndim() == 0 || in_kernel.strides(-1) != 1 ||
         !is_supported_unary_layout(in_kernel)) {
       in_kernel = contiguous_copy_gpu(in_kernel, s);
     }
@@ -231,8 +231,8 @@ bool try_eval_arg_reduce_vulkan(
     return false;
   }
 
-  if (!in_kernel.flags().row_contiguous || in_kernel.offset() != 0 ||
-      !is_supported_unary_layout(in_kernel)) {
+  if (in_kernel.ndim() == 0 || in_kernel.strides(-1) != 1 ||
+      in_kernel.offset() != 0 || !is_supported_unary_layout(in_kernel)) {
     in_kernel = contiguous_copy_gpu(in_kernel, s);
   }
 

@@ -1,0 +1,69 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "types.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W {
+    uint8_t data_w[];
+};
+layout(binding = 1) readonly buffer SCALES {
+    uint16_t data_scales[];
+};
+layout(binding = 2) readonly buffer BIASES {
+    uint16_t data_biases[];
+};
+layout(binding = 3) readonly buffer X {
+    uint16_t data_x[];
+};
+layout(binding = 4) writeonly buffer OUT {
+    uint16_t data_out[];
+};
+
+layout(push_constant) uniform parameter {
+    uint rows;
+    uint cols;
+    uint K;
+    uint packed_row_bytes;
+    uint x_row_stride;
+    uint out_row_stride;
+    uint scale_row_stride;
+    uint bias_row_stride;
+    uint bits;
+    uint group_size;
+    uint num_groups;
+} p;
+
+void main() {
+    const uint col = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+
+    if (row >= p.rows || col >= p.cols) {
+        return;
+    }
+
+    const uint w_row_base = col * p.packed_row_bytes;
+    const uint scale_row_base = col * p.scale_row_stride;
+    const uint bias_row_base = col * p.bias_row_stride;
+    const uint x_row_base = row * p.x_row_stride;
+
+    float acc = 0.0f;
+    for (uint group = 0u; group < p.num_groups; ++group) {
+        const float scale = bf16_to_fp32(uint(data_scales[scale_row_base + group]));
+        const float bias = bf16_to_fp32(uint(data_biases[bias_row_base + group]));
+        const uint group_start = group * p.group_size;
+        const uint group_end = min(group_start + p.group_size, p.K);
+
+        for (uint k = group_start; k < group_end; ++k) {
+            const float x = bf16_to_fp32(uint(data_x[x_row_base + k]));
+            const float w = scale * float(data_w[w_row_base + k]) + bias;
+            acc = fma(x, w, acc);
+        }
+    }
+
+    data_out[row * p.out_row_stride + col] = uint16_t(fp32_to_bf16(acc));
+}

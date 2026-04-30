@@ -46,6 +46,14 @@ bool trace_compiled_runtime_enabled() {
   return enabled;
 }
 
+bool trace_compiled_compile_flow_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_TRACE_COMPILED_COMPILE_FLOW");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
 bool trace_compiled_timing_enabled() {
   static const bool enabled = []() {
     const char* env = std::getenv("MLX_VULKAN_TRACE_COMPILED_TIMING");
@@ -215,8 +223,9 @@ bool supports_primitive_name(const std::string& prim_name) {
   static const std::unordered_set<std::string> supported = {
       "Abs",       "Add",     "AsType",  "Broadcast", "Ceil",     "Conjugate",
       "Cos",       "Divide",  "Exp",     "Floor",     "Imag",     "Log",
-      "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Power", "Real",
-      "Round",     "Sigmoid", "Sin",     "Sqrt",      "Subtract", "Tan", "Tanh"};
+      "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Power",
+      "Real",      "Round",   "Sigmoid", "Sin",       "Sqrt",     "Subtract",
+      "Tan",       "Tanh"};
   return supported.contains(prim_name);
 }
 
@@ -228,9 +237,10 @@ bool has_unsupported_bool_tape_op(const std::vector<array>& tape) {
     if (x.dtype() == bool_) {
       return true;
     }
-    return std::any_of(x.inputs().begin(), x.inputs().end(), [](const array& input) {
-      return input.dtype() == bool_;
-    });
+    return std::any_of(
+        x.inputs().begin(), x.inputs().end(), [](const array& input) {
+          return input.dtype() == bool_;
+        });
   });
 }
 
@@ -403,19 +413,7 @@ inline void build_glsl_kernel(
     bool contiguous,
     int ndim,
     int work_per_thread,
-    const Shape* strided_shape = nullptr,
-    const std::vector<Strides>* strided_strides = nullptr,
-    const std::vector<uint32_t>* input_offsets = nullptr,
-    const std::vector<uint32_t>* output_offsets = nullptr) {
-  if (!contiguous && (strided_shape == nullptr || strided_strides == nullptr)) {
-    throw std::runtime_error(
-        "Missing runtime shape/strides for Vulkan compiled strided kernel");
-  }
-  if (input_offsets == nullptr || output_offsets == nullptr) {
-    throw std::runtime_error(
-        "Missing runtime offsets for Vulkan compiled kernel");
-  }
-
+    uint32_t params_binding) {
   // Maps to store array identifiers - use simple valid GLSL names
   std::unordered_map<std::uintptr_t, std::string> var_names;
   int var_counter = 0;
@@ -455,8 +453,8 @@ inline void build_glsl_kernel(
   bool uses_int8_types = has_any_dtype(inputs, {int8, uint8, bool_}) ||
       has_any_dtype(outputs, {int8, uint8, bool_}) ||
       has_any_dtype(tape, {int8, uint8, bool_});
-  const bool uses_power = std::any_of(
-      tape.begin(), tape.end(), [](const array& x) {
+  const bool uses_power =
+      std::any_of(tape.begin(), tape.end(), [](const array& x) {
         return x.primitive().name() == "Power";
       });
 
@@ -477,9 +475,8 @@ inline void build_glsl_kernel(
   int wpt = std::min(work_per_thread, 16 / max_itemsize);
   wpt = std::max(wpt, 1);
 
-  const std::string buffer_layout_fmt = uses_int8_types
-      ? "layout(scalar, binding = {})"
-      : "layout(binding = {})";
+  const std::string buffer_layout_fmt =
+      uses_int8_types ? "layout(scalar, binding = {})" : "layout(binding = {})";
 
   // Buffer bindings for non-constant inputs
   int binding = 0;
@@ -501,7 +498,6 @@ inline void build_glsl_kernel(
     input_bindings.push_back({static_cast<int>(i), xname});
   }
 
-  // Strides buffer for non-contiguous access
   // Output buffers
   for (size_t i = 0; i < outputs.size(); ++i) {
     auto& x = outputs[i];
@@ -512,6 +508,37 @@ inline void build_glsl_kernel(
         i,
         dtype_to_glsl_storage(x.dtype()),
         xname);
+  }
+
+  // Params SSBO buffer (shape, strides, offsets)
+  os += fmt::format(
+      "{} readonly buffer Params {{ uint p[]; }};\n",
+      fmt::format(fmt::runtime(buffer_layout_fmt), params_binding));
+
+  // Compute params buffer layout offsets
+  uint32_t shape_base = 0;
+  uint32_t output_strides_base = 0;
+  uint32_t input_strides_base = 0;
+  uint32_t input_offsets_base = 0;
+  uint32_t output_offsets_base = 0;
+
+  if (!contiguous) {
+    int num_input_stride_sets = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      if (!is_constant(i) && !is_scalar(inputs[i])) {
+        num_input_stride_sets++;
+      }
+    }
+    shape_base = 0;
+    output_strides_base = static_cast<uint32_t>(ndim);
+    input_strides_base = static_cast<uint32_t>(2 * ndim);
+    input_offsets_base =
+        static_cast<uint32_t>(2 * ndim + num_input_stride_sets * ndim);
+    output_offsets_base =
+        input_offsets_base + static_cast<uint32_t>(inputs.size());
+  } else {
+    input_offsets_base = 0;
+    output_offsets_base = static_cast<uint32_t>(inputs.size());
   }
 
   // Push constants
@@ -536,82 +563,86 @@ layout(push_constant) uniform PushConstants {
     os += "  uint idx = base_idx;\n";
   }
 
+  if (!contiguous) {
+    os += "    uint rem_idx = idx;\n";
+    for (int axis = ndim - 1; axis >= 0; --axis) {
+      os += fmt::format(
+          "    uint coord_{} = rem_idx % p[{}u];\n", axis, shape_base + axis);
+      os += fmt::format("    rem_idx /= p[{}u];\n", shape_base + axis);
+    }
+  }
+
   // Declare and load inputs into temps
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& x = inputs[i];
     const auto& xname = get_var_name(x);
     std::string type_str = dtype_to_glsl_compute(x.dtype());
-    const uint32_t base_offset = (*input_offsets)[i];
+    uint32_t param_offset = input_offsets_base + static_cast<uint32_t>(i);
 
     if (is_constant(i)) {
       continue;
     } else if (is_scalar(x)) {
       if (x.dtype() == bool_) {
         os += fmt::format(
-            "    {} t_{} = ({}[{}] != uint8_t(0));\n",
+            "    {} t_{} = ({}[p[{}u]] != uint8_t(0));\n",
             type_str,
             xname,
             xname,
-            base_offset);
+            param_offset);
       } else if (x.dtype() == bfloat16) {
         os += fmt::format(
-            "    {} t_{} = bf16_to_fp32(uint({}[{}]));\n",
+            "    {} t_{} = bf16_to_fp32(uint({}[p[{}u]]));\n",
             type_str,
             xname,
             xname,
-            base_offset);
+            param_offset);
       } else {
         os += fmt::format(
-            "    {} t_{} = {}[{}];\n", type_str, xname, xname, base_offset);
+            "    {} t_{} = {}[p[{}u]];\n",
+            type_str,
+            xname,
+            xname,
+            param_offset);
       }
     } else if (contiguous) {
       if (x.dtype() == bool_) {
         os += fmt::format(
-            "    {} t_{} = ({}[idx + {}u] != uint8_t(0));\n",
+            "    {} t_{} = ({}[idx + p[{}u]] != uint8_t(0));\n",
             type_str,
             xname,
             xname,
-            base_offset);
+            param_offset);
       } else if (x.dtype() == bfloat16) {
         os += fmt::format(
-            "    {} t_{} = bf16_to_fp32(uint({}[idx + {}u]));\n",
+            "    {} t_{} = bf16_to_fp32(uint({}[idx + p[{}u]]));\n",
             type_str,
             xname,
             xname,
-            base_offset);
+            param_offset);
       } else {
         os += fmt::format(
-            "    {} t_{} = {}[idx + {}u];\n",
+            "    {} t_{} = {}[idx + p[{}u]];\n",
             type_str,
             xname,
             xname,
-            base_offset);
+            param_offset);
       }
     } else {
-      // Strided: compute location from strides
-      int stride_idx = 1;
+      // Strided: compute location from params buffer
+      int stride_set = 0;
       for (size_t j = 0; j < i; ++j) {
         if (!is_constant(j) && !is_scalar(inputs[j])) {
-          stride_idx++;
+          stride_set++;
         }
       }
-      const auto& runtime_shape = *strided_shape;
-      const auto& runtime_input_strides = (*strided_strides)[stride_idx];
-      os += fmt::format("    uint loc_{} = {}u;\n", xname, base_offset);
-      os += fmt::format("    uint rem_{} = idx;\n", xname);
+      uint32_t input_strides_offset = input_strides_base + stride_set * ndim;
+      os += fmt::format("    uint loc_{} = p[{}u];\n", xname, param_offset);
       for (int axis = ndim - 1; axis >= 0; --axis) {
         os += fmt::format(
-            "    uint coord_{0}_{1} = rem_{0} % uint({2});\n",
+            "    loc_{0} += coord_{1} * p[{2}u];\n",
             xname,
             axis,
-            runtime_shape[axis]);
-        os += fmt::format(
-            "    rem_{0} /= uint({1});\n", xname, runtime_shape[axis]);
-        os += fmt::format(
-            "    loc_{0} += coord_{0}_{1} * uint({2});\n",
-            xname,
-            axis,
-            runtime_input_strides[axis]);
+            input_strides_offset + axis);
       }
       if (x.dtype() == bool_) {
         os += fmt::format(
@@ -686,14 +717,12 @@ layout(push_constant) uniform PushConstants {
 
       if (prim_name == "Negative" && x.inputs().size() == 1) {
         os += fmt::format("(-{});\n", get_input_expr(x.inputs()[0]));
-      } else if (prim_name == "Power" && x.inputs().size() == 2 && !is_complex) {
+      } else if (
+          prim_name == "Power" && x.inputs().size() == 2 && !is_complex) {
         const auto lhs = get_input_expr(x.inputs()[0]);
         const auto rhs = get_input_expr(x.inputs()[1]);
         os += fmt::format(
-            "{}(safe_real_pow(float({}), float({})));\n",
-            type_str,
-            lhs,
-            rhs);
+            "{}(safe_real_pow(float({}), float({})));\n", type_str, lhs, rhs);
       } else if (prim_name == "LogAddExp" && x.inputs().size() == 2) {
         auto lhs = get_input_expr(x.inputs()[0]);
         auto rhs = get_input_expr(x.inputs()[1]);
@@ -790,49 +819,37 @@ layout(push_constant) uniform PushConstants {
     }
   }
 
-  const auto& runtime_shape = contiguous ? Shape{} : *strided_shape;
-  const auto& runtime_output_strides =
-      contiguous ? Strides{} : (*strided_strides)[0];
-
   // Write outputs
   for (size_t i = 0; i < outputs.size(); ++i) {
     auto& x = outputs[i];
     const auto& xname = get_var_name(x);
-    const uint32_t base_offset = (*output_offsets)[i];
+    uint32_t param_offset = output_offsets_base + static_cast<uint32_t>(i);
 
     if (contiguous) {
       if (x.dtype() == bool_) {
         os += fmt::format(
-            "    {}[idx + {}u] = uint8_t(t_{} ? 1 : 0);\n",
+            "    {}[idx + p[{}u]] = uint8_t(t_{} ? 1 : 0);\n",
             xname,
-            base_offset,
+            param_offset,
             xname);
       } else if (x.dtype() == bfloat16) {
         os += fmt::format(
-            "    {}[idx + {}u] = uint16_t(fp32_to_bf16(t_{}));\n",
+            "    {}[idx + p[{}u]] = uint16_t(fp32_to_bf16(t_{}));\n",
             xname,
-            base_offset,
+            param_offset,
             xname);
       } else {
         os += fmt::format(
-            "    {}[idx + {}u] = t_{};\n", xname, base_offset, xname);
+            "    {}[idx + p[{}u]] = t_{};\n", xname, param_offset, xname);
       }
     } else {
-      os += fmt::format("    uint loc_out_{} = {}u;\n", xname, base_offset);
-      os += fmt::format("    uint rem_out_{} = idx;\n", xname);
+      os += fmt::format("    uint loc_out_{} = p[{}u];\n", xname, param_offset);
       for (int axis = ndim - 1; axis >= 0; --axis) {
         os += fmt::format(
-            "    uint coord_out_{0}_{1} = rem_out_{0} % uint({2});\n",
+            "    loc_out_{0} += coord_{1} * p[{2}u];\n",
             xname,
             axis,
-            runtime_shape[axis]);
-        os += fmt::format(
-            "    rem_out_{0} /= uint({1});\n", xname, runtime_shape[axis]);
-        os += fmt::format(
-            "    loc_out_{0} += coord_out_{0}_{1} * uint({2});\n",
-            xname,
-            axis,
-            runtime_output_strides[axis]);
+            output_strides_base + axis);
       }
       if (x.dtype() == bool_) {
         os += fmt::format(
@@ -847,8 +864,7 @@ layout(push_constant) uniform PushConstants {
             xname,
             xname);
       } else {
-        os += fmt::format(
-            "    {}[loc_out_{}] = t_{};\n", xname, xname, xname);
+        os += fmt::format("    {}[loc_out_{}] = t_{};\n", xname, xname, xname);
       }
     }
   }
@@ -961,66 +977,29 @@ void Compiled::eval_gpu(
     throw std::runtime_error(
         "Compiled kernel failed on Vulkan (arrays >2^32 elements are only supported for contiguous layouts).");
   }
-  const bool has_nonzero_runtime_offset =
-      std::any_of(
-          input_offsets.begin(),
-          input_offsets.end(),
-          [](uint32_t x) { return x != 0; }) ||
-      std::any_of(output_offsets.begin(), output_offsets.end(), [](uint32_t x) {
-        return x != 0;
-      });
-
   // Build kernel name based on configuration
   std::string kernel_name = kernel_lib_;
   if (contiguous) {
     kernel_name += "_contiguous";
-    if (has_nonzero_runtime_offset) {
-      std::ostringstream layout_key;
-      for (size_t i = 0; i < input_offsets.size(); ++i) {
-        layout_key << "i" << i << "=" << input_offsets[i] << ",";
-      }
-      layout_key << "out=";
-      for (auto offset : output_offsets) {
-        layout_key << offset << ",";
-      }
-      kernel_name += fmt::format(
-          "_offsets_{}", std::hash<std::string>{}(layout_key.str()));
-    }
   } else {
     kernel_name += fmt::format("_strided_{}", shape.size());
-    std::ostringstream layout_key;
-    layout_key << "shape=";
-    for (auto dim : shape) {
-      layout_key << dim << ",";
-    }
-    for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
-      if (is_constant_(i)) {
-        continue;
-      }
-      if (!is_scalar(dispatch_inputs[i])) {
-        int stride_idx = 1;
-        for (size_t j = 0; j < i; ++j) {
-          if (!is_constant_(j) && !is_scalar(dispatch_inputs[j])) {
-            stride_idx++;
-          }
-        }
-        layout_key << "s" << i << "=";
-        for (auto stride : strides[stride_idx]) {
-          layout_key << stride << ",";
-        }
-      }
-      layout_key << "o" << i << "=" << input_offsets[i] << ",";
-    }
-    layout_key << "out=";
-    for (auto offset : output_offsets) {
-      layout_key << offset << ",";
-    }
-    kernel_name +=
-        fmt::format("_layout_{}", std::hash<std::string>{}(layout_key.str()));
   }
   // Check if we already have this kernel compiled (simple cache check)
   auto& manager = vulkan::KernelManager::get();
   auto* existing_shader = manager.get_shader(kernel_name);
+
+  if (trace_compiled_compile_flow_enabled()) {
+    std::cerr << "[vulkan-compiled-flow] eval_gpu enter: " << kernel_name
+              << " tape_size=" << tape_.size() << " contiguous=" << contiguous
+              << " large=" << large << " inputs=" << inputs_.size()
+              << " outputs=" << outputs_.size()
+              << " cached=" << (existing_shader != nullptr) << "\n";
+  } else if (trace_compiled_timing_enabled()) {
+    std::cerr << "[vulkan-compiled-timing] kernel=" << kernel_name
+              << " cached=" << (existing_shader != nullptr)
+              << " tape_size=" << tape_.size() << " contiguous=" << contiguous
+              << "\n";
+  }
 
   std::vector<uint32_t> spirv;
   if (!existing_shader) {
@@ -1028,6 +1007,13 @@ void Compiled::eval_gpu(
 
     // Generate GLSL source
     std::string glsl_source;
+    uint32_t params_binding = 0;
+    for (size_t i = 0; i < inputs_.size(); ++i) {
+      if (!is_constant_(i)) {
+        params_binding++;
+      }
+    }
+    params_binding += static_cast<uint32_t>(outputs_.size());
     build_glsl_kernel(
         glsl_source,
         kernel_name,
@@ -1039,14 +1025,22 @@ void Compiled::eval_gpu(
         contiguous,
         static_cast<int>(shape.size()),
         work_per_thread,
-        contiguous ? nullptr : &shape,
-        contiguous ? nullptr : &strides,
-        &input_offsets,
-        &output_offsets);
+        params_binding);
 
     if (trace_compiled_glsl_enabled()) {
       std::cerr << "=== Vulkan compiled GLSL: " << kernel_name << " ===\n"
                 << glsl_source << "\n=== End GLSL ===\n";
+    }
+
+    if (trace_compiled_compile_flow_enabled()) {
+      const auto glsl_built_at = std::chrono::steady_clock::now();
+      const auto glsl_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              glsl_built_at - compile_start)
+              .count();
+      std::cerr << "[vulkan-compiled-flow] glsl_generated: " << kernel_name
+                << " glsl_bytes=" << glsl_source.size() << " ms=" << glsl_ms
+                << "\n";
     }
 
     const auto glsl_built_at = std::chrono::steady_clock::now();
@@ -1064,24 +1058,53 @@ void Compiled::eval_gpu(
 
     const auto spirv_compiled_at = std::chrono::steady_clock::now();
 
+    if (trace_compiled_compile_flow_enabled()) {
+      const auto spirv_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              spirv_compiled_at - glsl_built_at)
+              .count();
+      std::cerr << "[vulkan-compiled-flow] spirv_compiled: " << kernel_name
+                << " spirv_words=" << spirv.size() << " ms=" << spirv_ms
+                << "\n";
+    }
+
     // Register the shader
     manager.register_shader(
         kernel_name, spirv.data(), spirv.size() * sizeof(uint32_t));
 
+    if (trace_compiled_compile_flow_enabled()) {
+      const auto registered_at = std::chrono::steady_clock::now();
+      const auto register_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              registered_at - spirv_compiled_at)
+              .count();
+      const auto total_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              registered_at - compile_start)
+              .count();
+      std::cerr << "[vulkan-compiled-flow] registered: " << kernel_name
+                << " register_ms=" << register_ms << " total_ms=" << total_ms
+                << "\n";
+    }
+
     if (trace_compiled_timing_enabled()) {
       const auto registered_at = std::chrono::steady_clock::now();
-      const auto glsl_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               glsl_built_at - compile_start)
-                               .count();
-      const auto spirv_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                spirv_compiled_at - glsl_built_at)
-                                .count();
-      const auto register_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   registered_at - spirv_compiled_at)
-                                   .count();
-      const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                registered_at - compile_start)
-                                .count();
+      const auto glsl_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              glsl_built_at - compile_start)
+              .count();
+      const auto spirv_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              spirv_compiled_at - glsl_built_at)
+              .count();
+      const auto register_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              registered_at - spirv_compiled_at)
+              .count();
+      const auto total_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              registered_at - compile_start)
+              .count();
       std::cerr << "[vulkan-compiled-timing] kernel=" << kernel_name
                 << " glsl_ms=" << glsl_ms << " spirv_ms=" << spirv_ms
                 << " register_ms=" << register_ms << " total_ms=" << total_ms
@@ -1127,6 +1150,14 @@ void Compiled::eval_gpu(
          nullptr});
   }
 
+  // Params binding
+  bindings.push_back(
+      {binding_idx++,
+       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       1,
+       VK_SHADER_STAGE_COMPUTE_BIT,
+       nullptr});
+
   // Get or create pipeline
   uint32_t push_constant_size = sizeof(uint32_t);
 
@@ -1162,7 +1193,6 @@ void Compiled::eval_gpu(
 
   // Input buffers
   uint32_t write_idx = 0;
-  std::vector<int32_t> all_strides;
 
   for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
     if (is_constant_(i)) {
@@ -1180,10 +1210,64 @@ void Compiled::eval_gpu(
     ++write_idx;
   }
 
+  // Output buffers
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    add_buffer(outputs[i]);
+    writes.push_back({});
+    writes[write_idx].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[write_idx].dstSet = VK_NULL_HANDLE;
+    writes[write_idx].dstBinding = write_idx;
+    writes[write_idx].dstArrayElement = 0;
+    writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[write_idx].descriptorCount = 1;
+    writes[write_idx].pBufferInfo = &buffer_infos[write_idx];
+    ++write_idx;
+  }
+
+  // Build params data
+  std::vector<uint32_t> params_data;
+  if (contiguous) {
+    for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+      params_data.push_back(input_offsets[i]);
+    }
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      params_data.push_back(output_offsets[i]);
+    }
+  } else {
+    for (auto dim : shape) {
+      params_data.push_back(static_cast<uint32_t>(dim));
+    }
+    const auto& out_strides = strides[0];
+    for (int d = 0; d < static_cast<int>(shape.size()); ++d) {
+      params_data.push_back(static_cast<uint32_t>(out_strides[d]));
+    }
+    for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+      if (is_constant_(i) || is_scalar(dispatch_inputs[i])) {
+        continue;
+      }
+      int stride_idx = 1;
+      for (size_t j = 0; j < i; ++j) {
+        if (!is_constant_(j) && !is_scalar(dispatch_inputs[j])) {
+          stride_idx++;
+        }
+      }
+      const auto& in_strides = strides[stride_idx];
+      for (int d = 0; d < static_cast<int>(shape.size()); ++d) {
+        params_data.push_back(static_cast<uint32_t>(in_strides[d]));
+      }
+    }
+    for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+      params_data.push_back(input_offsets[i]);
+    }
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      params_data.push_back(output_offsets[i]);
+    }
+  }
+
   if (trace_compiled_runtime_enabled()) {
     std::cerr << "[vulkan-compiled] kernel=" << kernel_name
               << " contiguous=" << contiguous << " shape=" << shape
-              << " all_strides=" << all_strides
+              << " params_size=" << params_data.size()
               << " out_data_size=" << outputs[0].data_size()
               << " out_size=" << outputs[0].size()
               << " input_offsets=" << input_offsets
@@ -1199,19 +1283,20 @@ void Compiled::eval_gpu(
     }
   }
 
-  // Output buffers
-  for (size_t i = 0; i < outputs.size(); ++i) {
-    add_buffer(outputs[i]);
-    writes.push_back({});
-    writes[write_idx].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[write_idx].dstSet = VK_NULL_HANDLE;
-    writes[write_idx].dstBinding = write_idx;
-    writes[write_idx].dstArrayElement = 0;
-    writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[write_idx].descriptorCount = 1;
-    writes[write_idx].pBufferInfo = &buffer_infos[write_idx];
-    ++write_idx;
-  }
+  auto params_array =
+      array(params_data.data(), {static_cast<int>(params_data.size())}, uint32);
+  params_array.eval();
+  add_buffer(params_array);
+  vulkan::retain_array_for_stream(s, params_array);
+  writes.push_back({});
+  writes[write_idx].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[write_idx].dstSet = VK_NULL_HANDLE;
+  writes[write_idx].dstBinding = write_idx;
+  writes[write_idx].dstArrayElement = 0;
+  writes[write_idx].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[write_idx].descriptorCount = 1;
+  writes[write_idx].pBufferInfo = &buffer_infos[write_idx];
+  ++write_idx;
 
   if (large) {
     for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
@@ -1220,55 +1305,62 @@ void Compiled::eval_gpu(
       }
       if (dispatch_inputs[i].data_size() != outputs[0].data_size()) {
         throw std::runtime_error(
-            "Compiled kernel failed on Vulkan (large contiguous compiled kernels require elementwise non-scalar inputs)."
-        );
+            "Compiled kernel failed on Vulkan (large contiguous compiled kernels require elementwise non-scalar inputs).");
       }
     }
   }
 
-  auto update_descriptor_set_for_chunk =
-      [&](uint64_t chunk_base_elements, uint64_t chunk_elements) {
-        size_t descriptor_binding = 0;
+  auto update_descriptor_set_for_chunk = [&](uint64_t chunk_base_elements,
+                                             uint64_t chunk_elements) {
+    size_t descriptor_binding = 0;
 
-        for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
-          if (is_constant_(i)) {
-            continue;
-          }
-          const auto& arr = dispatch_inputs[i];
-          const uint64_t item_size = static_cast<uint64_t>(size_of(arr.dtype()));
-          uint64_t offset_bytes = 0;
-          if (large && !is_scalar(arr)) {
-            offset_bytes += chunk_base_elements * item_size;
-          }
+    for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+      if (is_constant_(i)) {
+        continue;
+      }
+      const auto& arr = dispatch_inputs[i];
+      const uint64_t item_size = static_cast<uint64_t>(size_of(arr.dtype()));
+      uint64_t offset_bytes = 0;
+      if (large && !is_scalar(arr)) {
+        offset_bytes += chunk_base_elements * item_size;
+      }
 
-          buffer_infos[descriptor_binding].offset = static_cast<VkDeviceSize>(offset_bytes);
-          buffer_infos[descriptor_binding].range = VK_WHOLE_SIZE;
-          descriptor_binding++;
-        }
+      buffer_infos[descriptor_binding].offset =
+          static_cast<VkDeviceSize>(offset_bytes);
+      buffer_infos[descriptor_binding].range = VK_WHOLE_SIZE;
+      descriptor_binding++;
+    }
 
-        for (size_t i = 0; i < outputs.size(); ++i) {
-          const auto& arr = outputs[i];
-          const uint64_t item_size = static_cast<uint64_t>(size_of(arr.dtype()));
-          uint64_t offset_bytes = 0;
-          if (large) {
-            offset_bytes += chunk_base_elements * item_size;
-          }
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      const auto& arr = outputs[i];
+      const uint64_t item_size = static_cast<uint64_t>(size_of(arr.dtype()));
+      uint64_t offset_bytes = 0;
+      if (large) {
+        offset_bytes += chunk_base_elements * item_size;
+      }
 
-          buffer_infos[descriptor_binding].offset = static_cast<VkDeviceSize>(offset_bytes);
-          buffer_infos[descriptor_binding].range = VK_WHOLE_SIZE;
-          descriptor_binding++;
-        }
+      buffer_infos[descriptor_binding].offset =
+          static_cast<VkDeviceSize>(offset_bytes);
+      buffer_infos[descriptor_binding].range = VK_WHOLE_SIZE;
+      descriptor_binding++;
+    }
 
-      };
+    // Params buffer offset is always 0 (no chunking for params)
+    buffer_infos[descriptor_binding].offset = 0;
+    buffer_infos[descriptor_binding].range = VK_WHOLE_SIZE;
+    descriptor_binding++;
+  };
 
   std::vector<vk::DescriptorSet> descriptor_sets_to_free;
-  auto bind_descriptors_for_chunk = [&](uint64_t chunk_base_elements, uint64_t chunk_elements) {
+  auto bind_descriptors_for_chunk = [&](uint64_t chunk_base_elements,
+                                        uint64_t chunk_elements) {
     update_descriptor_set_for_chunk(chunk_base_elements, chunk_elements);
 
     if (use_push_descriptor) {
       auto push_fn = vulkan::VulkanContext::get().push_descriptor_fn();
       if (push_fn == nullptr) {
-        throw std::runtime_error("Missing Vulkan push descriptor function for compiled kernel");
+        throw std::runtime_error(
+            "Missing Vulkan push descriptor function for compiled kernel");
       }
       for (auto& write : writes) {
         write.dstSet = VK_NULL_HANDLE;
@@ -1283,21 +1375,23 @@ void Compiled::eval_gpu(
       return;
     }
 
-    auto descriptor_set = manager.allocate_descriptor_set(pipeline->descriptor_layout);
+    auto descriptor_set =
+        manager.allocate_descriptor_set(pipeline->descriptor_layout);
     descriptor_sets_to_free.push_back(descriptor_set);
     for (auto& write : writes) {
       write.dstSet = descriptor_set;
     }
     if (!writes.empty()) {
-          vkUpdateDescriptorSets(
-              vulkan::VulkanContext::get().device(),
-              static_cast<uint32_t>(writes.size()),
-              writes.data(),
-              0,
-              nullptr);
+      vkUpdateDescriptorSets(
+          vulkan::VulkanContext::get().device(),
+          static_cast<uint32_t>(writes.size()),
+          writes.data(),
+          0,
+          nullptr);
     }
 
-    VkDescriptorSet vk_descriptor_set = static_cast<VkDescriptorSet>(descriptor_set);
+    VkDescriptorSet vk_descriptor_set =
+        static_cast<VkDescriptorSet>(descriptor_set);
     vkCmdBindDescriptorSets(
         cmd_buffer,
         VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1367,7 +1461,8 @@ void Compiled::eval_gpu(
   // Defer descriptor set cleanup
   if (!use_push_descriptor) {
     for (auto descriptor_set : descriptor_sets_to_free) {
-      manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+      manager.defer_descriptor_set_free(
+          s.index, descriptor_epoch, descriptor_set);
     }
   }
 }

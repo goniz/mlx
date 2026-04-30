@@ -94,6 +94,19 @@ void trace_flash_attention_array(const char* label, const array& arr) {
   trace_flash_attention_debug(oss.str());
 }
 
+std::optional<vulkan::StaticShaderId> rms_norm_shader_id(Dtype dtype) {
+  switch (dtype) {
+    case float32:
+      return vulkan::StaticShaderId::rms_norm_f32;
+    case float16:
+      return vulkan::StaticShaderId::rms_norm_f16;
+    case bfloat16:
+      return vulkan::StaticShaderId::rms_norm_bf16;
+    default:
+      return std::nullopt;
+  }
+}
+
 void begin_tracked_manual_op(
     Stream s,
     const char* name,
@@ -1373,6 +1386,198 @@ bool try_eval_sdpa_heads_vulkan(
   const int v_dim = v_in.shape(3);
   const int batch_heads = batch * n_kv_heads;
 
+  const bool is_decode = (q_len == 1 && n_repeats > 1);
+
+  // Build output shape in head layout (not collapsed batch_heads layout).
+  const Shape out_head_shape = {batch, n_q_heads, q_len, v_dim};
+  const Shape score_head_shape = {batch, n_q_heads, q_len, kv_len};
+
+  if (is_decode) {
+    // --- Decode GQA path: avoid broadcast copies on K/V -----------------------
+    // Use NC matvec with f16 matrix + f32 vector, no repeated-head broadcast.
+
+    stage = "cast_inputs_decode";
+    // q: scale + cast to f32
+    array q_f32 = cast_to_f32_sdpa(
+        multiply(array(scale, q_in.dtype()), q_in, s), s);
+    // K/V: cast original (bf16/f16) directly to f16 for NC matvec.
+    array k_f16(k_in.shape(), float16, nullptr, {});
+    copy_gpu(k_in, k_f16, CopyType::General, s);
+    k_f16.set_status(array::Status::evaluated);
+
+    array v_f16(v_in.shape(), float16, nullptr, {});
+    copy_gpu(v_in, v_f16, CopyType::General, s);
+    v_f16.set_status(array::Status::evaluated);
+
+    // q in head layout, must be contiguous for matvec
+    stage = "reshape_q_decode";
+    array q_heads = reshape_sdpa_contiguous_view(
+        q_f32, {batch, n_q_heads, q_len, q_dim});
+    q_heads = ensure_sdpa_rowwise_layout(q_heads, s);
+    q_heads.set_status(array::Status::evaluated);
+
+    // k is already in [batch, n_kv_heads, kv_len, q_dim] f16.
+    // Ensure k is row-contiguous so matvec strides are trivial.
+    if (!is_supported_sdpa_rowwise_layout(k_f16)) {
+      k_f16 = contiguous_copy_gpu(k_f16, s);
+    }
+    k_f16.set_status(array::Status::evaluated);
+
+    // --- QK matvec via NC dispatch (matrix = k_f16, vec = q_heads) ----------
+    stage = "scores_matmul_decode";
+    array scores_head(score_head_shape, float32, nullptr, {});
+    scores_head.set_data(allocator::malloc(scores_head.nbytes()));
+
+    {
+      const uint32_t gqa = static_cast<uint32_t>(n_repeats);
+      auto cmd = vulkan::begin_command_recording(s.index);
+      vulkan::dispatch_mul_mat_vec_nc_op(
+          // matrix: k_f16 [batch, n_kv_heads, kv_len, q_dim]
+          k_f16,
+          // vec:    q_heads [batch, n_q_heads, 1, q_dim]
+          q_heads,
+          scores_head,
+          vulkan::StaticShaderId::mul_mat_vec_nc_f16_f32,
+          cmd,
+          s,
+          {
+              static_cast<uint32_t>(q_dim),                       // ncols_x = inner dim
+              static_cast<uint32_t>(kv_len),                      // nrows_x = output dim
+              static_cast<uint32_t>(k_f16.strides(-2)),           // row_stride_x
+              static_cast<uint32_t>(k_f16.strides(-3)),           // channel_stride_x
+              static_cast<uint32_t>(q_heads.strides(-3)),         // channel_stride_y
+              gqa,                                                // channel_x_divisor
+              static_cast<uint32_t>(n_q_heads),                   // ne12
+              0,
+              0,
+              static_cast<uint32_t>(k_f16.strides(-4)),           // nb03
+              static_cast<uint32_t>(q_heads.strides(-4)),         // nb13
+              static_cast<uint32_t>(scores_head.strides(-4)),      // nb23
+              0,
+          },
+          {
+              static_cast<uint32_t>(batch),
+              static_cast<uint32_t>(kv_len),
+              static_cast<uint32_t>(n_q_heads),
+          });
+      vulkan::end_command_recording(s.index);
+    }
+    scores_head.set_status(array::Status::evaluated);
+
+    // Cast scores to the f32 type expected by downstream stages.
+    // (scores_head is already f32, but output dtype may differ; keep as is.)
+
+    // Mask
+    std::optional<array> mask_work;
+    if (inputs.size() > 3) {
+      stage = "prepare_mask_decode";
+      array mask = cast_to_f32_sdpa(inputs[3], s);
+      if (mask.ndim() == 4 && mask.shape(1) == 1) {
+        mask = broadcast_to(mask, score_head_shape, s);
+      }
+      mask = ensure_sdpa_rowwise_layout(mask, s);
+      mask = reshape_sdpa_contiguous_view(mask, score_head_shape);
+      mask = ensure_sdpa_rowwise_layout(mask, s);
+      mask.set_status(array::Status::evaluated);
+      mask_work = mask;
+    }
+
+    if (do_causal) {
+      stage = "causal_mask_decode";
+      const int n_past = k_in.shape(2) - q_in.shape(2);
+      scores_head = apply_diag_mask_inf_vulkan(scores_head, n_past, s);
+    }
+
+    if (mask_work.has_value()) {
+      stage = "add_mask_decode";
+      array masked(score_head_shape, float32, nullptr, {});
+      eval_sdpa_binary_add_vulkan(scores_head, *mask_work, masked, s);
+      scores_head = masked;
+    }
+
+    if (logsumexp_out != nullptr) {
+      stage = "logsumexp_decode";
+      Shape logsumexp_shape = score_head_shape;
+      logsumexp_shape.back() = 1;
+      array logsumexp_f32(logsumexp_shape, float32, nullptr, {});
+      eval_sdpa_logsumexp_vulkan(scores_head, logsumexp_f32, s);
+      copy_gpu(
+          reshape_sdpa_contiguous_view(logsumexp_f32, logsumexp_out->shape()),
+          *logsumexp_out,
+          CopyType::General,
+          s);
+      logsumexp_out->set_status(array::Status::evaluated);
+    }
+
+    stage = "softmax_decode";
+    array probs_head(score_head_shape, float32, nullptr, {});
+    eval_sdpa_softmax_vulkan(scores_head, probs_head, s);
+
+    // --- Scores×V matvec via NC dispatch (matrix = v_f16, vec = probs) ------
+    stage = "result_matmul_decode";
+    // Ensure v_f16 is contiguous before swapaxes
+    if (!is_supported_sdpa_rowwise_layout(v_f16)) {
+      v_f16 = contiguous_copy_gpu(v_f16, s);
+    }
+    v_f16.set_status(array::Status::evaluated);
+
+    array v_t = swapaxes_in_eval(v_f16, -1, -2);
+    if (!is_supported_sdpa_rowwise_layout(v_t)) {
+      v_t = contiguous_copy_gpu(v_t, s);
+    }
+    v_t.set_status(array::Status::evaluated);
+
+    {
+      array result_heads(out_head_shape, float32, nullptr, {});
+      result_heads.set_data(allocator::malloc(result_heads.nbytes()));
+
+      const uint32_t gqa = static_cast<uint32_t>(n_repeats);
+      auto cmd = vulkan::begin_command_recording(s.index);
+      vulkan::dispatch_mul_mat_vec_nc_op(
+          v_t,
+          probs_head,
+          result_heads,
+          vulkan::StaticShaderId::mul_mat_vec_nc_f16_f32,
+          cmd,
+          s,
+          {
+              static_cast<uint32_t>(kv_len),                      // ncols_x = inner dim
+              static_cast<uint32_t>(v_dim),                       // nrows_x = output dim
+              static_cast<uint32_t>(v_t.strides(-2)),            // row_stride_x
+              static_cast<uint32_t>(v_t.strides(-3)),            // channel_stride_x
+              static_cast<uint32_t>(probs_head.strides(-3)),     // channel_stride_y
+              gqa,                                               // channel_x_divisor
+              static_cast<uint32_t>(n_q_heads),                  // ne12
+              0,
+              0,
+              static_cast<uint32_t>(v_t.strides(-4)),            // nb03
+              static_cast<uint32_t>(probs_head.strides(-4)),     // nb13
+              static_cast<uint32_t>(result_heads.strides(-4)),    // nb23
+              0,
+          },
+          {
+              static_cast<uint32_t>(batch),
+              static_cast<uint32_t>(v_dim),
+              static_cast<uint32_t>(n_q_heads),
+          });
+      vulkan::end_command_recording(s.index);
+
+      result_heads.set_status(array::Status::evaluated);
+      stage = "copy_out_decode";
+      copy_gpu(
+          reshape_sdpa_contiguous_view(result_heads, out.shape()),
+          out,
+          CopyType::General,
+          s);
+    }
+    out.set_status(array::Status::evaluated);
+    return true;
+  }
+
+  // ==========================================================================
+  // Prefill (or non-decode) path: original broadcast + materialize logic
+  // ==========================================================================
+
   stage = "cast_inputs";
   array q = cast_to_f32_sdpa(multiply(array(scale, q_in.dtype()), q_in, s), s);
   array k = cast_to_f32_sdpa(k_in, s);
@@ -1526,8 +1731,14 @@ bool try_eval_rms_norm_vulkan(
     return false;
   }
 
-  const bool use_f32_staging_io =
-      x.dtype() != float32 || w.dtype() != float32 || out.dtype() != float32;
+  const bool native_lowp_2048 = x.shape(-1) == 2048 &&
+      (x.dtype() == float16 || x.dtype() == bfloat16) && x.dtype() == w.dtype() &&
+      x.dtype() == out.dtype();
+  auto shader_id = (x.dtype() == float32 && w.dtype() == float32 &&
+                    out.dtype() == float32) || native_lowp_2048
+      ? rms_norm_shader_id(x.dtype())
+      : std::nullopt;
+  const bool use_f32_staging_io = !shader_id.has_value();
   if (use_f32_staging_io) {
     array x_f32(x.shape(), float32, nullptr, {});
     array w_f32(w.shape(), float32, nullptr, {});
@@ -1535,6 +1746,7 @@ bool try_eval_rms_norm_vulkan(
     copy_gpu(w, w_f32, CopyType::General, s);
     x = x_f32;
     w = w_f32;
+    shader_id = vulkan::StaticShaderId::rms_norm_f32;
   }
 
   if (w.ndim() > 4) {
@@ -1561,7 +1773,7 @@ bool try_eval_rms_norm_vulkan(
   const bool staged_output = use_f32_staging_io || !out.flags().contiguous ||
       out.offset() != 0 || out.strides().back() != 1;
   array out_work =
-      staged_output ? array(out.shape(), float32, nullptr, {}) : out;
+      staged_output ? array(out.shape(), x.dtype(), nullptr, {}) : out;
   set_unary_output_data(x, out_work);
   if (!out_work.flags().contiguous || out_work.offset() != 0 ||
       out_work.strides().back() != 1 || !is_supported_unary_layout(out_work)) {
@@ -1599,12 +1811,13 @@ bool try_eval_rms_norm_vulkan(
         x,
         w,
         out_work,
-        vulkan::StaticShaderId::rms_norm_f32,
+        *shader_id,
         command_buffer,
         s,
         vulkan::BinaryDispatchVariant::Standard,
         std::array<uint32_t, 3>{nrows, nchannels, nsamples},
-        {0u, has_weight ? 1u : 0u});
+        {0u, has_weight ? 1u : 0u},
+        eps);
     vulkan::end_command_recording(s.index);
     end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
     if (staged_output) {
@@ -2222,12 +2435,16 @@ void Quantize::eval_gpu(
     std::vector<array>& outputs) {
   if (dequantize_) {
     if (mode_ != QuantizationMode::Affine) {
-      if (mode_ == QuantizationMode::Nvfp4 && inputs.size() == 2 &&
+      if (mode_ == QuantizationMode::Nvfp4 &&
+          (inputs.size() == 2 || inputs.size() == 3) &&
           outputs.size() == 1) {
         auto& out = outputs[0];
         array out_f32(out.shape(), float32, nullptr, {});
+        std::optional<array> global_scale = inputs.size() == 3
+            ? std::make_optional(inputs[2])
+            : std::nullopt;
         if (!vulkan::nvfp4_dequantize_to_float32(
-                inputs[0], inputs[1], out_f32, stream())) {
+                inputs[0], inputs[1], global_scale, out_f32, stream())) {
           throw std::runtime_error(
               "[Quantize::eval_gpu] Nvfp4 dequantize failed on Vulkan.");
         }
@@ -2277,8 +2494,27 @@ void Quantize::eval_gpu(
     copy_gpu(out_f32, out, CopyType::General, s);
   } else {
     if (mode_ != QuantizationMode::Affine) {
+      if (mode_ == QuantizationMode::Nvfp4 &&
+          (inputs.size() == 1 || inputs.size() == 2) && outputs.size() == 2) {
+        auto& s = stream();
+        array in_f32 = inputs[0];
+        if (in_f32.dtype() != float32) {
+          in_f32 = array(inputs[0].shape(), float32, nullptr, {});
+          in_f32.set_data(allocator::malloc(in_f32.nbytes()));
+          copy_gpu(inputs[0], in_f32, CopyType::General, s);
+        }
+        std::optional<array> global_scale = inputs.size() == 2
+            ? std::make_optional(inputs[1])
+            : std::nullopt;
+        if (!vulkan::nvfp4_quantize_from_float32(
+                in_f32, outputs[0], outputs[1], global_scale, s)) {
+          throw std::runtime_error(
+              "[Quantize::eval_gpu] Nvfp4 quantize failed on Vulkan.");
+        }
+        return;
+      }
       throw std::runtime_error(
-          "Quantize encode only supports Affine mode on Vulkan.");
+          "Quantize encode only supports Affine and Nvfp4 modes on Vulkan.");
     }
     if (outputs.size() != 3 || inputs.size() != 1) {
       throw std::runtime_error(

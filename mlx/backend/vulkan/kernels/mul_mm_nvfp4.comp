@@ -1,0 +1,131 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W { uint data_w[]; };
+layout(binding = 1) readonly buffer S { uint8_t data_s[]; };
+layout(binding = 2) readonly buffer X { float data_x[]; };
+layout(binding = 3) readonly buffer GX { float data_global_scale_x[]; };
+layout(binding = 4) readonly buffer GW { float data_global_scale_w[]; };
+layout(binding = 5) writeonly buffer OUT { float data_out[]; };
+
+layout(push_constant) uniform parameter {
+    uint rows;
+    uint cols;
+    uint K;
+    uint packed_row_words;
+    uint x_row_stride;
+    uint out_row_stride;
+    uint scale_row_stride;
+    uint has_global_scales;
+} p;
+
+shared float partial[256];
+shared float x_group_scale;
+
+float fp8_e4m3_to_fp32(uint8_t x) {
+    uint v = (uint(x) & 127u) << 7;
+    float val = unpackHalf2x16(v).x * 256.0;
+    return (x & uint8_t(128u)) != 0u ? -val : val;
+}
+
+uint8_t fp32_to_fp8_e4m3_positive(float x) {
+    if (x <= 0.0) {
+        return uint8_t(0u);
+    }
+    uint best = 0u;
+    float best_err = abs(x - fp8_e4m3_to_fp32(uint8_t(0u)));
+    for (uint code = 1u; code < 128u; ++code) {
+        float v = fp8_e4m3_to_fp32(uint8_t(code));
+        float err = abs(x - v);
+        if (err < best_err) {
+            best_err = err;
+            best = code;
+        }
+    }
+    return uint8_t(best);
+}
+
+float nvfp4_lut(uint q) {
+    const float lut[16] = float[16](
+        +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+    return lut[q];
+}
+
+uint quant_nvfp4(float x) {
+    uint best = 0u;
+    float best_err = abs(x - nvfp4_lut(0u));
+    for (uint q = 1u; q < 16u; ++q) {
+        float err = abs(x - nvfp4_lut(q));
+        if (err <= best_err) {
+            best_err = err;
+            best = q;
+        }
+    }
+    return best;
+}
+
+float decode_w(uint row_base, uint scale_base, uint k) {
+    const uint packed = data_w[row_base + (k >> 3u)];
+    const uint q = (packed >> ((k & 7u) * 4u)) & 0xFu;
+    float scale = fp8_e4m3_to_fp32(data_s[scale_base + (k >> 4u)]);
+    if (p.has_global_scales != 0u) {
+        scale *= data_global_scale_w[0] / (448.0 * 6.0);
+    }
+    return nvfp4_lut(q) * scale;
+}
+
+void main() {
+    const uint col = gl_WorkGroupID.x;
+    const uint row = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.rows || col >= p.cols) {
+        return;
+    }
+
+    const uint w_row_base = col * p.packed_row_words;
+    const uint scale_row_base = col * p.scale_row_stride;
+    const uint x_row_base = row * p.x_row_stride;
+
+    float acc = 0.0;
+    for (uint group = 0u; group < (p.K + 15u) / 16u; ++group) {
+        const uint group_start = group * 16u;
+        const uint group_end = min(group_start + 16u, p.K);
+        if (tid == 0u) {
+            float amax = 0.0;
+            for (uint k = group_start; k < group_end; ++k) {
+                amax = max(amax, abs(data_x[x_row_base + k]));
+            }
+            float raw_scale = amax / 6.0;
+            float scale_encode = p.has_global_scales != 0u
+                ? (448.0 * 6.0) / data_global_scale_x[0]
+                : 1.0;
+            uint8_t scale_enc = fp32_to_fp8_e4m3_positive(raw_scale * scale_encode);
+            x_group_scale = fp8_e4m3_to_fp32(scale_enc) / scale_encode;
+        }
+        barrier();
+
+        const float inv_x_scale = x_group_scale != 0.0 ? 1.0 / x_group_scale : 0.0;
+        for (uint k = group_start + tid; k < group_end; k += gl_WorkGroupSize.x) {
+            const float xq = nvfp4_lut(quant_nvfp4(data_x[x_row_base + k] * inv_x_scale)) * x_group_scale;
+            acc = fma(xq, decode_w(w_row_base, scale_row_base, k), acc);
+        }
+        barrier();
+    }
+
+    partial[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        data_out[row * p.out_row_stride + col] = partial[0];
+    }
+}

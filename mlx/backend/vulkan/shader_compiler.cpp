@@ -4,14 +4,38 @@
 
 #include <fmt/format.h>
 #include <shaderc/shaderc.hpp>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 
 namespace mlx::core::vulkan {
 
+namespace {
+
+bool trace_shader_compile_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_TRACE_SHADER_COMPILE");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
+} // namespace
+
 std::vector<uint32_t> compile_glsl_to_spirv(
     const std::string& glsl_source,
     const std::string& shader_name) {
+  const bool trace = trace_shader_compile_enabled();
+
+  if (trace) {
+    std::cerr << "[vulkan-shader-compile] start: " << shader_name
+              << " glsl_bytes=" << glsl_source.size() << "\n";
+  }
+  const auto t0 = trace ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+
   shaderc::Compiler compiler;
   shaderc::CompileOptions options;
 
@@ -27,6 +51,20 @@ std::vector<uint32_t> compile_glsl_to_spirv(
       shaderc_compute_shader,
       shader_name.c_str(),
       options);
+
+  if (trace) {
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        t1 - t0)
+                        .count();
+    std::cerr << "[vulkan-shader-compile] done: " << shader_name
+              << " spirv_words=" << (result.cend() - result.cbegin())
+              << " ms=" << ms;
+    if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+      std::cerr << " FAILED";
+    }
+    std::cerr << "\n";
+  }
 
   if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
     throw std::runtime_error(

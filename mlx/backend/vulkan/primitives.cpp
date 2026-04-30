@@ -1650,14 +1650,10 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
         "Reduce operations (Sum, Prod, Min, Max) are not yet implemented.");
   }
 
-  if (is_donatable(in, out) && in.dtype() == out.dtype()) {
-    out.copy_shared_buffer(in);
-  } else {
-    auto ctype = in.flags().contiguous && in.size() == in.data_size()
-        ? CopyType::Vector
-        : CopyType::General;
-    copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
-  }
+  auto ctype = in.flags().contiguous && in.size() == in.data_size()
+      ? CopyType::Vector
+      : CopyType::General;
+  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
 
   auto [data_offset, out_strides] =
       prepare_slice(out, start_indices_, strides_);

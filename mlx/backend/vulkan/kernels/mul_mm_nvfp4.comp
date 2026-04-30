@@ -20,7 +20,8 @@ layout(push_constant) uniform parameter {
     uint x_row_stride;
     uint out_row_stride;
     uint scale_row_stride;
-    uint has_global_scales;
+    uint has_global_scale_x;
+    uint has_global_scale_w;
 } p;
 
 shared float partial[256];
@@ -73,7 +74,7 @@ float decode_w(uint row_base, uint scale_base, uint k) {
     const uint packed = data_w[row_base + (k >> 3u)];
     const uint q = (packed >> ((k & 7u) * 4u)) & 0xFu;
     float scale = fp8_e4m3_to_fp32(data_s[scale_base + (k >> 4u)]);
-    if (p.has_global_scales != 0u) {
+    if (p.has_global_scale_w != 0u) {
         scale *= data_global_scale_w[0] / (448.0 * 6.0);
     }
     return nvfp4_lut(q) * scale;
@@ -101,7 +102,7 @@ void main() {
                 amax = max(amax, abs(data_x[x_row_base + k]));
             }
             float raw_scale = amax / 6.0;
-            float scale_encode = p.has_global_scales != 0u
+            float scale_encode = p.has_global_scale_x != 0u
                 ? (448.0 * 6.0) / data_global_scale_x[0]
                 : 1.0;
             uint8_t scale_enc = fp32_to_fp8_e4m3_positive(raw_scale * scale_encode);

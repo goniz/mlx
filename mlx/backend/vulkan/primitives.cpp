@@ -1653,7 +1653,11 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto ctype = in.flags().contiguous && in.size() == in.data_size()
       ? CopyType::Vector
       : CopyType::General;
-  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+  ctype = in.data_size() == 1 ? CopyType::Scalar : ctype;
+  out.set_data(allocator::malloc(ctype == CopyType::Vector
+                   ? in.data_size() * out.itemsize()
+                   : out.nbytes()));
+  copy_gpu_inplace(in, out, ctype, stream());
 
   auto [data_offset, out_strides] =
       prepare_slice(out, start_indices_, strides_);

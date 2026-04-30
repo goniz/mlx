@@ -255,7 +255,7 @@ std::string build_dynamic_general_copy_shader(
     for (int dim = static_cast<int>(shape.size()) - 1; dim >= 0; --dim) {
       os << "  {\n";
       os << "    uint coord = remaining % " << static_cast<uint32_t>(shape[dim])
-         << "u;\n";
+          << "u;\n";
       os << "    remaining /= " << static_cast<uint32_t>(shape[dim]) << "u;\n";
       os << "    input_index += int64_t(coord) * int64_t(" << i_strides[dim]
          << ");\n";
@@ -1499,7 +1499,7 @@ void copy_gpu_inplace(
             "Copy operation failed on Vulkan: >4D non-contiguous arrays not supported");
       }
 
-      if (large_shader_offset) {
+      if (large_shader_offset || is_slice_copy) {
         if (!dispatch_dynamic_general_copy(
                 in_view,
                 out_view,

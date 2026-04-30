@@ -3,9 +3,11 @@
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/utils.h"
 
 #include <algorithm>
+#include <sstream>
 
 namespace mlx::core {
 
@@ -97,6 +99,105 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   return has_vulkan_buffer(arr);
 }
 
+bool is_same_complex_add(const array& a, const array& b, const array& out) {
+  return a.dtype() == complex64 && b.dtype() == complex64 &&
+      out.dtype() == complex64;
+}
+
+std::string build_complex_add_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {vec2 data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {vec2 data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = "
+        "a_buf.data[idx + pc.a_offset] + b_buf.data[idx + pc.b_offset];\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
+  auto materialize_broadcast_input = [&](array& in) {
+    if (in.shape() == out.shape()) {
+      return true;
+    }
+    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
+      return false;
+    }
+    if (!ensure_vulkan_buffer(in, s)) {
+      return false;
+    }
+    array view(out.shape(), in.dtype(), nullptr, {});
+    broadcast(in, view);
+    in = view;
+    return true;
+  };
+
+  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+    return false;
+  }
+
+  if (!is_supported_elementwise_layout(a)) {
+    a = contiguous_copy_gpu(a, s);
+  }
+  if (!is_supported_elementwise_layout(b)) {
+    b = contiguous_copy_gpu(b, s);
+  }
+  if (!is_supported_elementwise_layout(out)) {
+    return false;
+  }
+
+  const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
+  const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
+  const auto out_offset = static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
+  const auto total = static_cast<uint64_t>(out.data_size());
+  if (a_offset > std::numeric_limits<uint32_t>::max() ||
+      b_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  auto bopt = get_binary_op_type(a, b);
+  set_binary_op_output_data(a, b, out, bopt);
+
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out, 2}};
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_add_c64_c64_c64",
+      build_complex_add_shader(),
+      3,
+      arrays,
+      kPushConstantSize,
+      s);
+  struct PushConstants {
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t out_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(a_offset),
+      static_cast<uint32_t>(b_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  vkCmdDispatch(
+      dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 template <typename Primitive>
 constexpr vulkan::BinaryDispatchVariant binary_dispatch_variant() {
   if constexpr (std::is_same_v<Primitive, Add>) {
@@ -162,13 +263,20 @@ bool try_eval_binary_op_vulkan(
       is_vulkan_float_dtype(b.dtype()) && is_vulkan_float_dtype(out.dtype());
   const bool integer_case = a.dtype() == b.dtype() &&
       a.dtype() == out.dtype() && is_vulkan_integer_dtype(a.dtype());
-  if (!float_case && !integer_case && !bool_add && !mixed_numeric_div) {
+  const bool complex_add = std::is_same_v<Primitive, Add> &&
+      is_same_complex_add(a, b, out);
+  if (!float_case && !integer_case && !bool_add && !mixed_numeric_div &&
+      !complex_add) {
     trace_binary_unsupported("unsupported_dtype_combo", a, b);
     return false;
   }
 
   if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s)) {
     return false;
+  }
+
+  if (complex_add) {
+    return try_eval_complex_add_vulkan(a, b, out, s);
   }
 
   if (bool_add) {

@@ -4,6 +4,7 @@
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/shader_compiler.h"
+#include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/utils.h"
 
 #include <algorithm>
@@ -69,7 +70,7 @@ bool is_vulkan_compare_dtype(Dtype dtype) {
 
 bool has_vulkan_buffer(const array& arr) {
   auto data = arr.data_shared_ptr();
-  return data != nullptr && data->buffer.ptr() != nullptr;
+  return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
 }
 
 bool ensure_vulkan_buffer(array& arr, Stream s) {
@@ -123,7 +124,7 @@ std::string build_complex_add_shader() {
 bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
   auto materialize_broadcast_input = [&](array& in) {
     if (in.shape() == out.shape()) {
-      return true;
+      return ensure_vulkan_buffer(in, s);
     }
     if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
       return false;
@@ -147,14 +148,17 @@ bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
   if (!is_supported_elementwise_layout(b)) {
     b = contiguous_copy_gpu(b, s);
   }
-  if (!is_supported_elementwise_layout(out)) {
+  const bool staged_output = !is_supported_elementwise_layout(out);
+  array out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  if (!is_supported_elementwise_layout(out_work)) {
     return false;
   }
 
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset = static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
-  const auto total = static_cast<uint64_t>(out.data_size());
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto total = static_cast<uint64_t>(out_work.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -163,9 +167,9 @@ bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
   }
 
   auto bopt = get_binary_op_type(a, b);
-  set_binary_op_output_data(a, b, out, bopt);
+  set_binary_op_output_data(a, b, out_work, bopt);
 
-  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out, 2}};
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       "dynamic_add_c64_c64_c64",
@@ -195,6 +199,9 @@ bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
   vkCmdDispatch(
       dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
   vulkan::end_command_recording(s.index);
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::General, s);
+  }
   return true;
 }
 

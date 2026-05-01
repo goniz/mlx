@@ -242,6 +242,18 @@ VULKAN_GENERIC_UNARY_GPU(Sign, GenericUnaryShaderOp::Sign)
 VULKAN_GENERIC_UNARY_GPU(Tanh, GenericUnaryShaderOp::Tanh)
 
 // Specialized unary ops
+void Conjugate::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto shader_id = unary_shader_id(UnaryShaderOp::Conjugate, out.dtype());
+    if (shader_id.has_value()) {
+      eval_unary_vulkan<Conjugate>(inputs, out, *shader_id, stream());
+      return;
+    }
+  }
+  throw std::runtime_error(
+      "Conjugate operation failed on Vulkan (unsupported dtype or layout).");
+}
+
 void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
       out.dtype() == float32) {

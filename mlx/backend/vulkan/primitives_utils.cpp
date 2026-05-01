@@ -284,6 +284,7 @@ generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte) {
 std::optional<vulkan::StaticShaderId> unary_shader_id(
     UnaryShaderOp op,
     Dtype dtype) {
+  MLX_VK_UNARY_CASE(Conjugate, complex64, conj_c64);
   MLX_VK_UNARY_CASE(Cos, float32, cos_f32);
   MLX_VK_UNARY_CASE(Erf, float32, erf_f32);
   MLX_VK_UNARY_CASE(ErfInv, float32, erfinv_f32);

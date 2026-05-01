@@ -73,6 +73,7 @@ enum class GenericUnaryShaderOp {
 };
 
 enum class UnaryShaderOp {
+  Conjugate,
   Cos,
   Erf,
   ErfInv,

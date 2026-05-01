@@ -2094,6 +2094,10 @@ void process_shaders() {
       "square_c64.comp",
       {{"A_TYPE", "vec2"}, {"D_TYPE", "vec2"}, {"FLOAT_TYPE", "vec2"}});
   string_to_spv(
+      "conj_c64",
+      "conj_c64.comp",
+      {{"A_TYPE", "vec2"}, {"D_TYPE", "vec2"}, {"FLOAT_TYPE", "vec2"}});
+  string_to_spv(
       "sqr_f16",
       "square.comp",
       {{"A_TYPE", "float16_t"},

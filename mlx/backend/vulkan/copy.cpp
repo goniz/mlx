@@ -1685,13 +1685,10 @@ void concatenate_gpu(
     size_t data_offset = strides[axis] * sizes[i];
     out_slice.copy_shared_buffer(
         out, strides, flags, out_slice.size(), data_offset);
-    const bool vector_copy = has_row_contiguous_strides(inputs[i]) &&
-        has_row_contiguous_strides(out_slice) &&
-        inputs[i].shape() == out_slice.shape();
     copy_gpu_inplace(
         inputs[i],
         out_slice,
-        vector_copy ? CopyType::Vector : CopyType::GeneralGeneral,
+        CopyType::GeneralGeneral,
         s);
   }
 }

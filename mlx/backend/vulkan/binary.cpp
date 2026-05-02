@@ -154,6 +154,9 @@ bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
     return false;
   }
 
+  auto bopt = get_binary_op_type(a, b);
+  set_binary_op_output_data(a, b, out_work, bopt);
+
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
   const auto out_offset =
@@ -165,9 +168,6 @@ bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
       total > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
-
-  auto bopt = get_binary_op_type(a, b);
-  set_binary_op_output_data(a, b, out_work, bopt);
 
   vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;

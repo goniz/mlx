@@ -381,6 +381,10 @@ bool try_eval_equal_vulkan(
     return false;
   }
 
+  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
+    return false;
+  }
+
   auto materialize_broadcast_input = [&](array& in) {
     if (in.shape() == out.shape()) {
       return true;
@@ -506,6 +510,10 @@ bool try_eval_compare_vulkan(
     return false;
   }
 
+  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
+    return false;
+  }
+
   auto materialize_broadcast_input = [&](array& in) {
     if (in.shape() == out.shape()) {
       return true;
@@ -621,6 +629,10 @@ bool try_eval_power_vulkan(
   };
   if (!is_supported_dtype(a.dtype()) || !is_supported_dtype(b.dtype()) ||
       !is_supported_dtype(out.dtype())) {
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer_power(a, s) || !ensure_vulkan_buffer_power(b, s)) {
     return false;
   }
 
@@ -895,6 +907,10 @@ bool try_eval_logical_binary_vulkan(
   array a = inputs[0];
   array b = inputs[1];
 
+  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
+    return false;
+  }
+
   auto materialize_broadcast_input = [&](array& in) {
     if (in.shape() == out.shape()) {
       return true;
@@ -1004,6 +1020,10 @@ bool try_eval_bitwise_binary_vulkan(
     return false;
   }
   if (!(issubdtype(out.dtype(), integer) || out.dtype() == bool_)) {
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
     return false;
   }
 
@@ -1207,6 +1227,12 @@ bool try_eval_select_vulkan(
   if (condition.dtype() != bool_ || x.dtype() != out.dtype() ||
       y.dtype() != out.dtype()) {
     trace_select_unsupported("dtype_mismatch");
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer_compare(condition, s) ||
+      !ensure_vulkan_buffer_compare(x, s) ||
+      !ensure_vulkan_buffer_compare(y, s)) {
     return false;
   }
 

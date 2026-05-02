@@ -154,10 +154,19 @@ bool supports_dynamic_gpu_cast_dtype(Dtype dtype) {
     case mlx::core::float16:
     case mlx::core::float32:
     case mlx::core::bfloat16:
+    case mlx::core::complex64:
       return true;
     default:
       return false;
   }
+}
+
+bool supports_dynamic_gpu_cast_pair(Dtype in_dtype, Dtype out_dtype) {
+  if (in_dtype == mlx::core::complex64 || out_dtype == mlx::core::complex64) {
+    return in_dtype == mlx::core::complex64 && out_dtype == mlx::core::float32;
+  }
+  return supports_dynamic_gpu_cast_dtype(in_dtype) &&
+      supports_dynamic_gpu_cast_dtype(out_dtype);
 }
 
 void append_layout_key(std::ostringstream& os, const Shape& shape) {
@@ -268,6 +277,8 @@ std::string build_dynamic_general_copy_shader(
   if (needs_bf16_helpers(in_dtype, out_dtype)) {
     cast_expr = bf16_cast_expr(
         "input_buf.data[uint(input_index)]", in_dtype, out_dtype);
+  } else if (in_dtype == mlx::core::complex64 && out_dtype == mlx::core::float32) {
+    cast_expr = "input_buf.data[input_index].x";
   } else {
     cast_expr = cast_expr_for_dtype(
         "input_buf.data[uint(input_index)]", in_dtype, out_dtype);
@@ -275,6 +286,26 @@ std::string build_dynamic_general_copy_shader(
   os << "  output_buf.data[uint(output_index)] = " << cast_expr << ";\n";
   os << "}\n";
   return os.str();
+}
+
+void insert_copy_memory_barrier(vk::CommandBuffer command_buffer) {
+  vk::MemoryBarrier barrier;
+  barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead |
+      vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead |
+      vk::AccessFlagBits::eTransferWrite;
+  barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead |
+      vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead |
+      vk::AccessFlagBits::eTransferWrite;
+
+  command_buffer.pipelineBarrier(
+      vk::PipelineStageFlagBits::eComputeShader |
+          vk::PipelineStageFlagBits::eTransfer,
+      vk::PipelineStageFlagBits::eComputeShader |
+          vk::PipelineStageFlagBits::eTransfer,
+      {},
+      {barrier},
+      {},
+      {});
 }
 
 void dispatch_dynamic_offset_kernel(
@@ -318,7 +349,8 @@ bool dispatch_dynamic_general_copy(
     int64_t o_offset,
     const mlx::core::Stream& s,
     const std::optional<mlx::core::array>& dynamic_i_offset,
-    const std::optional<mlx::core::array>& dynamic_o_offset) {
+    const std::optional<mlx::core::array>& dynamic_o_offset,
+    bool insert_barrier_after_dispatch = false) {
   validate_dynamic_offset_array(dynamic_i_offset);
   validate_dynamic_offset_array(dynamic_o_offset);
 
@@ -413,6 +445,9 @@ bool dispatch_dynamic_general_copy(
   const uint32_t workgroups = std::max<uint32_t>(
       (static_cast<uint32_t>(total_elements) + 255u) / 256u, 1u);
   vkCmdDispatch(dispatch.command_buffer, workgroups, 1, 1);
+  if (insert_barrier_after_dispatch) {
+    insert_copy_memory_barrier(dispatch.command_buffer);
+  }
   vulkan::end_command_recording(s.index);
   return true;
 }
@@ -509,8 +544,7 @@ bool dispatch_dynamic_vector_cast_copy(
   if (!is_vulkan_storage_array(in) || !is_vulkan_storage_array(out)) {
     return false;
   }
-  if (!supports_dynamic_gpu_cast_dtype(in.dtype()) ||
-      !supports_dynamic_gpu_cast_dtype(out.dtype())) {
+  if (!supports_dynamic_gpu_cast_pair(in.dtype(), out.dtype())) {
     return false;
   }
   if (size == 0) {
@@ -1500,7 +1534,7 @@ void copy_gpu_inplace(
       }
 
       if (large_shader_offset || is_slice_copy) {
-        if (!dispatch_dynamic_general_copy(
+        const bool copied = dispatch_dynamic_general_copy(
                 in_view,
                 out_view,
                 dispatch_shape,
@@ -1510,7 +1544,9 @@ void copy_gpu_inplace(
                 0,
                 s,
                 std::nullopt,
-                std::nullopt)) {
+                std::nullopt,
+                is_slice_copy);
+        if (!copied) {
           throw std::runtime_error(
               "Large-offset shader copy does not support tensors with rank greater than 4.");
         }

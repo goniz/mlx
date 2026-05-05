@@ -1558,7 +1558,8 @@ class VulkanDevice {
     }
 
     if (barrier_between_deferred_ops()) {
-      if (stream->last_decode_resource_summary.safe_to_skip_tail_barrier()) {
+      if (should_prefer_long_decode_recording(stream) &&
+          stream->last_decode_resource_summary.safe_to_skip_tail_barrier()) {
         if (trace_batch_enabled()) {
           std::ostringstream oss;
           oss << "decode-tail action=skip stream=" << stream->stream_index

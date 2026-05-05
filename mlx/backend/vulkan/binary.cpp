@@ -358,13 +358,9 @@ std::string build_complex_div_shader() {
   os << "  if (idx >= pc.total_elements) return;\n";
   os << "  vec2 x = a_buf.data[idx + pc.a_offset];\n";
   os << "  vec2 y = b_buf.data[idx + pc.b_offset];\n";
-  os << "  double xr = double(x.x);\n";
-  os << "  double xi = double(x.y);\n";
-  os << "  double yr = double(y.x);\n";
-  os << "  double yi = double(y.y);\n";
-  os << "  double denom = yr * yr + yi * yi;\n";
-  os << "  float real = float((xr * yr + xi * yi) / denom);\n";
-  os << "  float imag = float((xi * yr - xr * yi) / denom);\n";
+  os << "  float denom = y.x * y.x + y.y * y.y;\n";
+  os << "  float real = (x.x * y.x + x.y * y.y) / denom;\n";
+  os << "  float imag = (x.y * y.x - x.x * y.y) / denom;\n";
   os << "  out_buf.data[idx + pc.out_offset] = vec2(real, imag);\n";
   os << "}\n";
   return os.str();

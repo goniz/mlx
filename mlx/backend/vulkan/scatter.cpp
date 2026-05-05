@@ -218,13 +218,8 @@ bool try_eval_scatter_vulkan(
       src, axis + 1, src.ndim(), "scatter_take size_post");
   const uint32_t index_count =
       checked_u32_size(idx.size(), "scatter_take index_count");
-  uint32_t slice_size = 1;
-  for (int i = 0; i < src.ndim(); ++i) {
-    slice_size = checked_mul_u32(
-        slice_size,
-        checked_u32_size(upd.shape(idx.ndim() + i), "scatter_take slice_size"),
-        "scatter_take expected_update_size");
-  }
+  const uint32_t slice_size = checked_mul_u32(
+      size_pre, size_post, "scatter_take slice_size");
   const uint32_t expected_update_size = checked_mul_u32(
       index_count, slice_size, "scatter_take expected_update_size");
   if (upd.size() != expected_update_size) {

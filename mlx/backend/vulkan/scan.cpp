@@ -6,6 +6,11 @@ namespace mlx::core {
 
 namespace {
 
+bool has_vulkan_buffer(const array& arr) {
+  auto data = arr.data_shared_ptr();
+  return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
+}
+
 bool try_eval_scan_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -36,19 +41,12 @@ bool try_eval_scan_vulkan(
 
   array scan_input = in_kernel;
 
-  if (reverse && reduce_type == Scan::Sum) {
-    Shape start(scan_input.ndim(), 0);
-    Shape stop = scan_input.shape();
-    Shape strides(scan_input.ndim(), 1);
-    start.back() = scan_input.shape(-1) - 1;
-    stop.back() = -scan_input.shape(-1) - 1;
-    strides.back() = -1;
-    scan_input = slice(scan_input, start, stop, strides, s);
-  }
-
   if (!scan_input.flags().contiguous || scan_input.offset() != 0 ||
       scan_input.strides().back() != 1 || scan_input.strides().back() < 0 ||
       !is_supported_unary_layout(scan_input)) {
+    scan_input = contiguous_copy_gpu(scan_input, s);
+  }
+  if (!has_vulkan_buffer(scan_input)) {
     scan_input = contiguous_copy_gpu(scan_input, s);
   }
 
@@ -82,7 +80,9 @@ bool try_eval_scan_vulkan(
           inclusive_out,
           vulkan::StaticShaderId::cumsum_f32,
           command_buffer,
-          s);
+          s,
+          reverse,
+          inclusive);
     } else {
       vulkan::dispatch_cumprod_op(
           scan_input,
@@ -95,29 +95,6 @@ bool try_eval_scan_vulkan(
     }
 
     array scan_result = inclusive_out;
-    if (!inclusive && reduce_type == Scan::Sum) {
-      array exclusive_out(scan_input.shape(), scan_input.dtype(), nullptr, {});
-      exclusive_out.set_data(allocator::malloc(exclusive_out.nbytes()));
-      vulkan::dispatch_binary_op(
-          inclusive_out,
-          scan_input,
-          exclusive_out,
-          vulkan::StaticShaderId::sub_f32_f32_f32,
-          command_buffer,
-          s,
-          vulkan::BinaryDispatchVariant::Standard);
-      scan_result = exclusive_out;
-    }
-
-    if (reverse && reduce_type == Scan::Sum) {
-      Shape start(scan_result.ndim(), 0);
-      Shape stop = scan_result.shape();
-      Shape strides(scan_result.ndim(), 1);
-      start.back() = scan_result.shape(-1) - 1;
-      stop.back() = -scan_result.shape(-1) - 1;
-      strides.back() = -1;
-      scan_result = slice(scan_result, start, stop, strides, s);
-    }
 
     vulkan::end_command_recording(s.index);
 
@@ -129,7 +106,8 @@ bool try_eval_scan_vulkan(
       restored = contiguous_copy_gpu(restored, s);
     }
 
-    copy_gpu(restored, out, CopyType::GeneralGeneral, s);
+    out.set_data(allocator::malloc(out.nbytes()));
+    copy_gpu_inplace(restored, out, CopyType::GeneralGeneral, s);
     return true;
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {

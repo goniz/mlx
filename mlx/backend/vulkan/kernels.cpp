@@ -2971,7 +2971,9 @@ void dispatch_cumsum_op(
     array& out,
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
-    const Stream& s) {
+    const Stream& s,
+    bool reverse,
+    bool inclusive) {
   if (out.size() == 0) {
     return;
   }
@@ -3015,8 +3017,13 @@ void dispatch_cumsum_op(
         cmd_buffer,
         s,
         std::nullopt,
-        {128u, 32u, 4u});
+        {128u, 32u, 4u, reverse ? 1u : 0u, inclusive ? 1u : 0u});
     return;
+  }
+
+  if (reverse || !inclusive) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumsum reverse/exclusive requires single-pass row width.");
   }
 
   const uint64_t tmp_elements_u64 = static_cast<uint64_t>(num_workgroups_x) *

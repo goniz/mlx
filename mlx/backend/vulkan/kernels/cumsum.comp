@@ -15,6 +15,8 @@ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 layout (constant_id = 0) const uint BLOCK_SIZE = 128;
 layout (constant_id = 1) const uint SUBGROUP_SIZE = 32;
 layout (constant_id = 2) const uint ELEM_PER_THREAD = 4;
+layout (constant_id = 3) const bool REVERSE = false;
+layout (constant_id = 4) const bool INCLUSIVE = true;
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
@@ -43,16 +45,21 @@ void main() {
     uint num_iter = CEIL_DIV(p.n_cols, BLOCK_SIZE * ELEM_PER_THREAD);
     for (int i = 0; i < num_iter; ++i) {
         FLOAT_TYPE v[ELEM_PER_THREAD];
+        FLOAT_TYPE exclusive_v[ELEM_PER_THREAD];
         FLOAT_TYPE thread_sum = 0;
         [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
-            if (col + j < p.n_cols) {
-                thread_sum += FLOAT_TYPE(data_a[src_idx + col + j]);
+            exclusive_v[j] = thread_sum;
+            const uint logical_col = col + j;
+            if (logical_col < p.n_cols) {
+                const uint read_col = REVERSE ? (p.n_cols - 1 - logical_col) : logical_col;
+                thread_sum += FLOAT_TYPE(data_a[src_idx + read_col]);
             }
             v[j] = thread_sum;
         }
 
         thread_sum = subgroupExclusiveAdd(thread_sum);
         [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
+            exclusive_v[j] += thread_sum;
             v[j] += thread_sum;
         }
         // Store the largest partial sum for each subgroup, then add the partials for all
@@ -63,10 +70,12 @@ void main() {
         barrier();
         for (int s = 0; s < subgroup_id; ++s) {
             [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
+                exclusive_v[j] += partial[s];
                 v[j] += partial[s];
             }
         }
         [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
+            exclusive_v[j] += last_sum;
             v[j] += last_sum;
         }
         barrier();
@@ -74,8 +83,10 @@ void main() {
             last_sum = v[ELEM_PER_THREAD - 1];
         }
         [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
-            if (col + j < p.n_cols) {
-                data_d[dst_idx + col + j] = D_TYPE(v[j]);
+            const uint logical_col = col + j;
+            if (logical_col < p.n_cols) {
+                const uint write_col = REVERSE ? (p.n_cols - 1 - logical_col) : logical_col;
+                data_d[dst_idx + write_col] = D_TYPE(INCLUSIVE ? v[j] : exclusive_v[j]);
             }
         }
         col += BLOCK_SIZE * ELEM_PER_THREAD;

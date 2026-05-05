@@ -823,7 +823,9 @@ void dispatch_cumsum_op(
     array& out,
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
-    const Stream& s);
+    const Stream& s,
+    bool reverse = false,
+    bool inclusive = true);
 
 void dispatch_cumprod_op(
     const array& in,

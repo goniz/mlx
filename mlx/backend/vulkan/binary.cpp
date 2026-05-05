@@ -340,8 +340,9 @@ std::string build_complex_mul_shader() {
   os << "  if (idx >= pc.total_elements) return;\n";
   os << "  vec2 x = a_buf.data[idx + pc.a_offset];\n";
   os << "  vec2 y = b_buf.data[idx + pc.b_offset];\n";
-  os << "  out_buf.data[idx + pc.out_offset] = "
-        "vec2(x.x * y.x - x.y * y.y, x.x * y.y + x.y * y.x);\n";
+  os << "  precise float real = x.x * y.x - x.y * y.y;\n";
+  os << "  precise float imag = x.x * y.y + x.y * y.x;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = vec2(real, imag);\n";
   os << "}\n";
   return os.str();
 }

@@ -287,14 +287,20 @@ float bf16_to_fp32(uint u) {
   if (uses_complex64) {
     os << R"(
 vec2 complex_mul(vec2 a, vec2 b) {
-  return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+  precise float real = a.x * b.x - a.y * b.y;
+  precise float imag = a.x * b.y + a.y * b.x;
+  return vec2(real, imag);
 }
 
 vec2 complex_div(vec2 a, vec2 b) {
-  float denom = dot(b, b);
-  return vec2(
-      (a.x * b.x + a.y * b.y) / denom,
-      (a.y * b.x - a.x * b.y) / denom);
+  precise float denom = b.x * b.x + b.y * b.y;
+  precise float real_num = a.x * b.x + a.y * b.y;
+  precise float imag_num = a.y * b.x - a.x * b.y;
+  precise float real = real_num / denom;
+  precise float imag = imag_num / denom;
+  real += (real_num - real * denom) / denom;
+  imag += (imag_num - imag * denom) / denom;
+  return vec2(real, imag);
 }
 
 vec2 complex_exp(vec2 z) {

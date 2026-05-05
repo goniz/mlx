@@ -1651,7 +1651,6 @@ NYI_OP(Real)
 NYI_OP(Sinh)
 NYI_OP_STATE(Sort)
 NYI_OP(Tan)
-NO_GPU(MaskedScatter)
 // Scatter and ScatterAxis are implemented in scatter.cpp
 
 void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {

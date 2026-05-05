@@ -530,6 +530,12 @@ struct GatherPairPushConstants {
   uint32_t index_count;
 };
 
+struct MaskedScatterPushConstants {
+  uint32_t ne;
+  uint32_t src_batch_size;
+  uint32_t mask_batch_size;
+};
+
 struct RopePushConstants {
   uint32_t rope_mode;
   uint32_t nrows;
@@ -987,6 +993,16 @@ void dispatch_scatter_pair_op(
     uint32_t slice1_size,
     uint32_t inner_size,
     uint32_t index_count);
+
+void dispatch_masked_scatter_op(
+    const array& mask,
+    const array& src,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t src_batch_size,
+    uint32_t mask_batch_size);
 
 void dispatch_rope_op(
     const array& in,

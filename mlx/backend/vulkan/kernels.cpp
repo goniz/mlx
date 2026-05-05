@@ -390,6 +390,7 @@ enum class KernelSpecId {
   Gather,
   GatherAxis,
   GatherPair,
+  MaskedScatter,
   Rope,
   FlashAttention,
   FlashAttentionSplitKReduce,
@@ -429,7 +430,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 36> kKernelSpecs = {
+const std::array<KernelSpec, 37> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -517,6 +518,10 @@ const std::array<KernelSpec, 36> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3},
         sizeof(GatherPairPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 2},
+        sizeof(MaskedScatterPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
         {0, 1, 2, 3, 4},
@@ -3656,6 +3661,35 @@ void dispatch_scatter_pair_op(
   dispatch_with_spec(
       shader_id,
       KernelSpecId::GatherPair,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_masked_scatter_op(
+    const array& mask,
+    const array& src,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t src_batch_size,
+    uint32_t mask_batch_size) {
+  MaskedScatterPushConstants push_constants{};
+  push_constants.ne = checked_u32(mask.size(), "masked_scatter elements");
+  push_constants.src_batch_size = src_batch_size;
+  push_constants.mask_batch_size = mask_batch_size;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&mask, "mask"},
+      {&src, "src"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::MaskedScatter,
       bound_arrays,
       push_constants,
       push_constants.ne,

@@ -375,4 +375,61 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 }
 
+void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 3);
+
+  const auto& dst = inputs[0];
+  array mask = inputs[1];
+  array src = inputs[2];
+  auto& s = stream();
+
+  const size_t total = mask.size();
+  auto [out_work, staged_output] = make_output_work(out);
+  copy_gpu(
+      dst,
+      out_work,
+      total == 1 ? CopyType::Scalar : source_copy_type(dst),
+      s);
+  if (total == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return;
+  }
+
+  auto shader_id = masked_scatter_shader_id(out.dtype());
+  if (!shader_id.has_value() || mask.dtype() != bool_) {
+    throw std::runtime_error(
+        "MaskedScatter operation failed on Vulkan (unsupported dtype).");
+  }
+
+  mask = flatten_in_eval(mask, 1, -1, s);
+  mask = ensure_row_contiguous(mask, s);
+  // src is already shaped as [batch, values_per_batch] by masked_scatter.
+  src = ensure_row_contiguous(src, s);
+
+  const uint32_t batch_count =
+      checked_u32_size(mask.shape(0), "masked_scatter batch_count");
+  const uint32_t mask_batch_size = checked_u32_size(
+      mask.size() / batch_count, "masked_scatter mask_batch_size");
+  const uint32_t src_batch_size = checked_u32_size(
+      src.size() / src.shape(0), "masked_scatter src_batch_size");
+
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_masked_scatter_op(
+      mask,
+      src,
+      out_work,
+      *shader_id,
+      command_buffer,
+      s,
+      src_batch_size,
+      mask_batch_size);
+  vulkan::end_command_recording(s.index);
+
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+  }
+}
+
 } // namespace mlx::core

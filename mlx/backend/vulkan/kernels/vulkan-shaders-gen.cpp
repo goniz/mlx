@@ -1383,6 +1383,19 @@ void process_shaders() {
   indexing_shaders("scatter_pair", "scatter_pair.comp");
   indexing_shaders("scatter_axis", "scatter_axis.comp");
 
+  auto masked_scatter_shader = [&](const std::string& value_tag,
+                                   const std::string& value_type) {
+    string_to_spv(
+        "masked_scatter_" + value_tag,
+        "masked_scatter.comp",
+        {{"VALUE_TYPE", value_type}});
+  };
+  masked_scatter_shader("f32", "float");
+  masked_scatter_shader("f16", "float16_t");
+  masked_scatter_shader("bf16", "uint16_t");
+  masked_scatter_shader("i32", "int");
+  masked_scatter_shader("u32", "uint");
+
   string_to_spv(
       "mul_mat_vec_p021_f16_f32_subgroup_add",
       "mul_mat_vec_p021.comp",
@@ -2775,6 +2788,16 @@ void process_shaders() {
       "cumsum_f32",
       "cumsum.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv(
+      "cumsum_i32",
+      "cumsum.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "int"},
+           {"D_TYPE", "int"},
+           {"FLOAT_TYPE", "int"},
+           {"FLOAT_TYPE_VEC2", "ivec2"},
+           {"FLOAT_TYPE_VEC4", "ivec4"}}));
   string_to_spv(
       "cumprod_f32",
       "cumprod.comp",

@@ -497,6 +497,24 @@ std::optional<vulkan::StaticShaderId> scatter_axis_shader_id(
   return std::nullopt;
 }
 
+std::optional<vulkan::StaticShaderId> masked_scatter_shader_id(
+    Dtype value_dtype) {
+  switch (value_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::masked_scatter_f32;
+    case float16:
+      return vulkan::StaticShaderId::masked_scatter_f16;
+    case bfloat16:
+      return vulkan::StaticShaderId::masked_scatter_bf16;
+    case int32:
+      return vulkan::StaticShaderId::masked_scatter_i32;
+    case uint32:
+      return vulkan::StaticShaderId::masked_scatter_u32;
+    default:
+      return std::nullopt;
+  }
+}
+
 #undef MLX_VK_GATHER_CASE
 
 bool is_supported_elementwise_layout(const array& arr) {

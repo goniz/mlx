@@ -25,7 +25,10 @@ bool try_eval_scan_vulkan(
   }
 
   array in = inputs[0];
-  if (in.ndim() == 0 || in.dtype() != float32 || out.dtype() != float32) {
+  const bool cumsum_i32 =
+      reduce_type == Scan::Sum && in.dtype() == int32 && out.dtype() == int32;
+  const bool scan_f32 = in.dtype() == float32 && out.dtype() == float32;
+  if (in.ndim() == 0 || (!scan_f32 && !cumsum_i32)) {
     return false;
   }
 
@@ -64,6 +67,11 @@ bool try_eval_scan_vulkan(
     return false;
   }
 
+  if (cumsum_i32 &&
+      (reverse || inclusive || scan_input.shape(scan_input.ndim() - 1) > 128)) {
+    return false;
+  }
+
   array inclusive_out(scan_input.shape(), scan_input.dtype(), nullptr, {});
   inclusive_out.set_data(allocator::malloc(inclusive_out.nbytes()));
   if (inclusive_out.size() == 0) {
@@ -78,7 +86,8 @@ bool try_eval_scan_vulkan(
       vulkan::dispatch_cumsum_op(
           scan_input,
           inclusive_out,
-          vulkan::StaticShaderId::cumsum_f32,
+          cumsum_i32 ? vulkan::StaticShaderId::cumsum_i32
+                     : vulkan::StaticShaderId::cumsum_f32,
           command_buffer,
           s,
           reverse,

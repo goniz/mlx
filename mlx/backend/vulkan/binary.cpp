@@ -128,7 +128,7 @@ bool is_same_complex_mul(const array& a, const array& b, const array& out) {
 
 bool is_complex_scalar_mul(const array& a, const array& b, const array& out) {
   return is_same_complex_mul(a, b, out) &&
-      (a.data_size() == 1 || b.data_size() == 1);
+      ((a.data_size() == 1) != (b.data_size() == 1));
 }
 
 bool is_same_complex_div(const array& a, const array& b, const array& out) {

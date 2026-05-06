@@ -539,6 +539,155 @@ bool try_eval_complex_div_vulkan(array& a, array& b, array& out, Stream s) {
   return true;
 }
 
+std::string build_divmod_f32_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(float32, float32, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint q_offset; uint r_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {float data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {float data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Quotient {float data[];} q_buf;\n";
+  os << "layout(set = 0, binding = 3) buffer Remainder {float data[];} r_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  float x = a_buf.data[idx + pc.a_offset];\n";
+  os << "  float y = b_buf.data[idx + pc.b_offset];\n";
+  os << "  float q = trunc(x / y);\n";
+  os << "  q_buf.data[idx + pc.q_offset] = q;\n";
+  os << "  r_buf.data[idx + pc.r_offset] = x - y * q;\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_divmod_f32_vulkan(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs,
+    Stream s) {
+  if (inputs.size() != 2 || outputs.size() != 2) {
+    return false;
+  }
+
+  array a = inputs[0];
+  array b = inputs[1];
+  auto& quotient = outputs[0];
+  auto& remainder = outputs[1];
+  if (a.dtype() != float32 || b.dtype() != float32 ||
+      quotient.dtype() != float32 || remainder.dtype() != float32 ||
+      quotient.shape() != remainder.shape()) {
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s)) {
+    return false;
+  }
+
+  auto materialize_broadcast_input = [&](array& in) {
+    if (in.shape() == quotient.shape()) {
+      return true;
+    }
+    if (broadcast_shapes(in.shape(), quotient.shape()) != quotient.shape()) {
+      return false;
+    }
+    array view(quotient.shape(), in.dtype(), nullptr, {});
+    broadcast(in, view);
+    in = view;
+    return true;
+  };
+
+  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+    return false;
+  }
+  if (!is_supported_elementwise_layout(a)) {
+    a = contiguous_copy_gpu(a, s);
+  }
+  if (!is_supported_elementwise_layout(b)) {
+    b = contiguous_copy_gpu(b, s);
+  }
+
+  const bool staged_quotient = !is_supported_elementwise_layout(quotient);
+  const bool staged_remainder = !is_supported_elementwise_layout(remainder);
+  array quotient_work = staged_quotient
+      ? array(quotient.shape(), quotient.dtype(), nullptr, {})
+      : quotient;
+  array remainder_work = staged_remainder
+      ? array(remainder.shape(), remainder.dtype(), nullptr, {})
+      : remainder;
+  auto bopt = get_binary_op_type(a, b);
+  set_binary_op_output_data(a, b, quotient_work, bopt);
+  set_binary_op_output_data(a, b, remainder_work, bopt);
+  if (!is_supported_elementwise_layout(quotient_work) ||
+      !is_supported_elementwise_layout(remainder_work)) {
+    return false;
+  }
+
+  if (quotient_work.size() == 0) {
+    if (staged_quotient) {
+      copy_gpu(quotient_work, quotient, CopyType::General, s);
+    }
+    if (staged_remainder) {
+      copy_gpu(remainder_work, remainder, CopyType::General, s);
+    }
+    return true;
+  }
+
+  const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
+  const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
+  const auto q_offset = static_cast<uint64_t>(
+      quotient_work.offset() / size_of(quotient_work.dtype()));
+  const auto r_offset = static_cast<uint64_t>(
+      remainder_work.offset() / size_of(remainder_work.dtype()));
+  const auto total = static_cast<uint64_t>(quotient_work.data_size());
+  if (a_offset > std::numeric_limits<uint32_t>::max() ||
+      b_offset > std::numeric_limits<uint32_t>::max() ||
+      q_offset > std::numeric_limits<uint32_t>::max() ||
+      r_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&a, 0}, {&b, 1}, {&quotient_work, 2}, {&remainder_work, 3}};
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 5;
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_divmod_f32",
+      build_divmod_f32_shader(),
+      4,
+      arrays,
+      kPushConstantSize,
+      s);
+  struct PushConstants {
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t q_offset;
+    uint32_t r_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(a_offset),
+      static_cast<uint32_t>(b_offset),
+      static_cast<uint32_t>(q_offset),
+      static_cast<uint32_t>(r_offset),
+      static_cast<uint32_t>(total),
+  };
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  vkCmdDispatch(
+      dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
+  vulkan::end_command_recording(s.index);
+
+  if (staged_quotient) {
+    copy_gpu(quotient_work, quotient, CopyType::General, s);
+  }
+  if (staged_remainder) {
+    copy_gpu(remainder_work, remainder, CopyType::General, s);
+  }
+  return true;
+}
+
 template <typename Primitive>
 constexpr vulkan::BinaryDispatchVariant binary_dispatch_variant() {
   if constexpr (std::is_same_v<Primitive, Add>) {
@@ -908,6 +1057,15 @@ void GreaterEqual::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_greater_equal_vulkan(inputs, out, stream())) {
     throw std::runtime_error(
         "GreaterEqual operation failed on Vulkan (unsupported dtype or layout).");
+  }
+}
+
+void DivMod::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  if (!try_eval_divmod_f32_vulkan(inputs, outputs, stream())) {
+    throw std::runtime_error(
+        "DivMod operation failed on Vulkan (unsupported dtype or layout).");
   }
 }
 

@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/ops.h"
 
 namespace mlx::core {
@@ -196,6 +197,12 @@ bool try_eval_scatter_vulkan(
   array upd = inputs[2];
   if (axis < 0 || axis >= src.ndim()) {
     trace_vulkan_unsupported("Scatter", "axis is out of range");
+    return false;
+  }
+  if (reduce_type == Scatter::Sum && out.dtype() == float32 &&
+      !vulkan::VulkanContext::get().shader_buffer_atomic_float32_supported()) {
+    trace_vulkan_unsupported(
+        "Scatter", "float32 scatter-sum requires shader atomic float support");
     return false;
   }
   const auto shader_id = reduce_type == Scatter::Sum

@@ -45,7 +45,7 @@ bool try_eval_scan_vulkan(
   array scan_input = in_kernel;
 
   if (!scan_input.flags().contiguous || scan_input.offset() != 0 ||
-      scan_input.strides().back() != 1 || scan_input.strides().back() < 0 ||
+      scan_input.strides().back() != 1 ||
       !is_supported_unary_layout(scan_input)) {
     scan_input = contiguous_copy_gpu(scan_input, s);
   }

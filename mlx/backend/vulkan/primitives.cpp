@@ -1621,7 +1621,6 @@ NYI_OP(ArcTan2)
 NYI_OP(ArcTanh)
 NYI_OP(BitwiseInvert)
 NYI_OP(Cosh)
-NYI_OP_MULTI(DivMod)
 NYI_OP(Remainder)
 NYI_OP(Expm1)
 NYI_OP_STATE(FFT)
@@ -1677,7 +1676,12 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto ctype = in.flags().contiguous && in.size() == in.data_size()
       ? CopyType::Vector
       : CopyType::General;
-  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+  if (reduce_type_ == SliceUpdate::None && in.is_donatable() &&
+      in.itemsize() == out.itemsize()) {
+    out.copy_shared_buffer(in);
+  } else {
+    copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+  }
 
   auto [data_offset, out_strides] =
       prepare_slice(out, start_indices_, strides_);

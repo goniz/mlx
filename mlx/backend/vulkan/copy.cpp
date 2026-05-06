@@ -1545,7 +1545,7 @@ void copy_gpu_inplace(
                 s,
                 std::nullopt,
                 std::nullopt,
-                is_slice_copy);
+                is_slice_copy && same_buffer);
         if (!copied) {
           throw std::runtime_error(
               "Large-offset shader copy does not support tensors with rank greater than 4.");
@@ -1705,6 +1705,60 @@ void concatenate_gpu(
             in_buf->buffer, out_buf->buffer, {copy_region});
         dst_offset += in.nbytes();
       }
+      vulkan::end_command_recording(s.index);
+      return;
+    }
+  }
+
+  if (out.flags().row_contiguous) {
+    bool supported_contiguous_concat = true;
+    for (const auto& in : inputs) {
+      if (in.dtype() != out.dtype() || !has_row_contiguous_strides(in) ||
+          !vulkan::is_vulkan_buffer(in.buffer())) {
+        supported_contiguous_concat = false;
+        break;
+      }
+    }
+    if (supported_contiguous_concat) {
+      size_t size_pre = 1;
+      for (int dim = 0; dim < axis; ++dim) {
+        size_pre *= out.shape(dim);
+      }
+      size_t size_post = 1;
+      for (int dim = axis + 1; dim < out.ndim(); ++dim) {
+        size_post *= out.shape(dim);
+      }
+
+      const size_t itemsize = size_of(out.dtype());
+      const size_t out_axis_size = out.shape(axis);
+
+      auto* out_buf =
+          static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
+      auto command_buffer = vulkan::begin_command_recording(s.index);
+      for (int i = 0; i < inputs.size(); ++i) {
+        const auto& in = inputs[i];
+        const size_t in_axis_size = in.shape(axis);
+        const size_t elements = in_axis_size * size_post;
+        if (elements == 0) {
+          continue;
+        }
+        auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
+            const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
+        std::vector<vk::BufferCopy> copy_regions;
+        copy_regions.reserve(size_pre);
+        for (size_t prefix = 0; prefix < size_pre; ++prefix) {
+          vk::BufferCopy region{};
+          region.srcOffset = static_cast<VkDeviceSize>(
+              (in.offset() + prefix * in_axis_size * size_post) * itemsize);
+          region.dstOffset = static_cast<VkDeviceSize>(
+              ((prefix * out_axis_size + sizes[i]) * size_post) * itemsize);
+          region.size = static_cast<VkDeviceSize>(elements * itemsize);
+          copy_regions.push_back(region);
+        }
+        command_buffer.copyBuffer(in_buf->buffer, out_buf->buffer, copy_regions);
+        vulkan::retain_array_for_stream(s, in);
+      }
+      vulkan::retain_array_for_stream(s, out);
       vulkan::end_command_recording(s.index);
       return;
     }

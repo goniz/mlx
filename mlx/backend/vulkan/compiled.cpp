@@ -222,7 +222,8 @@ std::string glsl_cast_expr(Dtype dst, Dtype src, const std::string& expr) {
 bool supports_primitive_name(const std::string& prim_name) {
   static const std::unordered_set<std::string> supported = {
       "Abs",       "Add",     "AsType",  "Broadcast", "Ceil",     "Conjugate",
-      "Cos",       "Divide",  "Exp",     "Floor",     "Imag",     "Log",
+      "Cos",       "Divide",  "Erf",     "Exp",       "Floor",    "Imag",
+      "Log",
       "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Power",
       "Real",      "Round",   "Sigmoid", "Sin",       "Sqrt",     "Subtract",
       "Tan",       "Tanh"};
@@ -250,6 +251,7 @@ std::string emit_glsl_preamble(
     bool uses_float16_types,
     bool uses_int16_types,
     bool uses_int8_types,
+    bool uses_erf,
     bool uses_power) {
   std::ostringstream os;
   os << "#version 450\n";
@@ -339,6 +341,25 @@ vec2 complex_conjugate(vec2 z) {
 )";
   }
 
+  if (uses_erf) {
+    os << R"(
+float erf(float x) {
+  const float a1 = 0.254829592;
+  const float a2 = -0.284496736;
+  const float a3 = 1.421413741;
+  const float a4 = -1.453152027;
+  const float a5 = 1.061405429;
+  const float p = 0.3275911;
+  float s = sign(x);
+  x = abs(x);
+  float t = 1.0 / (1.0 + p * x);
+  float y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-x * x);
+  return s * y;
+}
+
+)";
+  }
+
   if (uses_power) {
     os << R"(
 float safe_real_pow(float x, float y) {
@@ -386,6 +407,7 @@ std::string get_glsl_operator(const std::string& primitive_name) {
       {"Minimum", "min"},
       // GLSL built-in functions (lowercase)
       {"Exp", "exp"},
+      {"Erf", "erf"},
       {"Log", "log"},
       {"Sin", "sin"},
       {"Cos", "cos"},
@@ -463,6 +485,10 @@ inline void build_glsl_kernel(
       std::any_of(tape.begin(), tape.end(), [](const array& x) {
         return x.primitive().name() == "Power";
       });
+  const bool uses_erf = std::any_of(
+      tape.begin(), tape.end(), [](const array& x) {
+        return x.primitive().name() == "Erf";
+      });
 
   // GLSL header
   os = emit_glsl_preamble(
@@ -471,6 +497,7 @@ inline void build_glsl_kernel(
       uses_float16_types,
       uses_int16_types,
       uses_int8_types,
+      uses_erf,
       uses_power);
 
   // Determine max work per thread based on output dtype size

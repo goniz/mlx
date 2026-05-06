@@ -2302,17 +2302,17 @@ std::vector<array> FFT::vjp(
             axes,
             fft::FFTNorm::Backward,
             stream()),
-        array(n_elements, in.dtype()),
+        array(static_cast<float>(n_elements), float32),
         stream())};
   } else if (inverse_) {
     return {multiply(
         fft::fftn(cotangents[0], axes, fft::FFTNorm::Backward, stream()),
-        array(1 / n_elements, complex64),
+        array(static_cast<float>(1.0 / n_elements), complex64),
         stream())};
   } else {
     return {multiply(
         fft::ifftn(cotangents[0], axes, fft::FFTNorm::Backward, stream()),
-        array(n_elements, complex64),
+        array(static_cast<float>(n_elements), complex64),
         stream())};
   }
 }

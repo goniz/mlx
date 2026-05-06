@@ -2757,6 +2757,7 @@ void process_shaders() {
       "argsort_partition_f32", "argsort_partition.comp", {{"A_TYPE", "float"}});
   string_to_spv(
       "argsort_large_f32", "argsort_large.comp", {{"A_TYPE", "float"}});
+  string_to_spv("fft_c64", "fft.comp", {});
 
   string_to_spv("topk_argsort_f32", "topk_argsort.comp", {{"A_TYPE", "float"}});
   string_to_spv(

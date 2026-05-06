@@ -361,6 +361,14 @@ struct ArgsortPushConstants {
   uint32_t inner_end;
 };
 
+struct FFTPushConstants {
+  uint32_t in_offset;
+  uint32_t out_offset;
+  uint32_t batch_count;
+  uint32_t n;
+  uint32_t inverse;
+};
+
 struct DiagMaskInfPushConstants {
   uint32_t ncols;
   uint32_t rows_per_channel;
@@ -753,6 +761,15 @@ void dispatch_argsort_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t order = 0u);
+
+void dispatch_fft_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const FFTPushConstants& push_constants,
+    const std::vector<uint32_t>& specialization_constants = {});
 
 void dispatch_softmax_op(
     const array& in,

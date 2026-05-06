@@ -20,7 +20,8 @@ bool try_eval_unary_op_vulkan(
 
   array in = inputs[0];
   const bool complex_io = in.dtype() == complex64 && out.dtype() == complex64;
-  if ((!is_vulkan_float_dtype(in.dtype()) && !complex_io) ||
+  if ((!is_vulkan_float_dtype(in.dtype()) && in.dtype() != int32 &&
+       !complex_io) ||
       in.dtype() != out.dtype()) {
     return false;
   }
@@ -112,7 +113,8 @@ bool try_eval_generic_unary_op_vulkan(
 
   array in = inputs[0];
   const bool complex_io = in.dtype() == complex64 && out.dtype() == complex64;
-  if ((!is_vulkan_float_dtype(in.dtype()) && !complex_io) ||
+  if ((!is_vulkan_float_dtype(in.dtype()) && in.dtype() != int32 &&
+       !complex_io) ||
       in.dtype() != out.dtype()) {
     return false;
   }

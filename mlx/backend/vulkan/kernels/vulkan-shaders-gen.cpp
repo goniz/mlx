@@ -2120,6 +2120,10 @@ void process_shaders() {
       {{"A_TYPE", "float16_t"},
        {"D_TYPE", "float16_t"},
        {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "sqr_i32",
+      "square.comp",
+      {{"A_TYPE", "int"}, {"D_TYPE", "int"}, {"FLOAT_TYPE", "int"}});
 
   string_to_spv(
       "sqrt_f32",
@@ -2327,6 +2331,10 @@ void process_shaders() {
       {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
   string_to_spv(
       "abs_f32", "abs.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "abs_i32",
+      "abs.comp",
+      {{"A_TYPE", "int"}, {"D_TYPE", "int"}, {"INT_ABS", "1"}});
   string_to_spv(
       "xielu_f16",
       "xielu.comp",

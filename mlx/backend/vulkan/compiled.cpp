@@ -226,7 +226,7 @@ bool supports_primitive_name(const std::string& prim_name) {
       "Log",
       "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Power",
       "Real",      "Round",   "Sigmoid", "Sin",       "Sqrt",     "Subtract",
-      "Tan",       "Tanh"};
+      "Square",    "Tan",    "Tanh"};
   return supported.contains(prim_name);
 }
 
@@ -750,6 +750,9 @@ layout(push_constant) uniform PushConstants {
 
       if (prim_name == "Negative" && x.inputs().size() == 1) {
         os += fmt::format("(-{});\n", get_input_expr(x.inputs()[0]));
+      } else if (prim_name == "Square" && x.inputs().size() == 1) {
+        const auto input = get_input_expr(x.inputs()[0]);
+        os += fmt::format("({} * {});\n", input, input);
       } else if (
           prim_name == "Power" && x.inputs().size() == 2 && !is_complex) {
         const auto lhs = get_input_expr(x.inputs()[0]);

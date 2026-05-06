@@ -254,6 +254,7 @@ std::optional<vulkan::StaticShaderId>
 generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte) {
   MLX_VK_GENERIC_UNARY_CASE(Abs, float32, false, abs_f32);
   MLX_VK_GENERIC_UNARY_CASE(Abs, float16, false, abs_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Abs, int32, false, abs_i32);
   MLX_VK_GENERIC_UNARY_CASE(Ceil, float32, false, ceil_f32);
   MLX_VK_GENERIC_UNARY_CASE(Ceil, float16, false, ceil_f16);
   MLX_VK_GENERIC_UNARY_CASE(Exp, float32, false, exp_f32);
@@ -296,6 +297,7 @@ std::optional<vulkan::StaticShaderId> unary_shader_id(
   MLX_VK_UNARY_CASE(Square, float32, sqr_f32);
   MLX_VK_UNARY_CASE(Square, float16, sqr_f16);
   MLX_VK_UNARY_CASE(Square, bfloat16, sqr_f32);
+  MLX_VK_UNARY_CASE(Square, int32, sqr_i32);
   MLX_VK_UNARY_CASE(Square, complex64, sqr_c64);
   MLX_VK_UNARY_CASE(Sqrt, float32, sqrt_f32);
   MLX_VK_UNARY_CASE(Sqrt, float16, sqrt_f16);

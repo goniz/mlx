@@ -50,20 +50,32 @@ Fence::Fence(Stream stream) {
 void Fence::wait(Stream stream, const array&) {
   auto* impl = static_cast<FenceImpl*>(fence_.get());
   uint32_t target = 0;
+  Stream producer_stream{0, Device::cpu};
   {
     std::lock_guard<std::mutex> lock(impl->mutex);
     target = impl->count;
+    producer_stream = impl->stream;
   }
 
   if (stream.device == Device::cpu) {
+    if (producer_stream.device == Device::gpu) {
+      vulkan::synchronize_stream(producer_stream);
+      {
+        std::lock_guard<std::mutex> lock(impl->mutex);
+        if (impl->value < target) {
+          impl->value = target;
+        }
+      }
+      impl->cv.notify_all();
+    }
     scheduler::enqueue(stream, [fence = fence_, target]() mutable {
       wait_fence_value(fence, target);
     });
     return;
   }
 
-  if (impl->stream.device == Device::gpu) {
-    vulkan::synchronize_stream(impl->stream);
+  if (producer_stream.device == Device::gpu) {
+    vulkan::synchronize_stream(producer_stream);
     {
       std::lock_guard<std::mutex> lock(impl->mutex);
       if (impl->value < target) {

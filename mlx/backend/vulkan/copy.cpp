@@ -1697,8 +1697,7 @@ void concatenate_gpu(
         auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
             const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
         VkBufferCopy copy_region{};
-        copy_region.srcOffset =
-            static_cast<VkDeviceSize>(in.offset() * size_of(in.dtype()));
+        copy_region.srcOffset = static_cast<VkDeviceSize>(in.offset());
         copy_region.dstOffset = static_cast<VkDeviceSize>(dst_offset);
         copy_region.size = static_cast<VkDeviceSize>(in.nbytes());
         command_buffer.copyBuffer(
@@ -1749,7 +1748,7 @@ void concatenate_gpu(
         for (size_t prefix = 0; prefix < size_pre; ++prefix) {
           vk::BufferCopy region{};
           region.srcOffset = static_cast<VkDeviceSize>(
-              (in.offset() + prefix * in_axis_size * size_post) * itemsize);
+              in.offset() + prefix * in_axis_size * size_post * itemsize);
           region.dstOffset = static_cast<VkDeviceSize>(
               ((prefix * out_axis_size + sizes[i]) * size_post) * itemsize);
           region.size = static_cast<VkDeviceSize>(elements * itemsize);

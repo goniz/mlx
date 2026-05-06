@@ -137,24 +137,38 @@ std::string build_complex_add_shader() {
   return os.str();
 }
 
-bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
-  auto materialize_broadcast_input = [&](array& in) {
-    if (in.shape() == out.shape()) {
-      return ensure_vulkan_buffer(in, s);
-    }
-    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
-      return false;
-    }
-    if (!ensure_vulkan_buffer(in, s)) {
-      return false;
-    }
-    array view(out.shape(), in.dtype(), nullptr, {});
-    broadcast(in, view);
-    in = view;
-    return true;
-  };
+struct ComplexBinaryPushConstants {
+  uint32_t a_offset;
+  uint32_t b_offset;
+  uint32_t out_offset;
+  uint32_t total_elements;
+};
 
-  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+bool materialize_complex_binary_input(array& in, const array& out, Stream s) {
+  if (in.shape() == out.shape()) {
+    return ensure_vulkan_buffer(in, s);
+  }
+  if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
+    return false;
+  }
+  if (!ensure_vulkan_buffer(in, s)) {
+    return false;
+  }
+  array view(out.shape(), in.dtype(), nullptr, {});
+  broadcast(in, view);
+  in = view;
+  return true;
+}
+
+bool prepare_complex_binary_dispatch(
+    array& a,
+    array& b,
+    array& out,
+    array& out_work,
+    bool& staged_output,
+    Stream s) {
+  if (!materialize_complex_binary_input(a, out, s) ||
+      !materialize_complex_binary_input(b, out, s)) {
     return false;
   }
 
@@ -164,20 +178,27 @@ bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
   if (!is_supported_elementwise_layout(b)) {
     b = contiguous_copy_gpu(b, s);
   }
-  const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  staged_output = !is_supported_elementwise_layout(out);
+  out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
   if (!is_supported_elementwise_layout(out_work)) {
     return false;
   }
 
   auto bopt = get_binary_op_type(a, b);
   set_binary_op_output_data(a, b, out_work, bopt);
+  return true;
+}
 
+bool make_complex_binary_push_constants(
+    const array& a,
+    const array& b,
+    const array& out,
+    ComplexBinaryPushConstants& pc) {
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
   const auto out_offset =
-      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
-  const auto total = static_cast<uint64_t>(out_work.data_size());
+      static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
+  const auto total = static_cast<uint64_t>(out.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -185,26 +206,37 @@ bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
     return false;
   }
 
-  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
-  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
-  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      "dynamic_add_c64_c64_c64",
-      build_complex_add_shader(),
-      3,
-      arrays,
-      kPushConstantSize,
-      s);
-  struct PushConstants {
-    uint32_t a_offset;
-    uint32_t b_offset;
-    uint32_t out_offset;
-    uint32_t total_elements;
-  } pc{
+  pc = {
       static_cast<uint32_t>(a_offset),
       static_cast<uint32_t>(b_offset),
       static_cast<uint32_t>(out_offset),
       static_cast<uint32_t>(total),
   };
+  return true;
+}
+
+bool dispatch_complex_binary_shader(
+    array& a,
+    array& b,
+    array& out,
+    Stream s,
+    const char* name,
+    const std::string& source) {
+  array out_work(out.shape(), out.dtype(), nullptr, {});
+  bool staged_output = false;
+  if (!prepare_complex_binary_dispatch(a, b, out, out_work, staged_output, s)) {
+    return false;
+  }
+
+  ComplexBinaryPushConstants pc{};
+  if (!make_complex_binary_push_constants(a, b, out_work, pc)) {
+    return false;
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
+  constexpr uint32_t kPushConstantSize = sizeof(ComplexBinaryPushConstants);
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      name, source, 3, arrays, kPushConstantSize, s);
   vkCmdPushConstants(
       dispatch.command_buffer,
       dispatch.pipeline->layout,
@@ -219,6 +251,16 @@ bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
     copy_gpu(out_work, out, CopyType::General, s);
   }
   return true;
+}
+
+bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
+  return dispatch_complex_binary_shader(
+      a,
+      b,
+      out,
+      s,
+      "dynamic_add_c64_c64_c64",
+      build_complex_add_shader());
 }
 
 std::string build_complex_float_mul_shader(bool complex_lhs) {
@@ -245,87 +287,13 @@ bool try_eval_complex_float_mul_vulkan(
     array& out,
     Stream s) {
   const bool complex_lhs = a.dtype() == complex64;
-  auto materialize_broadcast_input = [&](array& in) {
-    if (in.shape() == out.shape()) {
-      return ensure_vulkan_buffer(in, s);
-    }
-    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
-      return false;
-    }
-    if (!ensure_vulkan_buffer(in, s)) {
-      return false;
-    }
-    array view(out.shape(), in.dtype(), nullptr, {});
-    broadcast(in, view);
-    in = view;
-    return true;
-  };
-
-  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
-    return false;
-  }
-
-  if (!is_supported_elementwise_layout(a)) {
-    a = contiguous_copy_gpu(a, s);
-  }
-  if (!is_supported_elementwise_layout(b)) {
-    b = contiguous_copy_gpu(b, s);
-  }
-  const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
-  if (!is_supported_elementwise_layout(out_work)) {
-    return false;
-  }
-
-  auto bopt = get_binary_op_type(a, b);
-  set_binary_op_output_data(a, b, out_work, bopt);
-
-  const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
-  const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset =
-      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
-  const auto total = static_cast<uint64_t>(out_work.data_size());
-  if (a_offset > std::numeric_limits<uint32_t>::max() ||
-      b_offset > std::numeric_limits<uint32_t>::max() ||
-      out_offset > std::numeric_limits<uint32_t>::max() ||
-      total > std::numeric_limits<uint32_t>::max()) {
-    return false;
-  }
-
-  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
-  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
-  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+  return dispatch_complex_binary_shader(
+      a,
+      b,
+      out,
+      s,
       complex_lhs ? "dynamic_mul_c64_f32_c64" : "dynamic_mul_f32_c64_c64",
-      build_complex_float_mul_shader(complex_lhs),
-      3,
-      arrays,
-      kPushConstantSize,
-      s);
-  struct PushConstants {
-    uint32_t a_offset;
-    uint32_t b_offset;
-    uint32_t out_offset;
-    uint32_t total_elements;
-  } pc{
-      static_cast<uint32_t>(a_offset),
-      static_cast<uint32_t>(b_offset),
-      static_cast<uint32_t>(out_offset),
-      static_cast<uint32_t>(total),
-  };
-  vkCmdPushConstants(
-      dispatch.command_buffer,
-      dispatch.pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      kPushConstantSize,
-      &pc);
-  vkCmdDispatch(
-      dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
-  vulkan::end_command_recording(s.index);
-  if (staged_output) {
-    copy_gpu(out_work, out, CopyType::General, s);
-  }
-  return true;
+      build_complex_float_mul_shader(complex_lhs));
 }
 
 std::string build_complex_mul_shader() {
@@ -372,171 +340,23 @@ std::string build_complex_div_shader() {
 }
 
 bool try_eval_complex_mul_vulkan(array& a, array& b, array& out, Stream s) {
-  auto materialize_broadcast_input = [&](array& in) {
-    if (in.shape() == out.shape()) {
-      return ensure_vulkan_buffer(in, s);
-    }
-    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
-      return false;
-    }
-    if (!ensure_vulkan_buffer(in, s)) {
-      return false;
-    }
-    array view(out.shape(), in.dtype(), nullptr, {});
-    broadcast(in, view);
-    in = view;
-    return true;
-  };
-
-  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
-    return false;
-  }
-
-  if (!is_supported_elementwise_layout(a)) {
-    a = contiguous_copy_gpu(a, s);
-  }
-  if (!is_supported_elementwise_layout(b)) {
-    b = contiguous_copy_gpu(b, s);
-  }
-  const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
-  if (!is_supported_elementwise_layout(out_work)) {
-    return false;
-  }
-
-  auto bopt = get_binary_op_type(a, b);
-  set_binary_op_output_data(a, b, out_work, bopt);
-
-  const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
-  const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset =
-      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
-  const auto total = static_cast<uint64_t>(out_work.data_size());
-  if (a_offset > std::numeric_limits<uint32_t>::max() ||
-      b_offset > std::numeric_limits<uint32_t>::max() ||
-      out_offset > std::numeric_limits<uint32_t>::max() ||
-      total > std::numeric_limits<uint32_t>::max()) {
-    return false;
-  }
-
-  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
-  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
-  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+  return dispatch_complex_binary_shader(
+      a,
+      b,
+      out,
+      s,
       "dynamic_mul_c64_c64_c64",
-      build_complex_mul_shader(),
-      3,
-      arrays,
-      kPushConstantSize,
-      s);
-  struct PushConstants {
-    uint32_t a_offset;
-    uint32_t b_offset;
-    uint32_t out_offset;
-    uint32_t total_elements;
-  } pc{
-      static_cast<uint32_t>(a_offset),
-      static_cast<uint32_t>(b_offset),
-      static_cast<uint32_t>(out_offset),
-      static_cast<uint32_t>(total),
-  };
-  vkCmdPushConstants(
-      dispatch.command_buffer,
-      dispatch.pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      kPushConstantSize,
-      &pc);
-  vkCmdDispatch(
-      dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
-  vulkan::end_command_recording(s.index);
-  if (staged_output) {
-    copy_gpu(out_work, out, CopyType::General, s);
-  }
-  return true;
+      build_complex_mul_shader());
 }
 
 bool try_eval_complex_div_vulkan(array& a, array& b, array& out, Stream s) {
-  auto materialize_broadcast_input = [&](array& in) {
-    if (in.shape() == out.shape()) {
-      return ensure_vulkan_buffer(in, s);
-    }
-    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
-      return false;
-    }
-    if (!ensure_vulkan_buffer(in, s)) {
-      return false;
-    }
-    array view(out.shape(), in.dtype(), nullptr, {});
-    broadcast(in, view);
-    in = view;
-    return true;
-  };
-
-  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
-    return false;
-  }
-
-  if (!is_supported_elementwise_layout(a)) {
-    a = contiguous_copy_gpu(a, s);
-  }
-  if (!is_supported_elementwise_layout(b)) {
-    b = contiguous_copy_gpu(b, s);
-  }
-  const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
-  if (!is_supported_elementwise_layout(out_work)) {
-    return false;
-  }
-
-  auto bopt = get_binary_op_type(a, b);
-  set_binary_op_output_data(a, b, out_work, bopt);
-
-  const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
-  const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset =
-      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
-  const auto total = static_cast<uint64_t>(out_work.data_size());
-  if (a_offset > std::numeric_limits<uint32_t>::max() ||
-      b_offset > std::numeric_limits<uint32_t>::max() ||
-      out_offset > std::numeric_limits<uint32_t>::max() ||
-      total > std::numeric_limits<uint32_t>::max()) {
-    return false;
-  }
-
-  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
-  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
-  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+  return dispatch_complex_binary_shader(
+      a,
+      b,
+      out,
+      s,
       "dynamic_div_c64_c64_c64",
-      build_complex_div_shader(),
-      3,
-      arrays,
-      kPushConstantSize,
-      s);
-  struct PushConstants {
-    uint32_t a_offset;
-    uint32_t b_offset;
-    uint32_t out_offset;
-    uint32_t total_elements;
-  } pc{
-      static_cast<uint32_t>(a_offset),
-      static_cast<uint32_t>(b_offset),
-      static_cast<uint32_t>(out_offset),
-      static_cast<uint32_t>(total),
-  };
-  vkCmdPushConstants(
-      dispatch.command_buffer,
-      dispatch.pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      kPushConstantSize,
-      &pc);
-  vkCmdDispatch(
-      dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
-  vulkan::end_command_recording(s.index);
-  if (staged_output) {
-    copy_gpu(out_work, out, CopyType::General, s);
-  }
-  return true;
+      build_complex_div_shader());
 }
 
 std::string build_divmod_f32_shader() {

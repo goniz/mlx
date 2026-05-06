@@ -97,6 +97,12 @@ uint64_t score_physical_device(
   return type_score + local_mem_score + queue_topology_score + vendor_score;
 }
 
+template <typename Feature>
+void append_pnext(void**& tail, Feature& feature) {
+  *tail = &feature;
+  tail = reinterpret_cast<void**>(&feature.pNext);
+}
+
 uint32_t find_queue_family(
     const std::vector<vk::QueueFamilyProperties>& queue_families,
     const vk::QueueFlags& required,
@@ -687,46 +693,19 @@ void VulkanContext::init() {
         supported_cooperative_matrix{};
     vk::PhysicalDeviceShaderBfloat16FeaturesKHR supported_shader_bfloat16{};
 
+    void** supported_feature_tail =
+        reinterpret_cast<void**>(&supported_shader_atomic_float.pNext);
     if (has_subgroup_size_control_ext) {
-      supported_shader_atomic_float.pNext =
-          &supported_subgroup_size_control;
-      if (has_pipeline_robustness_ext) {
-        supported_subgroup_size_control.pNext = &supported_pipeline_robustness;
-        if (has_cooperative_matrix_ext) {
-          supported_pipeline_robustness.pNext = &supported_cooperative_matrix;
-          if (has_shader_bfloat16_ext) {
-            supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
-          }
-        } else if (has_shader_bfloat16_ext) {
-          supported_pipeline_robustness.pNext = &supported_shader_bfloat16;
-        }
-      } else if (has_cooperative_matrix_ext) {
-        supported_subgroup_size_control.pNext = &supported_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        supported_shader_atomic_float.pNext = &supported_shader_bfloat16;
-      }
-    } else if (has_pipeline_robustness_ext) {
-      supported_shader_atomic_float.pNext =
-          &supported_pipeline_robustness;
-      if (has_cooperative_matrix_ext) {
-        supported_pipeline_robustness.pNext = &supported_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        supported_pipeline_robustness.pNext = &supported_shader_bfloat16;
-      }
-    } else if (has_cooperative_matrix_ext) {
-      supported_shader_atomic_float.pNext =
-          &supported_cooperative_matrix;
-      if (has_shader_bfloat16_ext) {
-        supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
-      }
-    } else if (has_shader_bfloat16_ext) {
-      supported_shader_atomic_float.pNext = &supported_shader_bfloat16;
+      append_pnext(supported_feature_tail, supported_subgroup_size_control);
+    }
+    if (has_pipeline_robustness_ext) {
+      append_pnext(supported_feature_tail, supported_pipeline_robustness);
+    }
+    if (has_cooperative_matrix_ext) {
+      append_pnext(supported_feature_tail, supported_cooperative_matrix);
+    }
+    if (has_shader_bfloat16_ext) {
+      append_pnext(supported_feature_tail, supported_shader_bfloat16);
     }
 
     physical_device.getFeatures2(&supported_features);
@@ -774,81 +753,20 @@ void VulkanContext::init() {
     VkPhysicalDeviceCooperativeMatrix2FeaturesNV enabled_cooperative_matrix2{};
     vk::PhysicalDeviceShaderBfloat16FeaturesKHR enabled_shader_bfloat16{};
 
-    // Link enabled feature chain (same pattern as supported features)
-    if (has_shader_atomic_float_ext && has_subgroup_size_control_ext) {
-      enabled_shader_atomic_float.pNext = &enabled_subgroup_size_control;
-      if (has_pipeline_robustness_ext) {
-        enabled_subgroup_size_control.pNext = &enabled_pipeline_robustness;
-        if (has_cooperative_matrix_ext) {
-          enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
-          if (has_shader_bfloat16_ext) {
-            enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-          }
-        } else if (has_shader_bfloat16_ext) {
-          enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_cooperative_matrix_ext) {
-        enabled_subgroup_size_control.pNext = &enabled_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        enabled_shader_atomic_float.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (has_shader_atomic_float_ext && has_pipeline_robustness_ext) {
-      enabled_shader_atomic_float.pNext = &enabled_pipeline_robustness;
-      if (has_cooperative_matrix_ext) {
-        enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (has_shader_atomic_float_ext && has_cooperative_matrix_ext) {
-      enabled_shader_atomic_float.pNext = &enabled_cooperative_matrix;
-      if (has_shader_bfloat16_ext) {
-        enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (has_shader_atomic_float_ext && has_shader_bfloat16_ext) {
-      enabled_shader_atomic_float.pNext = &enabled_shader_bfloat16;
-    } else if (!has_shader_atomic_float_ext && has_subgroup_size_control_ext) {
-      enabled_shader_integer_dot_product.pNext = &enabled_subgroup_size_control;
-      if (has_pipeline_robustness_ext) {
-        enabled_subgroup_size_control.pNext = &enabled_pipeline_robustness;
-        if (has_cooperative_matrix_ext) {
-          enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
-          if (has_shader_bfloat16_ext) {
-            enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-          }
-        } else if (has_shader_bfloat16_ext) {
-          enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_cooperative_matrix_ext) {
-        enabled_subgroup_size_control.pNext = &enabled_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        enabled_shader_integer_dot_product.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (!has_shader_atomic_float_ext && has_pipeline_robustness_ext) {
-      enabled_shader_integer_dot_product.pNext = &enabled_pipeline_robustness;
-      if (has_cooperative_matrix_ext) {
-        enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (!has_shader_atomic_float_ext && has_cooperative_matrix_ext) {
-      enabled_shader_integer_dot_product.pNext = &enabled_cooperative_matrix;
-      if (has_shader_bfloat16_ext) {
-        enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (!has_shader_atomic_float_ext && has_shader_bfloat16_ext) {
-      enabled_shader_integer_dot_product.pNext = &enabled_shader_bfloat16;
+    void** enabled_feature_tail = has_shader_atomic_float_ext
+        ? reinterpret_cast<void**>(&enabled_shader_atomic_float.pNext)
+        : reinterpret_cast<void**>(&enabled_shader_integer_dot_product.pNext);
+    if (has_subgroup_size_control_ext) {
+      append_pnext(enabled_feature_tail, enabled_subgroup_size_control);
+    }
+    if (has_pipeline_robustness_ext) {
+      append_pnext(enabled_feature_tail, enabled_pipeline_robustness);
+    }
+    if (has_cooperative_matrix_ext) {
+      append_pnext(enabled_feature_tail, enabled_cooperative_matrix);
+    }
+    if (has_shader_bfloat16_ext) {
+      append_pnext(enabled_feature_tail, enabled_shader_bfloat16);
     }
 
     if (supported_vulkan11_features.storageBuffer16BitAccess) {

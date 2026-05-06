@@ -18,10 +18,11 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   size_t bytes_per_key = out.itemsize() * elems_per_key;
   out.set_data(allocator::malloc(out.nbytes()));
 
-  // For now, support only uint32 keys/output on Vulkan.
-  if (keys.dtype() != uint32 || out.dtype() != uint32) {
+  // The shader writes packed 32-bit words into the output buffer.
+  if (keys.dtype() != uint32 || bytes_per_key % 4 != 0) {
     throw std::runtime_error(
-        "RandomBits failed on Vulkan (only uint32 keys/output supported).");
+        "RandomBits failed on Vulkan (only uint32 keys and 32-bit aligned "
+        "output supported).");
   }
 
   // Shader expects packed key layout.

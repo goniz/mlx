@@ -68,7 +68,7 @@ bool try_eval_scan_vulkan(
   }
 
   if (cumsum_i32 &&
-      (reverse || inclusive || scan_input.shape(scan_input.ndim() - 1) > 128)) {
+      (reverse || scan_input.shape(scan_input.ndim() - 1) > 128)) {
     return false;
   }
 

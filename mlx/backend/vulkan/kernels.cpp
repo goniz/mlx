@@ -784,6 +784,8 @@ ArangePushConstants make_arange_push_constants(
       return make_arange_push_constants_t<int16_t>(num_elements, start, step);
     case int32:
       return make_arange_push_constants_t<int32_t>(num_elements, start, step);
+    case int64:
+      return make_arange_push_constants_t<int64_t>(num_elements, start, step);
     case float16:
       return make_arange_push_constants_t<float16_t>(num_elements, start, step);
     case bfloat16:

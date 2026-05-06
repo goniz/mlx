@@ -2406,6 +2406,10 @@ void process_shaders() {
       "arange_int.comp",
       {{"A_TYPE", "int"}, {"D_TYPE", "int"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
+      "arange_i64",
+      "arange_int.comp",
+      {{"A_TYPE", "int64_t"}, {"D_TYPE", "int64_t"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
       "arange_u32",
       "arange_int.comp",
       {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"FLOAT_TYPE", "float"}});

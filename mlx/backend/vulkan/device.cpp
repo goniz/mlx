@@ -919,8 +919,8 @@ class VulkanDevice {
     wait_info.pSemaphores = &wait_semaphore;
     wait_info.pValues = &wait_timeline_value;
 
-    auto result = VulkanContext::get().device().waitSemaphores(
-        wait_info, UINT64_MAX);
+    auto result =
+        VulkanContext::get().device().waitSemaphores(wait_info, UINT64_MAX);
     if (result != vk::Result::eSuccess) {
       throw_if_vk_error(
           static_cast<VkResult>(result),
@@ -1101,7 +1101,7 @@ class VulkanDevice {
     if (arr.size() == 0) {
       return 0;
     }
-    return static_cast<uint64_t>(arr.data_size()) *
+    return static_cast<uint64_t>(arr.size()) *
         static_cast<uint64_t>(size_of(arr.dtype()));
   }
 
@@ -1617,7 +1617,7 @@ class VulkanDevice {
 
     for (const auto& arr : arrays) {
       auto data = arr.data_shared_ptr();
-      if (!data || arr.data_size() == 0) {
+      if (!data || arr.size() == 0) {
         continue;
       }
 
@@ -1637,8 +1637,7 @@ class VulkanDevice {
       }
 
       const uint64_t begin = static_cast<uint64_t>(offset_bytes);
-      const uint64_t size_bytes =
-          static_cast<uint64_t>(arr.data_size()) * item_size;
+      const uint64_t size_bytes = static_cast<uint64_t>(arr.size()) * item_size;
       const uint64_t buffer_size = static_cast<uint64_t>(storage->size);
       const uint64_t end = std::min(begin + size_bytes, buffer_size);
       if (begin >= end) {
@@ -1717,7 +1716,7 @@ class VulkanDevice {
     }
 
     const uint64_t bytes =
-        static_cast<uint64_t>(arr.data_size()) * size_of(arr.dtype());
+        static_cast<uint64_t>(arr.size()) * size_of(arr.dtype());
     const uint64_t offset =
         arr.offset() < 0 ? 0ull : static_cast<uint64_t>(arr.offset());
     if (offset > 0 || (bytes > 0 && bytes < buffer->size)) {

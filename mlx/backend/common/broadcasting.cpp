@@ -18,7 +18,12 @@ void broadcast(const array& in, array& out) {
   if (out.size() > in.size()) {
     flags.row_contiguous = flags.col_contiguous = false;
   }
-  out.copy_shared_buffer(in, strides, flags, in.data_size());
+  auto [data_size, row_contiguous, col_contiguous] =
+      check_contiguity(out.shape(), strides);
+  flags.contiguous = data_size == out.size();
+  flags.row_contiguous = row_contiguous;
+  flags.col_contiguous = col_contiguous;
+  out.copy_shared_buffer(in, strides, flags, data_size);
 }
 
 } // namespace mlx::core

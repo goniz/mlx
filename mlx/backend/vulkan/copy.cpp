@@ -25,8 +25,8 @@
 
 namespace {
 
-using mlx::core::Dtype;
 using mlx::core::array;
+using mlx::core::Dtype;
 using mlx::core::Shape;
 using mlx::core::Strides;
 namespace vulkan = mlx::core::vulkan;
@@ -39,10 +39,16 @@ using vulkan::zero_literal_for_dtype;
 
 constexpr size_t kMinTransferQueueCopyBytes = 256 * 1024;
 
+bool has_vulkan_storage(const array& arr) {
+  return arr.data_shared_ptr() != nullptr &&
+      vulkan::is_vulkan_buffer(arr.buffer());
+}
+
 std::string copy_dtype_suffix(Dtype dtype);
 bool needs_bf16_helpers(Dtype in_dtype, Dtype out_dtype);
 std::string emit_bf16_conversion_helpers();
-std::string bf16_cast_expr(const std::string& expr, Dtype in_dtype, Dtype out_dtype);
+std::string
+bf16_cast_expr(const std::string& expr, Dtype in_dtype, Dtype out_dtype);
 
 bool has_row_contiguous_strides(const mlx::core::array& arr) {
   if (arr.ndim() == 0) {
@@ -163,7 +169,9 @@ bool supports_dynamic_gpu_cast_dtype(Dtype dtype) {
 
 bool supports_dynamic_gpu_cast_pair(Dtype in_dtype, Dtype out_dtype) {
   if (in_dtype == mlx::core::complex64 || out_dtype == mlx::core::complex64) {
-    return in_dtype == mlx::core::complex64 && out_dtype == mlx::core::float32;
+    return in_dtype == out_dtype ||
+        (in_dtype == mlx::core::complex64 && out_dtype == mlx::core::float32) ||
+        (in_dtype != mlx::core::complex64 && out_dtype == mlx::core::complex64);
   }
   return supports_dynamic_gpu_cast_dtype(in_dtype) &&
       supports_dynamic_gpu_cast_dtype(out_dtype);
@@ -264,7 +272,7 @@ std::string build_dynamic_general_copy_shader(
     for (int dim = static_cast<int>(shape.size()) - 1; dim >= 0; --dim) {
       os << "  {\n";
       os << "    uint coord = remaining % " << static_cast<uint32_t>(shape[dim])
-          << "u;\n";
+         << "u;\n";
       os << "    remaining /= " << static_cast<uint32_t>(shape[dim]) << "u;\n";
       os << "    input_index += int64_t(coord) * int64_t(" << i_strides[dim]
          << ");\n";
@@ -277,8 +285,13 @@ std::string build_dynamic_general_copy_shader(
   if (needs_bf16_helpers(in_dtype, out_dtype)) {
     cast_expr = bf16_cast_expr(
         "input_buf.data[uint(input_index)]", in_dtype, out_dtype);
-  } else if (in_dtype == mlx::core::complex64 && out_dtype == mlx::core::float32) {
+  } else if (
+      in_dtype == mlx::core::complex64 && out_dtype == mlx::core::float32) {
     cast_expr = "input_buf.data[input_index].x";
+  } else if (
+      in_dtype == mlx::core::float32 && out_dtype == mlx::core::complex64) {
+    cast_expr =
+        "vec2(" + std::string("input_buf.data[uint(input_index)]") + ", 0.0)";
   } else {
     cast_expr = cast_expr_for_dtype(
         "input_buf.data[uint(input_index)]", in_dtype, out_dtype);
@@ -389,8 +402,8 @@ bool dispatch_dynamic_general_copy(
   append_layout_key(layout_key, o_strides);
 
   const std::string shader_name = "dynamic_general_copy_" +
-      copy_dtype_suffix(in.dtype()) + "_" + copy_dtype_suffix(out.dtype()) + "_" +
-      std::to_string(std::hash<std::string>{}(layout_key.str()));
+      copy_dtype_suffix(in.dtype()) + "_" + copy_dtype_suffix(out.dtype()) +
+      "_" + std::to_string(std::hash<std::string>{}(layout_key.str()));
 
   const std::string glsl_source = build_dynamic_general_copy_shader(
       in.dtype(),
@@ -448,6 +461,68 @@ bool dispatch_dynamic_general_copy(
   if (insert_barrier_after_dispatch) {
     insert_copy_memory_barrier(dispatch.command_buffer);
   }
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
+bool dispatch_dynamic_complex_scalar_fill(
+    const mlx::core::array& in,
+    mlx::core::array& out,
+    const mlx::core::Stream& s) {
+  if (!is_vulkan_storage_array(in) || !is_vulkan_storage_array(out) ||
+      in.dtype() != mlx::core::complex64 ||
+      out.dtype() != mlx::core::complex64 || in.data_size() != 1 ||
+      out.size() == 0) {
+    return false;
+  }
+
+  const uint64_t in_offset = static_cast<uint64_t>(element_offset(in));
+  const uint64_t out_offset = static_cast<uint64_t>(element_offset(out));
+  const uint64_t total = static_cast<uint64_t>(out.data_size());
+  if (in_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  std::ostringstream os;
+  os << emit_dynamic_shader_preamble(mlx::core::complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {vec2 data[];} input_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer OutputBuffer {vec2 data[];} output_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  output_buf.data[idx + pc.out_offset] = input_buf.data[pc.in_offset];\n";
+  os << "}\n";
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&in, 0},
+      {&out, 1},
+  };
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 3;
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_fill_c64_scalar", os.str(), 2, arrays, kPushConstantSize, s);
+
+  struct PushConstants {
+    uint32_t in_off;
+    uint32_t out_off;
+    uint32_t total;
+  } pc{
+      static_cast<uint32_t>(in_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  const uint32_t workgroups =
+      std::max<uint32_t>((static_cast<uint32_t>(total) + 255u) / 256u, 1u);
+  vkCmdDispatch(dispatch.command_buffer, workgroups, 1, 1);
   vulkan::end_command_recording(s.index);
   return true;
 }
@@ -750,6 +825,27 @@ void host_cast_copy_dispatch_src(
     case mlx::core::float64:
       throw std::runtime_error("float64 is not supported on the GPU");
   }
+}
+
+std::vector<char> make_host_scalar_fill_buffer(
+    const array& fill_val,
+    Dtype out_dtype,
+    size_t out_elements) {
+  std::vector<char> scalar_bytes(size_of(out_dtype));
+  host_cast_copy_dispatch_src(
+      fill_val.data<void>(),
+      fill_val.dtype(),
+      scalar_bytes.data(),
+      1,
+      out_dtype);
+
+  std::vector<char> host_fill(out_elements * size_of(out_dtype));
+  for (size_t offset = 0; offset < host_fill.size();
+       offset += scalar_bytes.size()) {
+    std::memcpy(
+        host_fill.data() + offset, scalar_bytes.data(), scalar_bytes.size());
+  }
+  return host_fill;
 }
 
 bool trace_copy_fallback_enabled() {
@@ -1242,6 +1338,16 @@ void copy_gpu_inplace(
     }
   }
 
+  if (source != &in && source->shape() == in.shape()) {
+    dispatch_shape = source->shape();
+    dispatch_i_strides = source->strides();
+    if (dispatch_shape.size() > 4) {
+      std::tie(dispatch_shape, dispatch_i_strides, dispatch_o_strides) =
+          collapse_copy_dims(
+              dispatch_shape, dispatch_i_strides, dispatch_o_strides);
+    }
+  }
+
   if (dynamic_i_offset.has_value() || dynamic_o_offset.has_value()) {
     if (ctype != CopyType::GeneralGeneral) {
       throw std::runtime_error(
@@ -1359,8 +1465,13 @@ void copy_gpu_inplace(
 
   const bool is_slice_copy =
       shader_copy_type && shader_id.has_value() && in.size() != out.size();
-  const bool large_shader_offset =
-      (shader_copy || is_slice_copy) &&
+  const bool dynamic_general_copy = !raw_buffer_copy && !shader_copy &&
+      !is_slice_copy &&
+      (ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
+      dispatch_shape.size() <= 4 && is_vulkan_storage_array(in_view) &&
+      is_vulkan_storage_array(out_view) &&
+      supports_dynamic_gpu_cast_pair(in_view.dtype(), out_view.dtype());
+  const bool large_shader_offset = (shader_copy || is_slice_copy) &&
       (has_large_element_offset(in_view) || has_large_element_offset(out_view));
 
   const bool segmented_buffer_copy = same_dtype && large_shader_offset;
@@ -1398,6 +1509,22 @@ void copy_gpu_inplace(
       }
     } catch (const std::exception& e) {
       // Fall through to error message
+    }
+  }
+
+  if (dynamic_general_copy) {
+    if (dispatch_dynamic_general_copy(
+            in_view,
+            out_view,
+            dispatch_shape,
+            dispatch_i_strides,
+            dispatch_o_strides,
+            0,
+            0,
+            s,
+            std::nullopt,
+            std::nullopt)) {
+      return;
     }
   }
 
@@ -1470,8 +1597,7 @@ void copy_gpu_inplace(
       static_cast<size_t>(dispatch_elements) * size_of(out.dtype());
   // Small copies, especially decode-time KV cache updates, are latency
   // sensitive and do better when they stay in the current compute submission.
-  const bool use_transfer_queue =
-      (raw_buffer_copy || segmented_buffer_copy) &&
+  const bool use_transfer_queue = (raw_buffer_copy || segmented_buffer_copy) &&
       should_use_transfer_queue_for_copy(copy_bytes);
   vk::CommandBuffer cmd_buffer = use_transfer_queue
       ? vulkan::begin_transfer_command_recording(s.index)
@@ -1535,17 +1661,17 @@ void copy_gpu_inplace(
 
       if (large_shader_offset || is_slice_copy) {
         const bool copied = dispatch_dynamic_general_copy(
-                in_view,
-                out_view,
-                dispatch_shape,
-                dispatch_i_strides,
-                dispatch_o_strides,
-                0,
-                0,
-                s,
-                std::nullopt,
-                std::nullopt,
-                is_slice_copy && same_buffer);
+            in_view,
+            out_view,
+            dispatch_shape,
+            dispatch_i_strides,
+            dispatch_o_strides,
+            0,
+            0,
+            s,
+            std::nullopt,
+            std::nullopt,
+            is_slice_copy && same_buffer);
         if (!copied) {
           throw std::runtime_error(
               "Large-offset shader copy does not support tensors with rank greater than 4.");
@@ -1594,8 +1720,13 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
 
   out.set_data(allocator::malloc(out.nbytes()));
 
+  if (dispatch_dynamic_complex_scalar_fill(fill_val, out, s)) {
+    return;
+  }
+
   if (auto shader_id = fill_shader_id(out.dtype()); shader_id.has_value()) {
-    if (auto fill_value = scalar_fill_value_as_float(fill_val); fill_value.has_value()) {
+    if (auto fill_value = scalar_fill_value_as_float(fill_val);
+        fill_value.has_value()) {
       auto command_buffer = vulkan::begin_command_recording(s.index);
       vulkan::dispatch_fill_op(out, *shader_id, command_buffer, s, *fill_value);
       vulkan::retain_array_for_stream(s, out);
@@ -1604,14 +1735,33 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
     }
   }
 
+  // CPU-side scalar replication must observe the final scalar value, even when
+  // it was produced by a prior GPU op.
+  fill_val.wait();
+
   // For unified memory, we can directly fill on CPU
   auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+  const char* val_ptr = static_cast<const char*>(fill_val.data<void>());
+  size_t val_size = size_of(fill_val.dtype());
+  complex64_t complex_scalar_value{};
+  if (fill_val.size() == 1 && fill_val.dtype() == complex64) {
+    complex_scalar_value = fill_val.item<complex64_t>();
+    val_ptr = reinterpret_cast<const char*>(&complex_scalar_value);
+    val_size = sizeof(complex_scalar_value);
+  }
+
+  const bool same_dtype_scalar_bytes = fill_val.dtype() == out.dtype();
+  std::vector<char> converted_scalar_bytes;
+  if (!same_dtype_scalar_bytes) {
+    converted_scalar_bytes =
+        make_host_scalar_fill_buffer(fill_val, out.dtype(), 1);
+    val_ptr = converted_scalar_bytes.data();
+    val_size = converted_scalar_bytes.size();
+  }
 
   if (vulkan::VulkanContext::get().is_unified_memory()) {
     // Direct CPU fill for unified memory
     char* dst_ptr = static_cast<char*>(out_buf->mapped_ptr);
-    const char* val_ptr = static_cast<const char*>(fill_val.data<void>());
-    size_t val_size = size_of(fill_val.dtype());
     size_t out_size = out.nbytes();
 
     const bool repeated_byte =
@@ -1627,8 +1777,6 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
     }
   } else {
     std::vector<char> host_fill(out.nbytes());
-    const char* val_ptr = static_cast<const char*>(fill_val.data<void>());
-    size_t val_size = size_of(fill_val.dtype());
     for (size_t i = 0; i < host_fill.size(); i += val_size) {
       std::memcpy(host_fill.data() + i, val_ptr, val_size);
     }
@@ -1686,14 +1834,20 @@ void concatenate_gpu(
       }
     }
     if (supported_axis0_concat) {
+      std::vector<array> prepared_inputs;
+      prepared_inputs.reserve(inputs.size());
+      for (auto in : inputs) {
+        if (!has_row_contiguous_strides(in) || !has_vulkan_storage(in)) {
+          in = contiguous_copy_gpu(in, s);
+        }
+        prepared_inputs.push_back(in);
+      }
+
       auto* out_buf =
           static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
       auto command_buffer = vulkan::begin_command_recording(s.index);
       size_t dst_offset = 0;
-      for (auto in : inputs) {
-        if (!has_row_contiguous_strides(in)) {
-          in = contiguous_copy_gpu(in, s);
-        }
+      for (const auto& in : prepared_inputs) {
         auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
             const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
         VkBufferCopy copy_region{};
@@ -1703,7 +1857,9 @@ void concatenate_gpu(
         command_buffer.copyBuffer(
             in_buf->buffer, out_buf->buffer, {copy_region});
         dst_offset += in.nbytes();
+        vulkan::retain_array_for_stream(s, in);
       }
+      vulkan::retain_array_for_stream(s, out);
       vulkan::end_command_recording(s.index);
       return;
     }
@@ -1711,11 +1867,24 @@ void concatenate_gpu(
 
   if (out.flags().row_contiguous) {
     bool supported_contiguous_concat = true;
+    std::vector<array> prepared_inputs;
     for (const auto& in : inputs) {
-      if (in.dtype() != out.dtype() || !has_row_contiguous_strides(in) ||
-          !vulkan::is_vulkan_buffer(in.buffer())) {
+      if (in.dtype() != out.dtype()) {
         supported_contiguous_concat = false;
         break;
+      }
+    }
+    if (supported_contiguous_concat) {
+      prepared_inputs.reserve(inputs.size());
+      for (auto in : inputs) {
+        if (!has_row_contiguous_strides(in) || !has_vulkan_storage(in)) {
+          in = contiguous_copy_gpu(in, s);
+        }
+        if (!has_row_contiguous_strides(in) || !has_vulkan_storage(in)) {
+          supported_contiguous_concat = false;
+          break;
+        }
+        prepared_inputs.push_back(in);
       }
     }
     if (supported_contiguous_concat) {
@@ -1734,8 +1903,8 @@ void concatenate_gpu(
       auto* out_buf =
           static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
       auto command_buffer = vulkan::begin_command_recording(s.index);
-      for (int i = 0; i < inputs.size(); ++i) {
-        const auto& in = inputs[i];
+      for (int i = 0; i < prepared_inputs.size(); ++i) {
+        const auto& in = prepared_inputs[i];
         const size_t in_axis_size = in.shape(axis);
         const size_t elements = in_axis_size * size_post;
         if (elements == 0) {
@@ -1754,7 +1923,8 @@ void concatenate_gpu(
           region.size = static_cast<VkDeviceSize>(elements * itemsize);
           copy_regions.push_back(region);
         }
-        command_buffer.copyBuffer(in_buf->buffer, out_buf->buffer, copy_regions);
+        command_buffer.copyBuffer(
+            in_buf->buffer, out_buf->buffer, copy_regions);
         vulkan::retain_array_for_stream(s, in);
       }
       vulkan::retain_array_for_stream(s, out);
@@ -1774,11 +1944,7 @@ void concatenate_gpu(
     size_t data_offset = strides[axis] * sizes[i];
     out_slice.copy_shared_buffer(
         out, strides, flags, out_slice.size(), data_offset);
-    copy_gpu_inplace(
-        inputs[i],
-        out_slice,
-        CopyType::GeneralGeneral,
-        s);
+    copy_gpu_inplace(inputs[i], out_slice, CopyType::GeneralGeneral, s);
   }
 }
 

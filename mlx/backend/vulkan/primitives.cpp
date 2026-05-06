@@ -21,16 +21,16 @@ namespace mlx::core {
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
-#define NYI_OP_MULTI(func)                                              \
-  void func::eval_gpu(                                                  \
-      const std::vector<array>& inputs, std::vector<array>& outputs) {  \
+#define NYI_OP_MULTI(func)                                             \
+  void func::eval_gpu(                                                 \
+      const std::vector<array>& inputs, std::vector<array>& outputs) { \
     throw std::runtime_error(#func " has no Vulkan implementation.");  \
   }
 
 #define NYI_OP_MULTI_STATE(func)                                       \
   void func::eval_gpu(                                                 \
       const std::vector<array>& inputs, std::vector<array>& outputs) { \
-    throw std::runtime_error(#func " has no Vulkan implementation."); \
+    throw std::runtime_error(#func " has no Vulkan implementation.");  \
   }
 
 #define NO_GPU_MULTI(func)                                             \
@@ -117,6 +117,7 @@ bool is_supported_equal_dtype(Dtype dtype) {
     case float16:
     case float32:
     case bfloat16:
+    case complex64:
     case int32:
     case int64:
     case uint32:
@@ -165,10 +166,8 @@ float bf16_to_fp32(uint u) {
 )";
 }
 
-std::string power_input_expr(
-    Dtype dtype,
-    const char* buffer_name,
-    const char* index_name) {
+std::string
+power_input_expr(Dtype dtype, const char* buffer_name, const char* index_name) {
   if (dtype == bfloat16) {
     return std::string("bf16_to_fp32(uint(") + buffer_name + ".data[" +
         index_name + "]))";
@@ -214,25 +213,26 @@ std::string build_power_shader(Dtype a_dtype, Dtype b_dtype, Dtype out_dtype) {
   os << "layout(set = 0, binding = 1) readonly buffer InputB {"
      << vulkan::dtype_to_glsl_storage_type(b_dtype) << " data[];} b_buf;\n";
   os << "layout(set = 0, binding = 2) buffer Output {"
-     << vulkan::dtype_to_glsl_storage_type(out_dtype) << " data[];} out_buf;\n\n";
+     << vulkan::dtype_to_glsl_storage_type(out_dtype)
+     << " data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
   os << "  if (linear_idx >= pc.total_elements) return;\n";
   os << "  uint idx = linear_idx;\n";
   os << "  uint a_idx = idx + pc.a_offset;\n";
   os << "  uint b_idx = idx + pc.b_offset;\n";
-  os << "  float lhs = " << power_input_expr(a_dtype, "a_buf", "a_idx") << ";\n";
-  os << "  float rhs = " << power_input_expr(b_dtype, "b_buf", "b_idx") << ";\n";
+  os << "  float lhs = " << power_input_expr(a_dtype, "a_buf", "a_idx")
+     << ";\n";
+  os << "  float rhs = " << power_input_expr(b_dtype, "b_buf", "b_idx")
+     << ";\n";
   os << "  out_buf.data[idx + pc.out_offset] = "
-      << power_output_expr(out_dtype, "pow(lhs, rhs)") << ";\n";
+     << power_output_expr(out_dtype, "pow(lhs, rhs)") << ";\n";
   os << "}\n";
   return os.str();
 }
 
-std::string equal_input_expr(
-    Dtype dtype,
-    const char* buffer_name,
-    const char* index_name) {
+std::string
+equal_input_expr(Dtype dtype, const char* buffer_name, const char* index_name) {
   if (dtype == bfloat16) {
     return std::string("bf16_to_fp32(uint(") + buffer_name + ".data[" +
         index_name + "]))";
@@ -250,9 +250,8 @@ std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
   std::ostringstream os;
   const bool uses_bfloat16 = a_dtype == bfloat16 || b_dtype == bfloat16;
   const bool uses_float16 = a_dtype == float16 || b_dtype == float16;
-  const bool uses_int64 =
-      a_dtype == int64 || a_dtype == uint64 || b_dtype == int64 ||
-      b_dtype == uint64;
+  const bool uses_int64 = a_dtype == int64 || a_dtype == uint64 ||
+      b_dtype == int64 || b_dtype == uint64;
 
   os << "#version 450\n";
   os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
@@ -284,13 +283,21 @@ std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
   os << "  uint idx = linear_idx;\n";
   os << "  uint a_idx = idx + pc.a_offset;\n";
   os << "  uint b_idx = idx + pc.b_offset;\n";
-  os << "  bool is_equal = (" << equal_input_expr(a_dtype, "a_buf", "a_idx")
-     << ") == (" << equal_input_expr(b_dtype, "b_buf", "b_idx") << ")";
-  if (equal_nan && (uses_bfloat16 || uses_float16 || a_dtype == float32 ||
-                    b_dtype == float32)) {
+  if (a_dtype == complex64 && b_dtype == complex64) {
+    os << "  vec2 lhs = " << equal_input_expr(a_dtype, "a_buf", "a_idx")
+       << ";\n";
+    os << "  vec2 rhs = " << equal_input_expr(b_dtype, "b_buf", "b_idx")
+       << ";\n";
+    os << "  bool is_equal = lhs.x == rhs.x && lhs.y == rhs.y";
+  } else {
+    os << "  bool is_equal = (" << equal_input_expr(a_dtype, "a_buf", "a_idx")
+       << ") == (" << equal_input_expr(b_dtype, "b_buf", "b_idx") << ")";
+  }
+  if (equal_nan &&
+      (uses_bfloat16 || uses_float16 || a_dtype == float32 ||
+       b_dtype == float32)) {
     os << " || (isnan(" << equal_input_expr(a_dtype, "a_buf", "a_idx")
-       << ") && isnan(" << equal_input_expr(b_dtype, "b_buf", "b_idx")
-       << "))";
+       << ") && isnan(" << equal_input_expr(b_dtype, "b_buf", "b_idx") << "))";
   }
   os << ";\n";
   os << "  out_buf.data[idx + pc.out_offset] = is_equal ? uint8_t(1) : uint8_t(0);\n";
@@ -302,9 +309,8 @@ std::string build_compare_shader(Dtype a_dtype, Dtype b_dtype, CompareOp op) {
   std::ostringstream os;
   const bool uses_bfloat16 = a_dtype == bfloat16 || b_dtype == bfloat16;
   const bool uses_float16 = a_dtype == float16 || b_dtype == float16;
-  const bool uses_int64 =
-      a_dtype == int64 || a_dtype == uint64 || b_dtype == int64 ||
-      b_dtype == uint64;
+  const bool uses_int64 = a_dtype == int64 || a_dtype == uint64 ||
+      b_dtype == int64 || b_dtype == uint64;
 
   os << "#version 450\n";
   os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
@@ -373,7 +379,8 @@ bool try_eval_equal_vulkan(
 
   array a = inputs[0];
   array b = inputs[1];
-  if (!is_supported_equal_dtype(a.dtype()) || !is_supported_equal_dtype(b.dtype())) {
+  if (!is_supported_equal_dtype(a.dtype()) ||
+      !is_supported_equal_dtype(b.dtype())) {
     return false;
   }
   if (a.dtype() != b.dtype() &&
@@ -386,7 +393,8 @@ bool try_eval_equal_vulkan(
     return true;
   }
 
-  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s)) {
     return false;
   }
 
@@ -425,11 +433,13 @@ bool try_eval_equal_vulkan(
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   out_work = collapse_compare_leading_dims(out_work, s);
 
-  if (!is_supported_elementwise_layout(a) || !is_supported_elementwise_layout(b) ||
+  if (!is_supported_elementwise_layout(a) ||
+      !is_supported_elementwise_layout(b) ||
       !is_supported_elementwise_layout(out_work)) {
     return false;
   }
-  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s) ||
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s) ||
       !ensure_vulkan_buffer_compare(out_work, s)) {
     return false;
   }
@@ -442,7 +452,8 @@ bool try_eval_equal_vulkan(
 
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset = static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
   const auto total = static_cast<uint64_t>(out_work.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
@@ -451,7 +462,8 @@ bool try_eval_equal_vulkan(
     return false;
   }
 
-  const std::string shader_name = std::string(equal_nan ? "dynamic_nan_equal_" : "dynamic_equal_") +
+  const std::string shader_name =
+      std::string(equal_nan ? "dynamic_nan_equal_" : "dynamic_equal_") +
       std::to_string(static_cast<int>(a.dtype().val())) + "_" +
       std::to_string(static_cast<int>(b.dtype().val()));
   const std::string glsl_source =
@@ -515,7 +527,8 @@ bool try_eval_compare_vulkan(
     return false;
   }
 
-  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s)) {
     return false;
   }
 
@@ -554,11 +567,13 @@ bool try_eval_compare_vulkan(
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   out_work = collapse_compare_leading_dims(out_work, s);
 
-  if (!is_supported_elementwise_layout(a) || !is_supported_elementwise_layout(b) ||
+  if (!is_supported_elementwise_layout(a) ||
+      !is_supported_elementwise_layout(b) ||
       !is_supported_elementwise_layout(out_work)) {
     return false;
   }
-  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s) ||
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s) ||
       !ensure_vulkan_buffer_compare(out_work, s)) {
     return false;
   }
@@ -571,7 +586,8 @@ bool try_eval_compare_vulkan(
 
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset = static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
   const auto total = static_cast<uint64_t>(out_work.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
@@ -584,7 +600,8 @@ bool try_eval_compare_vulkan(
       std::to_string(static_cast<int>(op)) + "_" +
       std::to_string(static_cast<int>(a.dtype().val())) + "_" +
       std::to_string(static_cast<int>(b.dtype().val()));
-  const std::string glsl_source = build_compare_shader(a.dtype(), b.dtype(), op);
+  const std::string glsl_source =
+      build_compare_shader(a.dtype(), b.dtype(), op);
   vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
@@ -672,11 +689,13 @@ bool try_eval_power_vulkan(
   b = collapse_power_leading_dims(b, s);
 
   const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   out_work = collapse_power_leading_dims(out_work, s);
 
-  if (!is_supported_elementwise_layout(a) || !is_supported_elementwise_layout(b) ||
+  if (!is_supported_elementwise_layout(a) ||
+      !is_supported_elementwise_layout(b) ||
       !is_supported_elementwise_layout(out_work)) {
     return false;
   }
@@ -693,7 +712,8 @@ bool try_eval_power_vulkan(
 
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset = static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
   const auto total = static_cast<uint64_t>(out_work.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
@@ -829,7 +849,8 @@ bool try_eval_logical_not_vulkan(
     const std::vector<array>& inputs,
     array& out,
     Stream s) {
-  if (inputs.size() != 1 || inputs[0].dtype() != bool_ || out.dtype() != bool_) {
+  if (inputs.size() != 1 || inputs[0].dtype() != bool_ ||
+      out.dtype() != bool_) {
     return false;
   }
 
@@ -844,10 +865,12 @@ bool try_eval_logical_not_vulkan(
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   out_work = collapse_compare_leading_dims(out_work, s);
 
-  if (!is_supported_elementwise_layout(in) || !is_supported_elementwise_layout(out_work)) {
+  if (!is_supported_elementwise_layout(in) ||
+      !is_supported_elementwise_layout(out_work)) {
     return false;
   }
-  if (!ensure_vulkan_buffer_compare(in, s) || !ensure_vulkan_buffer_compare(out_work, s)) {
+  if (!ensure_vulkan_buffer_compare(in, s) ||
+      !ensure_vulkan_buffer_compare(out_work, s)) {
     return false;
   }
   if (out_work.size() == 0) {
@@ -857,8 +880,10 @@ bool try_eval_logical_not_vulkan(
     return true;
   }
 
-  const auto in_offset = static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
-  const auto out_offset = static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto in_offset =
+      static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
   const auto total = static_cast<uint64_t>(out_work.data_size());
   if (in_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -869,7 +894,12 @@ bool try_eval_logical_not_vulkan(
   vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out_work, 1}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 3;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      "dynamic_logical_not", build_logical_not_shader(), 2, arrays, kPushConstantSize, s);
+      "dynamic_logical_not",
+      build_logical_not_shader(),
+      2,
+      arrays,
+      kPushConstantSize,
+      s);
 
   struct PushConstants {
     uint32_t in_offset;
@@ -904,15 +934,16 @@ bool try_eval_logical_binary_vulkan(
     Stream s,
     const char* shader_name,
     const char* expr) {
-  if (inputs.size() != 2 || inputs[0].dtype() != bool_ || inputs[1].dtype() != bool_ ||
-      out.dtype() != bool_) {
+  if (inputs.size() != 2 || inputs[0].dtype() != bool_ ||
+      inputs[1].dtype() != bool_ || out.dtype() != bool_) {
     return false;
   }
 
   array a = inputs[0];
   array b = inputs[1];
 
-  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s)) {
     return false;
   }
 
@@ -950,11 +981,13 @@ bool try_eval_logical_binary_vulkan(
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   out_work = collapse_compare_leading_dims(out_work, s);
 
-  if (!is_supported_elementwise_layout(a) || !is_supported_elementwise_layout(b) ||
+  if (!is_supported_elementwise_layout(a) ||
+      !is_supported_elementwise_layout(b) ||
       !is_supported_elementwise_layout(out_work)) {
     return false;
   }
-  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s) ||
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s) ||
       !ensure_vulkan_buffer_compare(out_work, s)) {
     return false;
   }
@@ -967,7 +1000,8 @@ bool try_eval_logical_binary_vulkan(
 
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset = static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
   const auto total = static_cast<uint64_t>(out_work.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
@@ -979,7 +1013,12 @@ bool try_eval_logical_binary_vulkan(
   vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      shader_name, build_logical_binary_shader(expr), 3, arrays, kPushConstantSize, s);
+      shader_name,
+      build_logical_binary_shader(expr),
+      3,
+      arrays,
+      kPushConstantSize,
+      s);
 
   struct PushConstants {
     uint32_t a_offset;
@@ -1028,7 +1067,8 @@ bool try_eval_bitwise_binary_vulkan(
     return false;
   }
 
-  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s)) {
     return false;
   }
 
@@ -1063,15 +1103,18 @@ bool try_eval_bitwise_binary_vulkan(
   b = collapse_compare_leading_dims(b, s);
 
   const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   out_work = collapse_compare_leading_dims(out_work, s);
 
-  if (!is_supported_elementwise_layout(a) || !is_supported_elementwise_layout(b) ||
+  if (!is_supported_elementwise_layout(a) ||
+      !is_supported_elementwise_layout(b) ||
       !is_supported_elementwise_layout(out_work)) {
     return false;
   }
-  if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s) ||
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s) ||
       !ensure_vulkan_buffer_compare(out_work, s)) {
     return false;
   }
@@ -1084,7 +1127,8 @@ bool try_eval_bitwise_binary_vulkan(
 
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
-  const auto out_offset = static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
   const auto total = static_cast<uint64_t>(out_work.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
@@ -1209,10 +1253,10 @@ bool try_eval_select_vulkan(
     std::ostringstream oss;
     oss << "select_vulkan_unsupported reason=" << reason
         << " out_shape=" << out.shape() << " out_dtype=" << out.dtype()
-        << " cond_shape=" << condition.shape() << " cond_dtype="
-        << condition.dtype() << " x_shape=" << x.shape() << " x_dtype="
-        << x.dtype() << " y_shape=" << y.shape() << " y_dtype="
-        << y.dtype();
+        << " cond_shape=" << condition.shape()
+        << " cond_dtype=" << condition.dtype() << " x_shape=" << x.shape()
+        << " x_dtype=" << x.dtype() << " y_shape=" << y.shape()
+        << " y_dtype=" << y.dtype();
     if (reason == "unsupported_elementwise_layout") {
       oss << " cond_ok=" << is_supported_elementwise_layout(condition)
           << " x_ok=" << is_supported_elementwise_layout(x)
@@ -1222,10 +1266,8 @@ bool try_eval_select_vulkan(
           << " x_row=" << x.flags().row_contiguous
           << " y_row=" << y.flags().row_contiguous
           << " out_row=" << out.flags().row_contiguous
-          << " cond_offset=" << condition.offset()
-          << " x_offset=" << x.offset()
-          << " y_offset=" << y.offset()
-          << " out_offset=" << out.offset();
+          << " cond_offset=" << condition.offset() << " x_offset=" << x.offset()
+          << " y_offset=" << y.offset() << " out_offset=" << out.offset();
     }
     trace_fallback(oss.str());
   };
@@ -1334,14 +1376,14 @@ bool try_eval_select_vulkan(
           s);
       vulkan::end_command_recording(s.index);
     } else {
-      const auto cond_offset =
-          static_cast<uint64_t>(cond_kernel.offset() / size_of(cond_kernel.dtype()));
+      const auto cond_offset = static_cast<uint64_t>(
+          cond_kernel.offset() / size_of(cond_kernel.dtype()));
       const auto x_offset =
           static_cast<uint64_t>(x_kernel.offset() / size_of(x_kernel.dtype()));
       const auto y_offset =
           static_cast<uint64_t>(y_kernel.offset() / size_of(y_kernel.dtype()));
-      const auto out_offset =
-          static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
+      const auto out_offset = static_cast<uint64_t>(
+          out_kernel.offset() / size_of(out_kernel.dtype()));
       const auto total = static_cast<uint64_t>(out_kernel.data_size());
       if (cond_offset > std::numeric_limits<uint32_t>::max() ||
           x_offset > std::numeric_limits<uint32_t>::max() ||
@@ -1396,10 +1438,14 @@ bool try_eval_select_vulkan(
           checked_u32_size(shape_dim_or_one(out_kernel, 1), "select_out_ne1"),
           checked_u32_size(shape_dim_or_one(out_kernel, 2), "select_out_ne2"),
           checked_u32_size(shape_dim_or_one(out_kernel, 3), "select_out_ne3"),
-          checked_u32_size(stride_dim_or_zero(cond_kernel, 0), "select_cond_s0"),
-          checked_u32_size(stride_dim_or_zero(cond_kernel, 1), "select_cond_s1"),
-          checked_u32_size(stride_dim_or_zero(cond_kernel, 2), "select_cond_s2"),
-          checked_u32_size(stride_dim_or_zero(cond_kernel, 3), "select_cond_s3"),
+          checked_u32_size(
+              stride_dim_or_zero(cond_kernel, 0), "select_cond_s0"),
+          checked_u32_size(
+              stride_dim_or_zero(cond_kernel, 1), "select_cond_s1"),
+          checked_u32_size(
+              stride_dim_or_zero(cond_kernel, 2), "select_cond_s2"),
+          checked_u32_size(
+              stride_dim_or_zero(cond_kernel, 3), "select_cond_s3"),
       };
       vkCmdPushConstants(
           dispatch.command_buffer,
@@ -1432,28 +1478,28 @@ bool try_eval_select_vulkan(
 void Equal::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_equal_vulkan(inputs, out, stream(), equal_nan_)) {
     throw std::runtime_error(
-        std::string(name()) +
-        " has no Vulkan implementation for this input.");
+        std::string(name()) + " has no Vulkan implementation for this input.");
   }
 }
 
 void BitwiseBinary::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_bitwise_binary_vulkan(inputs, out, stream(), op_)) {
     throw std::runtime_error(
-        std::string(name()) +
-        " has no Vulkan implementation for this input.");
+        std::string(name()) + " has no Vulkan implementation for this input.");
   }
 }
 
 void Greater::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_compare_vulkan(inputs, out, stream(), CompareOp::Greater)) {
-    throw std::runtime_error("Greater has no Vulkan implementation for this input.");
+    throw std::runtime_error(
+        "Greater has no Vulkan implementation for this input.");
   }
 }
 
 void Less::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_compare_vulkan(inputs, out, stream(), CompareOp::Less)) {
-    throw std::runtime_error("Less has no Vulkan implementation for this input.");
+    throw std::runtime_error(
+        "Less has no Vulkan implementation for this input.");
   }
 }
 
@@ -1473,19 +1519,24 @@ void NotEqual::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void LogicalNot::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_logical_not_vulkan(inputs, out, stream())) {
-    throw std::runtime_error("LogicalNot has no Vulkan implementation for this input.");
+    throw std::runtime_error(
+        "LogicalNot has no Vulkan implementation for this input.");
   }
 }
 
 void LogicalAnd::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (!try_eval_logical_binary_vulkan(inputs, out, stream(), "dynamic_logical_and", "lhs && rhs")) {
-    throw std::runtime_error("LogicalAnd has no Vulkan implementation for this input.");
+  if (!try_eval_logical_binary_vulkan(
+          inputs, out, stream(), "dynamic_logical_and", "lhs && rhs")) {
+    throw std::runtime_error(
+        "LogicalAnd has no Vulkan implementation for this input.");
   }
 }
 
 void LogicalOr::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (!try_eval_logical_binary_vulkan(inputs, out, stream(), "dynamic_logical_or", "lhs || rhs")) {
-    throw std::runtime_error("LogicalOr has no Vulkan implementation for this input.");
+  if (!try_eval_logical_binary_vulkan(
+          inputs, out, stream(), "dynamic_logical_or", "lhs || rhs")) {
+    throw std::runtime_error(
+        "LogicalOr has no Vulkan implementation for this input.");
   }
 }
 
@@ -1533,8 +1584,7 @@ void eval_argpartition_or_argsort_gpu(
   }
 
   if (out.dtype() != uint32) {
-    throw std::runtime_error(
-        "ArgPartition/ArgSort output must be uint32.");
+    throw std::runtime_error("ArgPartition/ArgSort output must be uint32.");
   }
 
   // Normalize axis
@@ -1628,7 +1678,6 @@ NYI_OP(BitwiseInvert)
 NYI_OP(Cosh)
 NYI_OP(Remainder)
 NYI_OP(Expm1)
-NYI_OP_STATE(FFT)
 NYI_OP_STATE(GatherMM)
 NYI_OP_STATE(Hadamard)
 NYI_OP(Imag)
@@ -1646,7 +1695,8 @@ NO_GPU_MULTI_STATE(SVD)
 NYI_OP_STATE(Partition)
 void Power::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_power_vulkan(inputs, out, stream())) {
-    throw std::runtime_error("Power has no Vulkan implementation for this input.");
+    throw std::runtime_error(
+        "Power has no Vulkan implementation for this input.");
   }
 }
 // QuantizedMatmul and QQMatmul are implemented in quantized.cpp.

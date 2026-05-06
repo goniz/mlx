@@ -381,6 +381,11 @@ bool try_eval_equal_vulkan(
     return false;
   }
 
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    return true;
+  }
+
   if (!ensure_vulkan_buffer_compare(a, s) || !ensure_vulkan_buffer_compare(b, s)) {
     return false;
   }

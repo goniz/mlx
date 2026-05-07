@@ -8,6 +8,22 @@ namespace mlx::core {
 
 namespace {
 
+bool is_vulkan_integer_dtype(Dtype dtype) {
+  switch (dtype) {
+    case int8:
+    case int16:
+    case int32:
+    case int64:
+    case uint8:
+    case uint16:
+    case uint32:
+    case uint64:
+      return true;
+    default:
+      return false;
+  }
+}
+
 std::string build_complex_abs_shader() {
   std::ostringstream os;
   os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
@@ -118,7 +134,7 @@ bool try_eval_unary_op_vulkan(
 
   array in = inputs[0];
   const bool complex_io = in.dtype() == complex64 && out.dtype() == complex64;
-  if ((!is_vulkan_float_dtype(in.dtype()) && in.dtype() != int32 &&
+  if ((!is_vulkan_float_dtype(in.dtype()) && !is_vulkan_integer_dtype(in.dtype()) &&
        !complex_io) ||
       in.dtype() != out.dtype()) {
     return false;
@@ -211,7 +227,7 @@ bool try_eval_generic_unary_op_vulkan(
 
   array in = inputs[0];
   const bool complex_io = in.dtype() == complex64 && out.dtype() == complex64;
-  if ((!is_vulkan_float_dtype(in.dtype()) && in.dtype() != int32 &&
+  if ((!is_vulkan_float_dtype(in.dtype()) && !is_vulkan_integer_dtype(in.dtype()) &&
        !complex_io) ||
       in.dtype() != out.dtype()) {
     return false;
@@ -416,6 +432,18 @@ void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
   throw std::runtime_error(
       "Log operation failed on Vulkan (unsupported dtype or layout).");
+}
+
+void Log1p::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
+      out.dtype() == float32) {
+    if (try_eval_unary_op_vulkan<Log1p>(
+            inputs, out, vulkan::StaticShaderId::log1p_f32, stream())) {
+      return;
+    }
+  }
+  throw std::runtime_error(
+      "Log1p operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {

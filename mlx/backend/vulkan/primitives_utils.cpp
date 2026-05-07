@@ -264,6 +264,9 @@ generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte) {
   MLX_VK_GENERIC_UNARY_CASE(Floor, float16, false, floor_f16);
   MLX_VK_GENERIC_UNARY_CASE(Negative, float32, false, neg_f32);
   MLX_VK_GENERIC_UNARY_CASE(Negative, float16, false, neg_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, int32, false, neg_i32);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, uint32, false, neg_u32);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, int64, false, neg_i64);
   MLX_VK_GENERIC_UNARY_CASE(Negative, complex64, false, neg_c64);
   MLX_VK_GENERIC_UNARY_CASE(Round, float32, false, round_f32);
   MLX_VK_GENERIC_UNARY_CASE(Round, float16, false, round_f16);

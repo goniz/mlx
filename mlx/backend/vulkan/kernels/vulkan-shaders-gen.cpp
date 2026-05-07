@@ -1830,6 +1830,7 @@ void process_shaders() {
             defs.insert({
                 {"FLOAT_TYPE", "float"},
                 {"NAN_GUARD", (op == "minimum" || op == "maximum") ? "1" : "0"},
+                {"REFINE_DIV", op == "div" ? "1" : "0"},
                 {"RTE16", rte ? "1" : "0"},
                 {"ADD_RMS", add_rms},
             });
@@ -1864,6 +1865,7 @@ void process_shaders() {
            {"D_TYPE", t},
            {"FLOAT_TYPE", t},
            {"NAN_GUARD", "0"},
+           {"REFINE_DIV", "0"},
            {"RTE16", "0"},
            {"ADD_RMS", "0"}});
     }
@@ -2250,6 +2252,8 @@ void process_shaders() {
         {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"RTE16", rte ? "1" : "0"}});
   }
   string_to_spv(
+      "log1p_f32", "log1p.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
       "gelu_f16",
       "gelu.comp",
       {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
@@ -2289,6 +2293,16 @@ void process_shaders() {
       {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
   string_to_spv(
       "neg_f32", "neg.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "neg_i32", "neg_int.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
+  string_to_spv(
+      "neg_u32",
+      "neg_int.comp",
+      {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"UNSIGNED_NEGATE", "1"}});
+  string_to_spv(
+      "neg_i64",
+      "neg_int.comp",
+      {{"A_TYPE", "int64_t"}, {"D_TYPE", "int64_t"}});
   string_to_spv(
       "tanh_f16",
       "tanh.comp",
@@ -2780,6 +2794,10 @@ void process_shaders() {
   string_to_spv(
       "sum_rows_f32",
       "sum_rows.comp",
+      merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv(
+      "prod_rows_f32",
+      "prod_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv(
       "max_rows_f32",

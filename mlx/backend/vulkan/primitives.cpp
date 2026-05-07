@@ -71,6 +71,15 @@ array collapse_compare_leading_dims(const array& arr, Stream s) {
   return flatten_in_eval(arr, 0, arr.ndim() - 4, s);
 }
 
+array flatten_compare_array(const array& arr, Stream s) {
+  if (arr.ndim() <= 4) {
+    return arr;
+  }
+  array flat({static_cast<ShapeElem>(arr.size())}, arr.dtype(), nullptr, {});
+  copy_gpu(arr, flat, CopyType::General, s);
+  return flat;
+}
+
 bool ensure_vulkan_buffer_power(array& arr, Stream s) {
   auto data = arr.data_shared_ptr();
   if (data != nullptr && vulkan::is_vulkan_buffer(data->buffer)) {
@@ -114,6 +123,10 @@ bool ensure_vulkan_buffer_compare(array& arr, Stream s) {
 bool is_supported_equal_dtype(Dtype dtype) {
   switch (dtype) {
     case bool_:
+    case int8:
+    case uint8:
+    case int16:
+    case uint16:
     case float16:
     case float32:
     case bfloat16:
@@ -130,6 +143,10 @@ bool is_supported_equal_dtype(Dtype dtype) {
 
 bool is_supported_ordered_compare_dtype(Dtype dtype) {
   switch (dtype) {
+    case int8:
+    case uint8:
+    case int16:
+    case uint16:
     case float16:
     case float32:
     case bfloat16:
@@ -425,13 +442,28 @@ bool try_eval_equal_vulkan(
     b = contiguous_copy_gpu(b, s);
   }
 
-  a = collapse_compare_leading_dims(a, s);
-  b = collapse_compare_leading_dims(b, s);
+  const bool flatten_rank = a.ndim() > 4 || b.ndim() > 4 || out.ndim() > 4;
+  if (flatten_rank) {
+    a = flatten_compare_array(a, s);
+    b = flatten_compare_array(b, s);
+  } else {
+    a = collapse_compare_leading_dims(a, s);
+    b = collapse_compare_leading_dims(b, s);
+  }
 
-  const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work = staged_output ? array(out.shape(), bool_, nullptr, {}) : out;
+  const bool staged_output = flatten_rank || !is_supported_elementwise_layout(out);
+  array out_work = staged_output
+      ? array(
+            flatten_rank ? Shape{static_cast<ShapeElem>(out.size())}
+                         : out.shape(),
+            bool_,
+            nullptr,
+            {})
+      : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  out_work = collapse_compare_leading_dims(out_work, s);
+  if (!flatten_rank) {
+    out_work = collapse_compare_leading_dims(out_work, s);
+  }
 
   if (!is_supported_elementwise_layout(a) ||
       !is_supported_elementwise_layout(b) ||
@@ -445,7 +477,11 @@ bool try_eval_equal_vulkan(
   }
   if (out_work.size() == 0) {
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::General, s);
+      if (flatten_rank) {
+        out.copy_shared_buffer(out_work, out.strides(), out.flags(), out.size());
+      } else {
+        copy_gpu(out_work, out, CopyType::General, s);
+      }
     }
     return true;
   }
@@ -497,7 +533,11 @@ bool try_eval_equal_vulkan(
   vulkan::end_command_recording(s.index);
 
   if (staged_output) {
-    copy_gpu(out_work, out, CopyType::General, s);
+    if (flatten_rank) {
+      out.copy_shared_buffer(out_work, out.strides(), out.flags(), out.size());
+    } else {
+      copy_gpu(out_work, out, CopyType::General, s);
+    }
   }
   return true;
 }
@@ -559,13 +599,28 @@ bool try_eval_compare_vulkan(
     b = contiguous_copy_gpu(b, s);
   }
 
-  a = collapse_compare_leading_dims(a, s);
-  b = collapse_compare_leading_dims(b, s);
+  const bool flatten_rank = a.ndim() > 4 || b.ndim() > 4 || out.ndim() > 4;
+  if (flatten_rank) {
+    a = flatten_compare_array(a, s);
+    b = flatten_compare_array(b, s);
+  } else {
+    a = collapse_compare_leading_dims(a, s);
+    b = collapse_compare_leading_dims(b, s);
+  }
 
-  const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work = staged_output ? array(out.shape(), bool_, nullptr, {}) : out;
+  const bool staged_output = flatten_rank || !is_supported_elementwise_layout(out);
+  array out_work = staged_output
+      ? array(
+            flatten_rank ? Shape{static_cast<ShapeElem>(out.size())}
+                         : out.shape(),
+            bool_,
+            nullptr,
+            {})
+      : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  out_work = collapse_compare_leading_dims(out_work, s);
+  if (!flatten_rank) {
+    out_work = collapse_compare_leading_dims(out_work, s);
+  }
 
   if (!is_supported_elementwise_layout(a) ||
       !is_supported_elementwise_layout(b) ||
@@ -579,7 +634,11 @@ bool try_eval_compare_vulkan(
   }
   if (out_work.size() == 0) {
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::General, s);
+      if (flatten_rank) {
+        out.copy_shared_buffer(out_work, out.strides(), out.flags(), out.size());
+      } else {
+        copy_gpu(out_work, out, CopyType::General, s);
+      }
     }
     return true;
   }
@@ -631,7 +690,11 @@ bool try_eval_compare_vulkan(
   vulkan::end_command_recording(s.index);
 
   if (staged_output) {
-    copy_gpu(out_work, out, CopyType::General, s);
+    if (flatten_rank) {
+      out.copy_shared_buffer(out_work, out.strides(), out.flags(), out.size());
+    } else {
+      copy_gpu(out_work, out, CopyType::General, s);
+    }
   }
   return true;
 }
@@ -1681,8 +1744,6 @@ NYI_OP(Expm1)
 NYI_OP_STATE(GatherMM)
 NYI_OP_STATE(Hadamard)
 NYI_OP(Imag)
-NYI_OP(Log1p)
-NYI_OP(LogAddExp)
 // Linear algebra operations - throw NYI like Metal backend
 NO_GPU_MULTI(LUF)
 NO_GPU_MULTI(QRF)
@@ -1693,6 +1754,31 @@ NO_GPU_MULTI_STATE(Eig)
 NO_GPU_MULTI_STATE(SVD)
 
 NYI_OP_STATE(Partition)
+void LogAddExp::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() != 2) {
+    throw std::runtime_error("LogAddExp has no Vulkan implementation.");
+  }
+
+  auto s = stream();
+  const auto& x = inputs[0];
+  const auto& y = inputs[1];
+
+  auto maxval = maximum(x, y, s);
+  auto minval = minimum(x, y, s);
+  auto result = add(
+      maxval,
+      log(
+          add(
+              array(1.0f, maxval.dtype()),
+              exp(subtract(minval, maxval, s), s),
+              s),
+          s),
+      s);
+  auto any_inf = logical_or(isneginf(minval, s), isposinf(maxval, s), s);
+  result = where(any_inf, maxval, result, s);
+  copy_gpu(result, out, CopyType::General, s);
+}
+
 void Power::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_power_vulkan(inputs, out, stream())) {
     throw std::runtime_error(

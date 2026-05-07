@@ -46,6 +46,29 @@ checked_shape_product(const array& arr, int begin, int end, const char* label) {
   return product;
 }
 
+std::optional<int64_t> scalar_index_value(const array& idx) {
+  if (idx.ndim() != 0) {
+    return std::nullopt;
+  }
+  switch (idx.dtype()) {
+    case int32:
+      return idx.item<int32_t>();
+    case int64:
+      return idx.item<int64_t>();
+    case uint32:
+      return static_cast<int64_t>(idx.item<uint32_t>());
+    case uint64: {
+      auto value = idx.item<uint64_t>();
+      if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return std::nullopt;
+      }
+      return static_cast<int64_t>(value);
+    }
+    default:
+      return std::nullopt;
+  }
+}
+
 bool try_eval_gather_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -166,6 +189,19 @@ bool try_eval_gather_vulkan(
   if (axis < 0 || axis >= src_input.ndim()) {
     trace_vulkan_unsupported("Gather", "axis is out of range");
     return false;
+  }
+  if (auto scalar_index = scalar_index_value(idx); scalar_index.has_value()) {
+    Shape start(src_input.ndim(), 0);
+    Shape stop = slice_sizes;
+    Shape strides(src_input.ndim(), 1);
+    start[axis] = *scalar_index;
+    stop[axis] += *scalar_index;
+    copy_gpu(
+        slice(src_input, std::move(start), std::move(stop), std::move(strides), s),
+        out,
+        CopyType::GeneralGeneral,
+        s);
+    return true;
   }
   for (int i = 0; i < src_input.ndim(); ++i) {
     const int64_t expected = (i == axis) ? 1 : src_input.shape(i);

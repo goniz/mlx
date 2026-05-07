@@ -49,12 +49,64 @@ checked_shape_product(const array& arr, int begin, int end, const char* label) {
   return product;
 }
 
+std::optional<int64_t> scalar_index_value(const array& idx) {
+  if (idx.ndim() != 0) {
+    return std::nullopt;
+  }
+  switch (idx.dtype()) {
+    case int32:
+      return idx.item<int32_t>();
+    case int64:
+      return idx.item<int64_t>();
+    case uint32:
+      return static_cast<int64_t>(idx.item<uint32_t>());
+    case uint64: {
+      auto value = idx.item<uint64_t>();
+      if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return std::nullopt;
+      }
+      return static_cast<int64_t>(value);
+    }
+    default:
+      return std::nullopt;
+  }
+}
+
 bool try_eval_scatter_vulkan(
     const std::vector<array>& inputs,
     array& out,
     Scatter::ReduceType reduce_type,
     const std::vector<int>& axes,
     Stream s) {
+  if (axes.empty() && inputs.size() == 2) {
+    const auto& src = inputs[0];
+    const auto& upd = inputs[1];
+    if (src.ndim() != 0 || upd.shape() != src.shape() || upd.dtype() != src.dtype() ||
+        out.shape() != src.shape() || out.dtype() != src.dtype()) {
+      return false;
+    }
+
+    array result = src;
+    switch (reduce_type) {
+      case Scatter::None:
+        result = upd;
+        break;
+      case Scatter::Sum:
+        result = add(src, upd, s);
+        break;
+      case Scatter::Max:
+        result = maximum(src, upd, s);
+        break;
+      case Scatter::Min:
+        result = minimum(src, upd, s);
+        break;
+      default:
+        return false;
+    }
+    copy_gpu(result, out, CopyType::GeneralGeneral, s);
+    return true;
+  }
+
   if (inputs.size() < 3 || inputs.size() != axes.size() + 2) {
     return false;
   }
@@ -198,6 +250,21 @@ bool try_eval_scatter_vulkan(
   if (axis < 0 || axis >= src.ndim()) {
     trace_vulkan_unsupported("Scatter", "axis is out of range");
     return false;
+  }
+  if (reduce_type == Scatter::None) {
+    if (auto scalar_index = scalar_index_value(idx); scalar_index.has_value()) {
+      Shape start(src.ndim(), 0);
+      Shape stop = upd.shape();
+      Shape strides(src.ndim(), 1);
+      start[axis] = *scalar_index;
+      stop[axis] += *scalar_index;
+      copy_gpu(
+          slice_update(src, upd, std::move(start), std::move(stop), std::move(strides), s),
+          out,
+          CopyType::GeneralGeneral,
+          s);
+      return true;
+    }
   }
   if (reduce_type == Scatter::Sum && out.dtype() == float32 &&
       !vulkan::VulkanContext::get().shader_buffer_atomic_float32_supported()) {

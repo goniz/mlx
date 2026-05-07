@@ -232,6 +232,13 @@ std::string build_dynamic_general_copy_shader(
     const Strides& o_strides,
     bool has_dynamic_i_offset,
     bool has_dynamic_o_offset) {
+  auto glsl_i64_literal = [](int64_t value) {
+    if (value < 0) {
+      return std::string("(-") + std::to_string(static_cast<uint64_t>(-value)) +
+          "l)";
+    }
+    return std::to_string(static_cast<uint64_t>(value)) + "l";
+  };
   std::ostringstream os;
   os << emit_dynamic_shader_preamble(in_dtype, out_dtype, true);
   if (needs_bf16_helpers(in_dtype, out_dtype)) {
@@ -274,10 +281,10 @@ std::string build_dynamic_general_copy_shader(
       os << "    uint coord = remaining % " << static_cast<uint32_t>(shape[dim])
          << "u;\n";
       os << "    remaining /= " << static_cast<uint32_t>(shape[dim]) << "u;\n";
-      os << "    input_index += int64_t(coord) * int64_t(" << i_strides[dim]
-         << ");\n";
-      os << "    output_index += int64_t(coord) * int64_t(" << o_strides[dim]
-         << ");\n";
+      os << "    input_index += int64_t(coord) * "
+         << glsl_i64_literal(i_strides[dim]) << ";\n";
+      os << "    output_index += int64_t(coord) * "
+         << glsl_i64_literal(o_strides[dim]) << ";\n";
       os << "  }\n";
     }
   }

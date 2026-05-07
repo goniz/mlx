@@ -797,6 +797,10 @@ bool try_eval_binary_op_vulkan(
     }
   }
 
+  if (out.size() == 0) {
+    return true;
+  }
+
   if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s)) {
     return false;
   }

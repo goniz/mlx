@@ -3,6 +3,7 @@
 #include <utility>
 #include <limits>
 
+#include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/ops.h"
@@ -25,6 +26,17 @@ array ensure_row_contiguous(array arr, Stream s) {
   if (needs_row_contiguous(arr)) {
     arr = contiguous_copy_gpu(arr, s);
   }
+  return arr;
+}
+
+array ensure_host_readable_row_contiguous(array arr, Stream s) {
+  if (arr.has_primitive()) {
+    arr.eval();
+  }
+  if (needs_row_contiguous(arr)) {
+    arr = contiguous_copy_gpu(arr, s);
+  }
+  arr.wait();
   return arr;
 }
 
@@ -104,6 +116,41 @@ int64_t normalize_gather_index(int64_t idx, int64_t axis_size) {
   return idx;
 }
 
+int64_t read_contiguous_index(const array& idx, int i) {
+  switch (idx.dtype()) {
+    case int32:
+      return idx.data<int32_t>()[i];
+    case int64:
+      return idx.data<int64_t>()[i];
+    case uint32:
+      return idx.data<uint32_t>()[i];
+    case uint64: {
+      auto val = idx.data<uint64_t>()[i];
+      if (val > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        throw std::runtime_error("uint64 index exceeds max int64_t value");
+      }
+      return static_cast<int64_t>(val);
+    }
+    default:
+      throw std::runtime_error("Unsupported index dtype for Vulkan gather.");
+  }
+}
+
+bool is_full_range_index_for_axis(const array& idx, int64_t axis_size, Stream s) {
+  if (axis_size <= 0 || idx.size() == 0 || (idx.size() % axis_size) != 0) {
+    return false;
+  }
+  auto flat_idx = ensure_row_contiguous(
+      reshape(idx, {static_cast<ShapeElem>(idx.size())}, s), s);
+  flat_idx.eval();
+  for (int i = 0; i < flat_idx.size(); ++i) {
+    if (read_contiguous_index(flat_idx, i) != (i % axis_size)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool try_eval_gather_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -136,6 +183,117 @@ bool try_eval_gather_vulkan(
 
   if (inputs.size() < 2 || inputs.size() != axes.size() + 1) {
     return false;
+  }
+
+  if (axes.size() > 2) {
+    std::vector<int> norm_axes;
+    norm_axes.reserve(axes.size());
+    for (int ax : axes) {
+      int norm = normalize_axis(ax, src_input.ndim());
+      if (norm < 0 || norm >= src_input.ndim()) {
+        return false;
+      }
+      norm_axes.push_back(norm);
+    }
+    for (int i = 0; i < norm_axes.size(); ++i) {
+      for (int j = i + 1; j < norm_axes.size(); ++j) {
+        if (norm_axes[i] == norm_axes[j]) {
+          return false;
+        }
+      }
+    }
+
+    const int idx_ndim = inputs[1].ndim();
+    for (int i = 2; i < inputs.size(); ++i) {
+      if (inputs[i].shape() != inputs[1].shape() ||
+          inputs[i].dtype() != inputs[1].dtype()) {
+        return false;
+      }
+    }
+
+    if (out.ndim() != idx_ndim + src_input.ndim()) {
+      return false;
+    }
+
+    Shape out_slice_shape(out.shape().begin() + idx_ndim, out.shape().end());
+    if (out_slice_shape != slice_sizes) {
+      return false;
+    }
+
+    std::vector<array> flat_indices;
+    flat_indices.reserve(inputs.size() - 1);
+    const auto index_count = checked_u32_size(inputs[1].size(), "gather_generic index_count");
+    for (int i = 1; i < inputs.size(); ++i) {
+      flat_indices.push_back(ensure_host_readable_row_contiguous(
+          reshape(inputs[i], {static_cast<ShapeElem>(index_count)}, s), s));
+    }
+
+    auto [out_work, staged_output] = make_output_work(out);
+    if (out_work.size() == 0) {
+      if (staged_output) {
+        copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      }
+      return true;
+    }
+
+    Strides out_slice_strides(
+        out_work.strides().begin() + idx_ndim, out_work.strides().end());
+    size_t out_slice_elems = 1;
+    for (auto dim : out_slice_shape) {
+      out_slice_elems *= static_cast<size_t>(dim);
+    }
+    auto [out_slice_data_size, out_slice_row_contig, out_slice_col_contig] =
+        check_contiguity(out_slice_shape, out_slice_strides);
+    array::Flags out_slice_flags = {
+        out_slice_data_size == out_slice_elems,
+        out_slice_row_contig,
+        out_slice_col_contig};
+
+    Strides index_shape_strides(idx_ndim, 1);
+    for (int i = idx_ndim - 2; i >= 0; --i) {
+      index_shape_strides[i] =
+          index_shape_strides[i + 1] * inputs[1].shape(i + 1);
+    }
+
+    for (uint32_t i = 0; i < index_count; ++i) {
+      Shape start(src_input.ndim(), 0);
+      Shape stop = slice_sizes;
+      Shape unit_strides(src_input.ndim(), 1);
+      for (int j = 0; j < norm_axes.size(); ++j) {
+        const int axis = norm_axes[j];
+        start[axis] = normalize_gather_index(
+            read_contiguous_index(flat_indices[j], i), src_input.shape(axis));
+        stop[axis] += start[axis];
+        if (stop[axis] > src_input.shape(axis)) {
+          return false;
+        }
+      }
+
+      array gathered = slice(src_input, start, stop, unit_strides, s);
+
+      int64_t out_offset = 0;
+      size_t remainder = i;
+      for (int d = 0; d < idx_ndim; ++d) {
+        const size_t coord = remainder / index_shape_strides[d];
+        remainder %= index_shape_strides[d];
+        out_offset += coord * out_work.strides(d);
+      }
+
+      array out_slice(out_slice_shape, out.dtype(), nullptr, {});
+      out_slice.copy_shared_buffer(
+          out_work,
+          out_slice_strides,
+          out_slice_flags,
+          out_slice_data_size,
+          out_offset);
+      out_slice.set_status(array::Status::available);
+      copy_gpu_inplace(gathered, out_slice, CopyType::GeneralGeneral, s);
+    }
+
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
   }
 
   if (axes.size() == 2) {

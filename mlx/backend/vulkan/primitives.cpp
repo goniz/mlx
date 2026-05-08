@@ -2048,11 +2048,25 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto [data_offset, out_strides] =
       prepare_slice(out, start_indices_, strides_);
-  if (reduce_type_ == SliceUpdate::Sum) {
-    auto reduced = add(
-        slice(in, start_indices_, end_indices_, strides_, stream()),
-        upd,
-        stream());
+  if (reduce_type_ != SliceUpdate::None) {
+    auto current = slice(in, start_indices_, end_indices_, strides_, stream());
+    array reduced = current;
+    switch (reduce_type_) {
+      case SliceUpdate::Sum:
+        reduced = add(current, upd, stream());
+        break;
+      case SliceUpdate::Prod:
+        reduced = multiply(current, upd, stream());
+        break;
+      case SliceUpdate::Max:
+        reduced = maximum(current, upd, stream());
+        break;
+      case SliceUpdate::Min:
+        reduced = minimum(current, upd, stream());
+        break;
+      case SliceUpdate::None:
+        break;
+    }
     copy_gpu_inplace(
         reduced,
         out,
@@ -2064,13 +2078,6 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
         CopyType::GeneralGeneral,
         stream());
     return;
-  }
-
-  if (reduce_type_ != SliceUpdate::None) {
-    throw std::runtime_error(
-        "[SliceUpdate::eval_gpu] Vulkan only supports SliceUpdate::None and "
-        "SliceUpdate::Sum. Reduce operations (Prod, Min, Max) are not yet "
-        "implemented.");
   }
 
   copy_gpu_inplace(

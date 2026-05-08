@@ -1,0 +1,110 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+#if defined(INDEX_IS_I64)
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#if defined(INDEX_IS_UNSIGNED)
+#define INDEX_TYPE uint64_t
+#else
+#define INDEX_TYPE int64_t
+#endif
+#elif defined(INDEX_IS_UNSIGNED)
+#define INDEX_TYPE uint
+#else
+#define INDEX_TYPE int
+#endif
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint outer_size;
+    uint axis0_size;
+    uint slice0_size;
+    uint middle_size;
+    uint axis1_size;
+    uint slice1_size;
+    uint inner_size;
+    uint index_count;
+} p;
+
+layout(scalar, binding = 0) readonly buffer U { uint16_t data_u[]; };
+layout(scalar, binding = 1) readonly buffer I0 { INDEX_TYPE data_i0[]; };
+layout(scalar, binding = 2) readonly buffer I1 { INDEX_TYPE data_i1[]; };
+layout(scalar, binding = 3) buffer D { uint data_d[]; };
+
+uint get_idx() {
+    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+}
+
+uint normalize_index(INDEX_TYPE idx, uint axis_size) {
+#if defined(INDEX_IS_UNSIGNED)
+    return uint(idx);
+#elif defined(INDEX_IS_I64)
+    return uint(idx < 0 ? idx + int64_t(axis_size) : idx);
+#else
+    return uint(idx < 0 ? idx + int(axis_size) : idx);
+#endif
+}
+
+float bf16_to_f32(uint bf16_bits) {
+    return uintBitsToFloat(bf16_bits << 16u);
+}
+
+uint f32_to_bf16(float val) {
+    uint f32_bits = floatBitsToUint(val);
+    uint trunc_bits = f32_bits & 0xFFFFu;
+    uint bf16 = f32_bits >> 16u;
+    if (trunc_bits > 0x8000u || (trunc_bits == 0x8000u && (bf16 & 1u) != 0u)) {
+        bf16 += 1u;
+    }
+    return bf16;
+}
+
+void main() {
+    const uint linear_idx = get_idx();
+
+    if (linear_idx >= p.ne) {
+        return;
+    }
+
+    const uint slice_size = p.outer_size * p.slice0_size * p.middle_size * p.slice1_size * p.inner_size;
+    const uint slice_offset = linear_idx % slice_size;
+    const uint index_pos = linear_idx / slice_size;
+    const uint inner_idx = slice_offset % p.inner_size;
+    const uint tmp = slice_offset / p.inner_size;
+    const uint slice1_idx = tmp % p.slice1_size;
+    const uint tmp1 = tmp / p.slice1_size;
+    const uint middle_idx = tmp1 % p.middle_size;
+    const uint tmp2 = tmp1 / p.middle_size;
+    const uint slice0_idx = tmp2 % p.slice0_size;
+    const uint outer_idx = tmp2 / p.slice0_size;
+    const uint scatter_idx0 = normalize_index(data_i0[index_pos], p.axis0_size);
+    const uint scatter_idx1 = normalize_index(data_i1[index_pos], p.axis1_size);
+    const uint dst_idx = (((((outer_idx * p.axis0_size + scatter_idx0 + slice0_idx) * p.middle_size + middle_idx) * p.axis1_size + scatter_idx1 + slice1_idx) * p.inner_size) + inner_idx);
+
+    const uint word_idx = dst_idx >> 1u;
+    const uint lane = dst_idx & 1u;
+    const float add_val = bf16_to_f32(uint(data_u[linear_idx]));
+
+    uint old_packed = data_d[word_idx];
+    while (true) {
+        uint lo_bf16 = old_packed & 0xFFFFu;
+        uint hi_bf16 = (old_packed >> 16u) & 0xFFFFu;
+        float lo_f = bf16_to_f32(lo_bf16);
+        float hi_f = bf16_to_f32(hi_bf16);
+        if (lane == 0u) {
+            lo_f += add_val;
+        } else {
+            hi_f += add_val;
+        }
+        uint new_packed = f32_to_bf16(lo_f) | (f32_to_bf16(hi_f) << 16u);
+        uint returned = atomicCompSwap(data_d[word_idx], old_packed, new_packed);
+        if (returned == old_packed) {
+            break;
+        }
+        old_packed = returned;
+    }
+}

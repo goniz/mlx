@@ -69,18 +69,64 @@ std::optional<int64_t> scalar_index_value(const array& idx) {
   }
 }
 
+std::optional<int64_t> singleton_index_value(const array& idx) {
+  if (idx.size() != 1) {
+    return std::nullopt;
+  }
+  switch (idx.dtype()) {
+    case int32:
+      return idx.item<int32_t>();
+    case int64:
+      return idx.item<int64_t>();
+    case uint32:
+      return static_cast<int64_t>(idx.item<uint32_t>());
+    case uint64: {
+      auto value = idx.item<uint64_t>();
+      if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return std::nullopt;
+      }
+      return static_cast<int64_t>(value);
+    }
+    default:
+      return std::nullopt;
+  }
+}
+
+int64_t normalize_gather_index(int64_t idx, int64_t axis_size) {
+  return idx < 0 ? idx + axis_size : idx;
+}
+
 bool try_eval_gather_vulkan(
     const std::vector<array>& inputs,
     array& out,
     const std::vector<int>& axes,
     const Shape& slice_sizes,
     Stream s) {
-  if (inputs.size() < 2 || inputs.size() != axes.size() + 1) {
+  if (inputs.empty()) {
     return false;
   }
 
   const auto& src_input = inputs[0];
   if (src_input.ndim() == 0 || out.dtype() != src_input.dtype()) {
+    return false;
+  }
+
+  if (inputs.size() == 1 && axes.empty()) {
+    if (slice_sizes.size() != src_input.ndim()) {
+      return false;
+    }
+    Shape start(src_input.ndim(), 0);
+    Shape stop = slice_sizes;
+    Shape strides(src_input.ndim(), 1);
+    copy_gpu(
+        slice(src_input, std::move(start), std::move(stop), std::move(strides), s),
+        out,
+        CopyType::GeneralGeneral,
+        s);
+    return true;
+  }
+
+  if (inputs.size() < 2 || inputs.size() != axes.size() + 1) {
     return false;
   }
 
@@ -194,10 +240,36 @@ bool try_eval_gather_vulkan(
     Shape start(src_input.ndim(), 0);
     Shape stop = slice_sizes;
     Shape strides(src_input.ndim(), 1);
-    start[axis] = *scalar_index;
-    stop[axis] += *scalar_index;
+    auto normalized_index =
+        normalize_gather_index(*scalar_index, src_input.shape(axis));
+    start[axis] = normalized_index;
+    stop[axis] += normalized_index;
     copy_gpu(
         slice(src_input, std::move(start), std::move(stop), std::move(strides), s),
+        out,
+        CopyType::GeneralGeneral,
+        s);
+    return true;
+  }
+  if (auto singleton_index = singleton_index_value(idx);
+      singleton_index.has_value()) {
+    Shape start(src_input.ndim(), 0);
+    Shape stop = slice_sizes;
+    Shape strides(src_input.ndim(), 1);
+    auto normalized_index =
+        normalize_gather_index(*singleton_index, src_input.shape(axis));
+    start[axis] = normalized_index;
+    stop[axis] += normalized_index;
+    copy_gpu(
+        reshape(
+            slice(
+                src_input,
+                std::move(start),
+                std::move(stop),
+                std::move(strides),
+                s),
+            out.shape(),
+            s),
         out,
         CopyType::GeneralGeneral,
         s);

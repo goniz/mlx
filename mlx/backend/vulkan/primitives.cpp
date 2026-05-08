@@ -264,6 +264,23 @@ equal_input_expr(Dtype dtype, const char* buffer_name, const char* index_name) {
 }
 
 std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
+  if (a_dtype == bool_ && b_dtype == bool_) {
+    std::ostringstream os;
+    os << vulkan::emit_dynamic_shader_preamble(bool_, bool_, false);
+    os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+    os << "layout(set = 0, binding = 0) readonly buffer InputA {uint8_t data[];} a_buf;\n";
+    os << "layout(set = 0, binding = 1) readonly buffer InputB {uint8_t data[];} b_buf;\n";
+    os << "layout(set = 0, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
+    os << "void main() {\n";
+    os << "  uint idx = gl_GlobalInvocationID.x;\n";
+    os << "  if (idx >= pc.total_elements) return;\n";
+    os << "  bool lhs = a_buf.data[idx + pc.a_offset] != uint8_t(0);\n";
+    os << "  bool rhs = b_buf.data[idx + pc.b_offset] != uint8_t(0);\n";
+    os << "  out_buf.data[idx + pc.out_offset] = (lhs == rhs) ? uint8_t(1) : uint8_t(0);\n";
+    os << "}\n";
+    return os.str();
+  }
+
   std::ostringstream os;
   const bool uses_bfloat16 = a_dtype == bfloat16 || b_dtype == bfloat16;
   const bool uses_float16 = a_dtype == float16 || b_dtype == float16;
@@ -272,6 +289,7 @@ std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
 
   os << "#version 450\n";
   os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  os << "#extension GL_EXT_scalar_block_layout : require\n";
   if (uses_int64) {
     os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
   }
@@ -289,11 +307,11 @@ std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
   }
 
   os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer InputA {"
+  os << "layout(scalar, binding = 0) readonly buffer InputA {"
      << vulkan::dtype_to_glsl_storage_type(a_dtype) << " data[];} a_buf;\n";
-  os << "layout(set = 0, binding = 1) readonly buffer InputB {"
+  os << "layout(scalar, binding = 1) readonly buffer InputB {"
      << vulkan::dtype_to_glsl_storage_type(b_dtype) << " data[];} b_buf;\n";
-  os << "layout(set = 0, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
+  os << "layout(scalar, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
   os << "  if (linear_idx >= pc.total_elements) return;\n";
@@ -331,6 +349,7 @@ std::string build_compare_shader(Dtype a_dtype, Dtype b_dtype, CompareOp op) {
 
   os << "#version 450\n";
   os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  os << "#extension GL_EXT_scalar_block_layout : require\n";
   if (uses_int64) {
     os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
   }
@@ -367,11 +386,11 @@ std::string build_compare_shader(Dtype a_dtype, Dtype b_dtype, CompareOp op) {
   }
 
   os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer InputA {"
+  os << "layout(scalar, binding = 0) readonly buffer InputA {"
      << vulkan::dtype_to_glsl_storage_type(a_dtype) << " data[];} a_buf;\n";
-  os << "layout(set = 0, binding = 1) readonly buffer InputB {"
+  os << "layout(scalar, binding = 1) readonly buffer InputB {"
      << vulkan::dtype_to_glsl_storage_type(b_dtype) << " data[];} b_buf;\n";
-  os << "layout(set = 0, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
+  os << "layout(scalar, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
@@ -409,6 +428,22 @@ bool try_eval_equal_vulkan(
     out.set_data(allocator::malloc(out.nbytes()));
     return true;
   }
+
+  auto stage_lowbit_equal_input = [&](array& in) {
+    if (in.dtype() == bool_ || in.dtype() == uint8 || in.dtype() == uint16) {
+      array staged(in.shape(), uint32, nullptr, {});
+      copy_gpu(in, staged, CopyType::General, s);
+      in = staged;
+      return;
+    }
+    if (in.dtype() == int8 || in.dtype() == int16) {
+      array staged(in.shape(), int32, nullptr, {});
+      copy_gpu(in, staged, CopyType::General, s);
+      in = staged;
+    }
+  };
+  stage_lowbit_equal_input(a);
+  stage_lowbit_equal_input(b);
 
   if (!ensure_vulkan_buffer_compare(a, s) ||
       !ensure_vulkan_buffer_compare(b, s)) {
@@ -708,10 +743,176 @@ bool try_eval_power_vulkan(
   }
   array a = inputs[0];
   array b = inputs[1];
-
   auto is_supported_dtype = [](Dtype dtype) {
     return dtype == float16 || dtype == float32 || dtype == bfloat16;
   };
+  auto scalar_float_value = [&](const array& arr) -> std::optional<double> {
+    array scalar = arr;
+    if (arr.size() != 1) {
+      if (arr.data_size() != 1) {
+        return std::nullopt;
+      }
+      scalar = slice(arr, Shape(arr.ndim(), 0), Shape(arr.ndim(), 1), s);
+    }
+    if (!ensure_vulkan_buffer_power(scalar, s)) {
+      return std::nullopt;
+    }
+    scalar.wait();
+    switch (scalar.dtype()) {
+      case float16:
+        return static_cast<double>(scalar.item<float16_t>());
+      case float32:
+        return static_cast<double>(scalar.item<float>());
+      case bfloat16:
+        return static_cast<double>(scalar.item<bfloat16_t>());
+      default:
+        return std::nullopt;
+    }
+  };
+
+  if (a.size() == 1 && b.size() == 1 && out.size() == 1 &&
+      a.dtype() == b.dtype() && a.dtype() == out.dtype()) {
+    if (is_supported_dtype(a.dtype()) && b.has_primitive()) {
+      double base = 0.0;
+      switch (a.dtype()) {
+        case float16:
+          base = static_cast<double>(a.item<float16_t>());
+          break;
+        case bfloat16:
+          base = static_cast<double>(a.item<bfloat16_t>());
+          break;
+        case float32:
+          base = static_cast<double>(a.item<float>());
+          break;
+        default:
+          break;
+      }
+      if (base > 0.0) {
+        auto result = exp(multiply(log(a, s), b, s), s);
+        copy_gpu(result, out, CopyType::General, s);
+        return true;
+      }
+    }
+
+    auto integer_power = [](auto base, auto exp) {
+      using T = decltype(base);
+      T res = 1;
+      if constexpr (std::is_signed_v<T>) {
+        if (exp < 0) {
+          return T(0);
+        }
+      }
+      while (exp) {
+        if (exp & 1) {
+          res *= base;
+        }
+        exp >>= 1;
+        base *= base;
+      }
+      return res;
+    };
+
+    switch (a.dtype()) {
+      case bool_: {
+        auto result = integer_power(a.item<bool>(), b.item<bool>());
+        copy_gpu(array(result, bool_), out, CopyType::General, s);
+        return true;
+      }
+      case int32: {
+        auto result = integer_power(a.item<int32_t>(), b.item<int32_t>());
+        copy_gpu(array(result, int32), out, CopyType::General, s);
+        return true;
+      }
+      case uint32: {
+        auto result = integer_power(a.item<uint32_t>(), b.item<uint32_t>());
+        copy_gpu(array(result, uint32), out, CopyType::General, s);
+        return true;
+      }
+      case int64: {
+        auto result = integer_power(a.item<int64_t>(), b.item<int64_t>());
+        copy_gpu(array(result, int64), out, CopyType::General, s);
+        return true;
+      }
+      case uint64: {
+        auto result = integer_power(a.item<uint64_t>(), b.item<uint64_t>());
+        copy_gpu(array(result, uint64), out, CopyType::General, s);
+        return true;
+      }
+      case complex64: {
+        auto result = std::pow(a.item<complex64_t>(), b.item<complex64_t>());
+        copy_gpu(array(result, complex64), out, CopyType::General, s);
+        return true;
+      }
+      default:
+        break;
+    }
+
+    if (is_supported_dtype(a.dtype())) {
+      array b_norm = add(b, array(0.0f, b.dtype()), s);
+      auto base = scalar_float_value(a);
+      auto exp = scalar_float_value(b_norm);
+      if (base.has_value() && exp.has_value()) {
+        double result = 0.0;
+        if (std::isfinite(*exp) && *exp >= 0.0 && std::floor(*exp) == *exp) {
+          uint64_t n = static_cast<uint64_t>(*exp);
+          double factor = *base;
+          result = 1.0;
+          while (n > 0) {
+            if (n & 1u) {
+              result *= factor;
+            }
+            n >>= 1;
+            if (n > 0) {
+              factor *= factor;
+            }
+          }
+        } else {
+          result = std::pow(*base, *exp);
+        }
+        copy_gpu(array(static_cast<float>(result), out.dtype()), out, CopyType::General, s);
+        return true;
+      }
+    }
+  }
+
+  if (is_supported_dtype(a.dtype()) && is_supported_dtype(b.dtype()) &&
+      is_supported_dtype(out.dtype()) && a.dtype() == out.dtype()) {
+    auto scalar_exp = scalar_float_value(b);
+    if (scalar_exp.has_value() && std::isfinite(*scalar_exp) && *scalar_exp >= 0.0 &&
+        std::floor(*scalar_exp) == *scalar_exp) {
+      uint64_t exp = static_cast<uint64_t>(*scalar_exp);
+      if (exp == 0) {
+        copy_gpu(array(1.0f, out.dtype()), out, CopyType::Scalar, s);
+        return true;
+      }
+
+      array base = a;
+      if (base.shape() != out.shape()) {
+        if (broadcast_shapes(base.shape(), out.shape()) != out.shape()) {
+          return false;
+        }
+        array view(out.shape(), base.dtype(), nullptr, {});
+        broadcast(base, view);
+        base = view;
+      }
+
+      array result = base;
+      uint64_t remaining = exp - 1;
+      array factor = base;
+      while (remaining > 0) {
+        if (remaining & 1u) {
+          result = multiply(result, factor, s);
+        }
+        remaining >>= 1;
+        if (remaining > 0) {
+          factor = multiply(factor, factor, s);
+        }
+      }
+      copy_gpu(result, out, CopyType::General, s);
+      return true;
+    }
+  }
+
   if (!is_supported_dtype(a.dtype()) || !is_supported_dtype(b.dtype()) ||
       !is_supported_dtype(out.dtype())) {
     return false;
@@ -1729,6 +1930,13 @@ void ArgSort::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_argpartition_or_argsort_gpu(inputs, out, axis_, 0, stream());
 }
 
+void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto result = take_along_axis(
+      inputs[0], argpartition(inputs[0], kth_, axis_, stream()), axis_, stream());
+  copy_gpu(result, out, CopyType::General, stream());
+}
+
 // CPU fallbacks for primitives not implemented on Vulkan
 NYI_OP(ArcCos)
 NYI_OP(ArcCosh)
@@ -1739,8 +1947,6 @@ NYI_OP(ArcTan2)
 NYI_OP(ArcTanh)
 NYI_OP(BitwiseInvert)
 NYI_OP(Cosh)
-NYI_OP(Remainder)
-NYI_OP(Expm1)
 NYI_OP_STATE(GatherMM)
 NYI_OP_STATE(Hadamard)
 NYI_OP(Imag)
@@ -1753,7 +1959,6 @@ NO_GPU_MULTI_STATE(Eigh)
 NO_GPU_MULTI_STATE(Eig)
 NO_GPU_MULTI_STATE(SVD)
 
-NYI_OP_STATE(Partition)
 void LogAddExp::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() != 2) {
     throw std::runtime_error("LogAddExp has no Vulkan implementation.");
@@ -1762,6 +1967,24 @@ void LogAddExp::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto s = stream();
   const auto& x = inputs[0];
   const auto& y = inputs[1];
+
+  if (x.dtype() == complex64 && y.dtype() == complex64 && out.dtype() == complex64 &&
+      x.size() == 1 && y.size() == 1 && out.size() == 1) {
+    constexpr float neginf = -std::numeric_limits<float>::infinity();
+    const auto xv = x.item<complex64_t>();
+    const auto yv = y.item<complex64_t>();
+    complex64_t result;
+    if (yv.real() == neginf && yv.imag() == neginf) {
+      result = xv;
+    } else if (xv.real() == neginf && xv.imag() == neginf) {
+      result = yv;
+    } else {
+      result = std::log(std::exp(xv) + std::exp(yv));
+    }
+    auto scalar = array(result);
+    copy_gpu(scalar, out, CopyType::General, s);
+    return;
+  }
 
   auto maxval = maximum(x, y, s);
   auto minval = minimum(x, y, s);
@@ -1808,12 +2031,6 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  if (reduce_type_ != SliceUpdate::None) {
-    throw std::runtime_error(
-        "[SliceUpdate::eval_gpu] Vulkan only supports SliceUpdate::None. "
-        "Reduce operations (Sum, Prod, Min, Max) are not yet implemented.");
-  }
-
   auto ctype = in.flags().contiguous && in.size() == in.data_size()
       ? CopyType::Vector
       : CopyType::General;
@@ -1826,6 +2043,31 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto [data_offset, out_strides] =
       prepare_slice(out, start_indices_, strides_);
+  if (reduce_type_ == SliceUpdate::Sum) {
+    auto reduced = add(
+        slice(in, start_indices_, end_indices_, strides_, stream()),
+        upd,
+        stream());
+    copy_gpu_inplace(
+        reduced,
+        out,
+        reduced.shape(),
+        reduced.strides(),
+        out_strides,
+        0,
+        data_offset,
+        CopyType::GeneralGeneral,
+        stream());
+    return;
+  }
+
+  if (reduce_type_ != SliceUpdate::None) {
+    throw std::runtime_error(
+        "[SliceUpdate::eval_gpu] Vulkan only supports SliceUpdate::None and "
+        "SliceUpdate::Sum. Reduce operations (Prod, Min, Max) are not yet "
+        "implemented.");
+  }
+
   copy_gpu_inplace(
       upd,
       out,

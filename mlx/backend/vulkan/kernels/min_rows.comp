@@ -28,13 +28,23 @@ void main() {
 
     tmp[col] = FLOAT_TYPE(3.402823466e+38);
     for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
-        tmp[col] = min(tmp[col], FLOAT_TYPE(data_a[src_idx + i]));
+        const FLOAT_TYPE value = FLOAT_TYPE(data_a[src_idx + i]);
+        if (isnan(value)) {
+            tmp[col] = value;
+            break;
+        }
+        tmp[col] = min(tmp[col], value);
     }
 
     barrier();
     [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
         if (col < s) {
-            tmp[col] = min(tmp[col], tmp[col + s]);
+            const FLOAT_TYPE other = tmp[col + s];
+            if (isnan(other)) {
+                tmp[col] = other;
+            } else if (!isnan(tmp[col])) {
+                tmp[col] = min(tmp[col], other);
+            }
         }
         barrier();
     }

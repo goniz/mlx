@@ -22,6 +22,7 @@
 #include "mlx/dtype_utils.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
+#include "mlx/transforms.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
@@ -363,28 +364,26 @@ float erf(float x) {
   if (uses_power) {
     os << R"(
 float safe_real_pow(float x, float y) {
-  if (x < 0.0) {
-    float yi = round(y);
-    if (abs(y - yi) <= 0.00001 && abs(yi) <= 64.0) {
-      int n = int(yi);
-      float base = abs(x);
-      float result = 1.0;
-      int exp = abs(n);
-      while (exp > 0) {
-        if ((exp & 1) != 0) {
-          result *= base;
-        }
-        base *= base;
-        exp >>= 1;
+  float yi = round(y);
+  if (abs(y - yi) <= 0.00001 && abs(yi) <= 64.0) {
+    int n = int(yi);
+    float base = abs(x);
+    float result = 1.0;
+    int exp = abs(n);
+    while (exp > 0) {
+      if ((exp & 1) != 0) {
+        result *= base;
       }
-      if (n < 0) {
-        result = 1.0 / result;
-      }
-      if ((abs(n) & 1) != 0) {
-        result = -result;
-      }
-      return result;
+      base *= base;
+      exp >>= 1;
     }
+    if (n < 0) {
+      result = 1.0 / result;
+    }
+    if (x < 0.0 && (abs(n) & 1) != 0) {
+      result = -result;
+    }
+    return result;
   }
   return pow(x, y);
 }
@@ -954,6 +953,16 @@ void Compiled::eval_gpu(
   auto [contiguous, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
   auto dispatch_inputs = inputs;
+  std::vector<array> pending_inputs;
+  pending_inputs.reserve(dispatch_inputs.size());
+  for (const auto& in : dispatch_inputs) {
+    if (in.status() == array::Status::unscheduled) {
+      pending_inputs.push_back(in);
+    }
+  }
+  if (!pending_inputs.empty()) {
+    async_eval(std::move(pending_inputs));
+  }
   std::vector<uint32_t> input_offsets(inputs.size(), 0u);
   for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
     input_offsets[i] = checked_elem_offset(dispatch_inputs[i], "input");

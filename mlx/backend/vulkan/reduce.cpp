@@ -47,6 +47,7 @@ bool try_eval_reduce_sum_rows_vulkan(
   const bool bool_sum =
       sum_reduce && in.dtype() == bool_ && out.dtype() == int32;
   const bool bool_io = in.dtype() == bool_ && out.dtype() == bool_;
+  const bool bool_min_max = (max_reduce || min_reduce) && bool_io;
   const bool integer_sum_prod =
       (sum_reduce || prod_reduce) &&
       ((in.dtype() == uint8 && out.dtype() == uint32) ||
@@ -58,8 +59,8 @@ bool try_eval_reduce_sum_rows_vulkan(
       ((in.dtype() == uint32 && out.dtype() == uint32) ||
        (in.dtype() == int32 && out.dtype() == int32));
   if ((sum_reduce || prod_reduce || max_reduce || min_reduce) && !f32_io &&
-      !f16_io && !bf16_io && !bool_sum && !bool_prod && !integer_sum_prod &&
-      !integer_min_max) {
+      !f16_io && !bf16_io && !bool_sum && !bool_prod && !bool_min_max &&
+      !integer_sum_prod && !integer_min_max) {
     return false;
   }
   if (logic_reduce && !bool_prod && out.dtype() != bool_) {
@@ -70,7 +71,7 @@ bool try_eval_reduce_sum_rows_vulkan(
       (sum_reduce || prod_reduce || max_reduce || min_reduce) &&
       (f16_io || bf16_io || bool_sum || bool_prod || integer_sum_prod ||
        integer_min_max);
-  const bool use_u8_staging_io = logic_reduce;
+  const bool use_u8_staging_io = logic_reduce || bool_min_max;
   if (use_f32_staging_io) {
     if (in.offset() > 0xFFFF && in.flags().row_contiguous) {
       in = stage_zero_offset_row_contiguous(in, s);
@@ -99,7 +100,7 @@ bool try_eval_reduce_sum_rows_vulkan(
     reduce_out_target.set_data(allocator::malloc(reduce_out_target.nbytes()));
   }
 
-  if (logic_reduce && in.ndim() == 0) {
+  if ((logic_reduce || bool_min_max) && in.ndim() == 0) {
     copy_gpu(in, out, CopyType::General, s);
     return true;
   }
@@ -198,6 +199,9 @@ bool try_eval_reduce_sum_rows_vulkan(
         auto command_buffer = vulkan::begin_command_recording(s.index);
         const auto shader_id = sum_reduce ? vulkan::StaticShaderId::sum_rows_f32
             : prod_reduce                ? vulkan::StaticShaderId::prod_rows_f32
+            : bool_min_max               ? (max_reduce
+                                ? vulkan::StaticShaderId::any_rows_u8
+                                : vulkan::StaticShaderId::all_rows_u8)
             : max_reduce                 ? vulkan::StaticShaderId::max_rows_f32
             : min_reduce                 ? vulkan::StaticShaderId::min_rows_f32
             : reduce_type == Reduce::And ? vulkan::StaticShaderId::all_rows_u8
@@ -218,48 +222,27 @@ bool try_eval_reduce_sum_rows_vulkan(
         : swapaxes_in_eval(kernel_out, axis, reduced.ndim() - 1);
   }
 
-  if (out_is_squeezed) {
-    auto squeezed = reshape_in_eval(reduced, reduce_out_target.shape(), s);
-    if (use_u8_staging_io) {
-      out.copy_shared_buffer(
-          squeezed,
-          squeezed.strides(),
-          squeezed.flags(),
-          squeezed.data_size(),
-          squeezed.offset());
-    } else {
-      copy_gpu(squeezed, reduce_out_target, CopyType::GeneralGeneral, s);
-    }
-  } else {
-    if (staged_full_reduce_output) {
-      auto restored_keepdims = reshape_in_eval(reduced, out.shape(), s);
-      if (use_u8_staging_io) {
-        out.copy_shared_buffer(
-            restored_keepdims,
-            restored_keepdims.strides(),
-            restored_keepdims.flags(),
-            restored_keepdims.data_size(),
-            restored_keepdims.offset());
-      } else {
-        copy_gpu(restored_keepdims, out, CopyType::GeneralGeneral, s);
-      }
-    } else if (use_u8_staging_io) {
-      out.copy_shared_buffer(
-          reduced,
-          reduced.strides(),
-          reduced.flags(),
-          reduced.data_size(),
-          reduced.offset());
-    } else {
-      copy_gpu(reduced, reduce_out_target, CopyType::GeneralGeneral, s);
-    }
-  }
+  array final_result = out_is_squeezed
+      ? reshape_in_eval(reduced, out.shape(), s)
+      : staged_full_reduce_output ? reshape_in_eval(reduced, out.shape(), s)
+                                  : reduced;
 
   if (use_f32_staging_io) {
+    copy_gpu(final_result, reduce_out_target, CopyType::General, s);
     copy_gpu(reduce_out_target, out, CopyType::General, s);
-  } else if (staged_full_reduce_output && !use_u8_staging_io) {
-    copy_gpu(reduce_out_target, out, CopyType::Scalar, s);
+  } else if (use_u8_staging_io) {
+    out.copy_shared_buffer(
+        final_result,
+        final_result.strides(),
+        final_result.flags(),
+        final_result.data_size(),
+        final_result.offset());
+  } else if (final_result.ndim() == 0 && out.ndim() == 0) {
+    copy_gpu(final_result, out, CopyType::Scalar, s);
+  } else {
+    copy_gpu(final_result, out, CopyType::GeneralGeneral, s);
   }
+
   return true;
 }
 

@@ -1261,6 +1261,13 @@ std::optional<float> scalar_fill_value_as_float(const array& val) {
 } // namespace
 
 void copy_gpu(const array& src, array& out, CopyType ctype, const Stream& s) {
+  // A broadcasted scalar can still appear as a general or vector copy with a
+  // single backing element. Those paths must become scalar fills, otherwise we
+  // only copy the lone raw element instead of the broadcasted value.
+  if ((ctype == CopyType::Vector || ctype == CopyType::General) &&
+      src.data_size() == 1 && out.size() != 1) {
+    ctype = CopyType::Scalar;
+  }
   bool donated = set_copy_output_data(src, out, ctype);
   if (donated && src.dtype() == out.dtype()) {
     // If the output has the same type as the input then there is nothing to
@@ -1716,6 +1723,15 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
   }
 
   array fill_val = val;
+  if (fill_val.data_size() == 1 && fill_val.size() != 1) {
+    array scalar_view({1}, fill_val.dtype(), nullptr, {});
+    array::Flags scalar_flags{};
+    scalar_flags.contiguous = true;
+    scalar_flags.row_contiguous = true;
+    scalar_flags.col_contiguous = true;
+    scalar_view.copy_shared_buffer(fill_val, {1}, scalar_flags, 1);
+    fill_val = scalar_view;
+  }
   if (fill_val.has_primitive()) {
     fill_val.eval();
   } else {
@@ -1844,6 +1860,10 @@ void concatenate_gpu(
       std::vector<array> prepared_inputs;
       prepared_inputs.reserve(inputs.size());
       for (auto in : inputs) {
+        if (in.nbytes() == 0) {
+          prepared_inputs.push_back(in);
+          continue;
+        }
         if (!has_row_contiguous_strides(in) || !has_vulkan_storage(in)) {
           in = contiguous_copy_gpu(in, s);
         }
@@ -1855,6 +1875,9 @@ void concatenate_gpu(
       auto command_buffer = vulkan::begin_command_recording(s.index);
       size_t dst_offset = 0;
       for (const auto& in : prepared_inputs) {
+        if (in.nbytes() == 0) {
+          continue;
+        }
         auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
             const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
         VkBufferCopy copy_region{};
@@ -1884,6 +1907,10 @@ void concatenate_gpu(
     if (supported_contiguous_concat) {
       prepared_inputs.reserve(inputs.size());
       for (auto in : inputs) {
+        if (in.nbytes() == 0) {
+          prepared_inputs.push_back(in);
+          continue;
+        }
         if (!has_row_contiguous_strides(in) || !has_vulkan_storage(in)) {
           in = contiguous_copy_gpu(in, s);
         }

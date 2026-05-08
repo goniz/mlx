@@ -108,7 +108,52 @@ array uniform(
   auto stream = to_stream(s);
   auto lo = astype(low, dtype, stream);
   auto hi = astype(high, dtype, stream);
-  auto range = subtract(hi, lo, stream);
+  bool scalar_bounds = lo.size() == 1 && hi.size() == 1;
+  if (lo.size() == 1 && hi.size() == 1) {
+    switch (dtype) {
+      case float32: {
+        lo = array(lo.item<float>(), float32);
+        hi = array(hi.item<float>(), float32);
+        break;
+      }
+      case float16: {
+        lo = array(lo.item<float16_t>(), float16);
+        hi = array(hi.item<float16_t>(), float16);
+        break;
+      }
+      case bfloat16: {
+        lo = array(lo.item<bfloat16_t>(), bfloat16);
+        hi = array(hi.item<bfloat16_t>(), bfloat16);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  array range = scalar_bounds ? array(0.0f, dtype) : subtract(hi, lo, stream);
+  if (scalar_bounds) {
+    switch (dtype) {
+      case float32:
+        range = array(hi.item<float>() - lo.item<float>(), float32);
+        break;
+      case float16:
+        range = array(
+            static_cast<float16_t>(
+                static_cast<float>(hi.item<float16_t>()) -
+                static_cast<float>(lo.item<float16_t>())),
+            float16);
+        break;
+      case bfloat16:
+        range = array(
+            static_cast<bfloat16_t>(
+                static_cast<float>(hi.item<bfloat16_t>()) -
+                static_cast<float>(lo.item<bfloat16_t>())),
+            bfloat16);
+        break;
+      default:
+        break;
+    }
+  }
   auto out_shape = broadcast_shapes(shape, range.shape());
   if (out_shape != shape) {
     std::ostringstream msg;
@@ -134,9 +179,11 @@ array uniform(
 
   auto upper = get_upper();
   auto maxval = array(std::numeric_limits<uint32_t>::max(), float32);
-  auto out = bits(shape, size_of(float32), key, stream);
+  auto out = astype(bits(shape, size_of(float32), key, stream), float32, stream);
   out = divide(out, maxval, stream);
   out = astype(minimum(out, upper, stream), dtype, stream);
+  range = broadcast_to(range, shape, stream);
+  lo = broadcast_to(lo, shape, stream);
   return add(multiply(range, out, stream), lo, stream);
 }
 

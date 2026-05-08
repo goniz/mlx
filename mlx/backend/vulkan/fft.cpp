@@ -51,8 +51,11 @@ bool try_plan_stockham_fft(int n, std::vector<int>& plan) {
 array make_axis_contiguous_copy(const array& x, int axis, Stream s) {
   bool has_vulkan_storage =
       x.data_shared_ptr() != nullptr && vulkan::is_vulkan_buffer(x.buffer());
+  // The Stockham shader indexes batches as dense contiguous rows:
+  //   base = batch * n
+  // So the full array must be row-contiguous, not just the FFT axis.
   bool no_copy = has_vulkan_storage && x.strides()[axis] == 1 &&
-      (x.flags().row_contiguous || x.flags().col_contiguous);
+      x.flags().row_contiguous;
   if (no_copy) {
     return x;
   }

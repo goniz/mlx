@@ -93,7 +93,15 @@ std::optional<int64_t> singleton_index_value(const array& idx) {
 }
 
 int64_t normalize_gather_index(int64_t idx, int64_t axis_size) {
-  return idx < 0 ? idx + axis_size : idx;
+  if (idx < 0) {
+    idx += axis_size;
+  }
+  if (idx < 0 || idx >= axis_size) {
+    throw std::out_of_range(
+        "gather index " + std::to_string(idx) + " out of bounds " +
+        std::to_string(axis_size));
+  }
+  return idx;
 }
 
 bool try_eval_gather_vulkan(

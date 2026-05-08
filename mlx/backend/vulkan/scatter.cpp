@@ -112,7 +112,15 @@ std::optional<int64_t> singleton_index_value(const array& idx) {
 }
 
 int64_t normalize_scatter_index(int64_t idx, int64_t axis_size) {
-  return idx < 0 ? idx + axis_size : idx;
+  if (idx < 0) {
+    idx += axis_size;
+  }
+  if (idx < 0 || idx >= axis_size) {
+    throw std::out_of_range(
+        "scatter index " + std::to_string(idx) + " out of bounds " +
+        std::to_string(axis_size));
+  }
+  return idx;
 }
 
 int64_t read_flat_index_item(const array& idx, int i, Stream s) {
@@ -928,12 +936,7 @@ bool try_eval_scatter_vulkan(
       Shape unit_strides(src.ndim(), 1);
       auto idx_value =
           normalize_scatter_index(
-              slice(
-                  flat_idx,
-                  {static_cast<ShapeElem>(i)},
-                  {static_cast<ShapeElem>(i + 1)},
-                  s)
-                  .item<int64_t>(),
+              read_flat_index_item(flat_idx, i, s),
               src.shape(axis));
       Shape start(src.ndim(), 0);
       Shape stop = slice_shape;
@@ -992,26 +995,26 @@ bool try_eval_scatter_vulkan(
       return true;
     }
     if (idx.size() == 1) {
-      array flat_idx = reshape(idx, {1}, s);
-      auto singleton_index = flat_idx.item<int64_t>();
-      Shape slice_shape(
-          upd.shape().begin() + idx.ndim(),
-          upd.shape().end());
-      Shape start(src.ndim(), 0);
-      Shape stop = slice_shape;
-      Shape strides(src.ndim(), 1);
-      auto normalized_index =
-          normalize_scatter_index(singleton_index, src.shape(axis));
-      start[axis] = normalized_index;
-      stop[axis] += normalized_index;
-      array update_value =
-          ensure_row_contiguous(reshape(upd, slice_shape, s), s);
-      array next(src.shape(), src.dtype(), nullptr, {});
-      next.set_data(allocator::malloc(next.nbytes()));
-      SliceUpdate op(s, SliceUpdate::None, start, stop, strides);
-      op.eval_gpu({src, update_value}, next);
-      out.copy_shared_buffer(next);
-      return true;
+      if (auto single_idx = singleton_index_value(idx); single_idx.has_value()) {
+        Shape slice_shape(
+            upd.shape().begin() + idx.ndim(),
+            upd.shape().end());
+        Shape start(src.ndim(), 0);
+        Shape stop = slice_shape;
+        Shape strides(src.ndim(), 1);
+        auto normalized_index =
+            normalize_scatter_index(*single_idx, src.shape(axis));
+        start[axis] = normalized_index;
+        stop[axis] += normalized_index;
+        array update_value =
+            ensure_row_contiguous(reshape(upd, slice_shape, s), s);
+        array next(src.shape(), src.dtype(), nullptr, {});
+        next.set_data(allocator::malloc(next.nbytes()));
+        SliceUpdate op(s, SliceUpdate::None, start, stop, strides);
+        op.eval_gpu({src, update_value}, next);
+        out.copy_shared_buffer(next);
+        return true;
+      }
     }
   }
   const uint32_t slice_size = take_slice_size;
@@ -1026,6 +1029,15 @@ bool try_eval_scatter_vulkan(
     trace_vulkan_unsupported(
         "Scatter", "float32 scatter-sum requires shader atomic float support");
     return false;
+  }
+  if (reduce_type == Scatter::Sum &&
+      (out.dtype() == float16 || out.dtype() == bfloat16)) {
+    if ((out.offset() % 4) != 0 || (out.size() % 2) != 0) {
+      trace_vulkan_unsupported(
+          "Scatter",
+          "float16/bfloat16 scatter-sum requires 4-byte-aligned offset and even element count");
+      return false;
+    }
   }
   const auto shader_id = reduce_type == Scatter::Sum
       ? scatter_sum_shader_id(out.dtype(), idx.dtype())

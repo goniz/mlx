@@ -24,7 +24,6 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   size_t elems_per_key = out.size() / num_keys;
   size_t bytes_per_key = out.itemsize() * elems_per_key;
-  out.set_data(allocator::malloc(out.nbytes()));
 
   if (keys.dtype() != uint32) {
     throw std::runtime_error(
@@ -75,7 +74,8 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   keys.wait();
 
   auto* kptr = keys.data<uint32_t>();
-  auto* cptr = out.data<char>();
+  auto host_out = std::make_shared<std::vector<char>>(out.nbytes());
+  auto* cptr = host_out->data();
   auto copy_word = [&](char* dst, size_t word_idx, uint32_t v) {
     const size_t byte_offset = 4 * word_idx;
     if (byte_offset + 4 <= bytes_per_key) {
@@ -113,6 +113,15 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
       copy_word(cptr, half_size, random::threefry2x32_hash(key, count).first);
     }
   }
+  copy_gpu(
+      array(
+          static_cast<void*>(host_out->data()),
+          out.shape(),
+          out.dtype(),
+          [host_out](void*) {}),
+      out,
+      CopyType::GeneralGeneral,
+      stream());
 }
 
 } // namespace mlx::core

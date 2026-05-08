@@ -1589,6 +1589,19 @@ void copy_gpu_inplace(
 
   const bool same_buffer = source_is_vulkan && out_is_vulkan &&
       source->buffer().ptr() == out.buffer().ptr();
+  // For same-buffer slice copies where source and destination regions may
+  // overlap, use a staging buffer to avoid intra-dispatch read-after-write
+  // hazards. A post-dispatch barrier only orders later commands, not parallel
+  // workgroups inside the same dispatch.
+  if (is_slice_copy && same_buffer &&
+      !(in_view.offset() + in_view.nbytes() <= out_view.offset() ||
+        out_view.offset() + out_view.nbytes() <= in_view.offset())) {
+    array staged(out_view.shape(), out_view.dtype(), nullptr, {});
+    staged.set_data(mlx::core::allocator::malloc(staged.nbytes()));
+    copy_gpu_inplace(in_view, staged, CopyType::GeneralGeneral, s);
+    copy_gpu_inplace(staged, out_view, CopyType::GeneralGeneral, s);
+    return;
+  }
   if (segmented_buffer_copy && same_buffer) {
     array staged(out_view.shape(), out_view.dtype(), nullptr, {});
     staged.set_data(mlx::core::allocator::malloc(staged.nbytes()));
@@ -1685,7 +1698,7 @@ void copy_gpu_inplace(
             s,
             std::nullopt,
             std::nullopt,
-            is_slice_copy && same_buffer);
+            false);
         if (!copied) {
           throw std::runtime_error(
               "Large-offset shader copy does not support tensors with rank greater than 4.");

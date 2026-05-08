@@ -6,32 +6,6 @@
 
 namespace mlx::core::gpu {
 
-namespace {
-
-void update_scalar_broadcast_metadata(
-    const std::vector<array>& inputs,
-    std::vector<array>& outputs,
-    Primitive& primitive) {
-  if (inputs.empty() || outputs.empty() || inputs[0].data_size() != 1) {
-    return;
-  }
-  if (typeid(primitive) != typeid(Broadcast) &&
-      typeid(primitive) != typeid(BroadcastAxes)) {
-    return;
-  }
-  for (auto& out : outputs) {
-    if (out.size() == 0) {
-      continue;
-    }
-    auto flags = out.flags();
-    flags.contiguous = true;
-    out.copy_shared_buffer(
-        inputs[0], out.strides(), flags, inputs[0].data_size());
-  }
-}
-
-} // namespace
-
 void eval(array& arr) {
   auto outputs = arr.outputs();
   auto s = arr.primitive().stream();
@@ -47,7 +21,6 @@ void eval(array& arr) {
       inputs = arr.inputs();
     }
     arr.primitive().eval_gpu(arr.inputs(), outputs);
-    update_scalar_broadcast_metadata(arr.inputs(), outputs, arr.primitive());
   }
 
   vulkan::end_primitive_tracking(s, arr.inputs(), outputs);

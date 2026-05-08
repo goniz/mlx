@@ -1439,11 +1439,6 @@ bool try_eval_bitwise_binary_vulkan(
   return true;
 }
 
-bool is_supported_select_layout(const array& arr) {
-  return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
-      arr.strides().back() == 1;
-}
-
 array collapse_select_leading_dims(const array& arr, Stream s) {
   if (arr.ndim() <= 4) {
     return arr;
@@ -1573,8 +1568,8 @@ bool try_eval_select_vulkan(
     return false;
   }
 
-  auto materialize = [&](array arr) {
-    if (!is_supported_select_layout(arr)) {
+  auto materialize_elementwise = [&](array arr) {
+    if (!is_supported_elementwise_layout(arr)) {
       array staged(arr.shape(), arr.dtype(), nullptr, {});
       staged.set_data(allocator::malloc(staged.nbytes()));
       copy_gpu(arr, staged, CopyType::General, s);
@@ -1583,11 +1578,21 @@ bool try_eval_select_vulkan(
     return arr;
   };
 
-  condition = materialize(condition);
-  x = materialize(x);
-  y = materialize(y);
+  auto materialize_cond = [&](array arr) {
+    if (arr.ndim() > 4) {
+      array staged(arr.shape(), arr.dtype(), nullptr, {});
+      staged.set_data(allocator::malloc(staged.nbytes()));
+      copy_gpu(arr, staged, CopyType::General, s);
+      arr = staged;
+    }
+    return arr;
+  };
 
-  const bool staged_output = !is_supported_select_layout(out);
+  condition = materialize_cond(condition);
+  x = materialize_elementwise(x);
+  y = materialize_elementwise(y);
+
+  const bool staged_output = !is_supported_elementwise_layout(out);
   array out_storage =
       staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
   out_storage.set_data(allocator::malloc(out_storage.nbytes()));

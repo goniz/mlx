@@ -681,9 +681,11 @@ void VulkanContext::init() {
     vk::PhysicalDeviceShaderIntegerDotProductFeatures
         supported_shader_integer_dot_product{};
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT supported_shader_atomic_float{};
-    supported_shader_atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
     supported_scalar_block_layout.pNext = &supported_shader_integer_dot_product;
-    supported_shader_integer_dot_product.pNext = &supported_shader_atomic_float;
+    if (has_shader_atomic_float_ext) {
+      supported_shader_atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+      supported_shader_integer_dot_product.pNext = &supported_shader_atomic_float;
+    }
 
     vk::PhysicalDeviceSubgroupSizeControlFeatures
         supported_subgroup_size_control{};
@@ -693,8 +695,10 @@ void VulkanContext::init() {
         supported_cooperative_matrix{};
     vk::PhysicalDeviceShaderBfloat16FeaturesKHR supported_shader_bfloat16{};
 
-    void** supported_feature_tail =
-        reinterpret_cast<void**>(&supported_shader_atomic_float.pNext);
+    void** supported_feature_tail = has_shader_atomic_float_ext
+        ? reinterpret_cast<void**>(&supported_shader_atomic_float.pNext)
+        : reinterpret_cast<void**>(
+              &supported_shader_integer_dot_product.pNext);
     if (has_subgroup_size_control_ext) {
       append_pnext(supported_feature_tail, supported_subgroup_size_control);
     }

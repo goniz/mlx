@@ -1658,7 +1658,10 @@ class VulkanDevice {
       }
 
       const uint64_t begin = static_cast<uint64_t>(offset_bytes);
-      const uint64_t size_bytes = static_cast<uint64_t>(arr.size()) * item_size;
+      // Use data_size() (storage span) instead of size() (logical elements)
+      // so that non-contiguous views correctly report their full byte range.
+      const uint64_t size_bytes =
+          static_cast<uint64_t>(arr.data_size()) * item_size;
       const uint64_t buffer_size = static_cast<uint64_t>(storage->size);
       const uint64_t end = std::min(begin + size_bytes, buffer_size);
       if (begin >= end) {

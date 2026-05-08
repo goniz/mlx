@@ -20,7 +20,9 @@ bool try_eval_scan_vulkan(
     bool inclusive,
     Stream s) {
   if (inputs.size() != 1 ||
-      (reduce_type != Scan::Sum && reduce_type != Scan::Prod)) {
+      (reduce_type != Scan::Sum && reduce_type != Scan::Prod &&
+       reduce_type != Scan::Min && reduce_type != Scan::Max &&
+       reduce_type != Scan::LogAddExp)) {
     return false;
   }
 
@@ -72,6 +74,12 @@ bool try_eval_scan_vulkan(
     return false;
   }
 
+  if ((reduce_type == Scan::Prod || reduce_type == Scan::Min ||
+       reduce_type == Scan::Max || reduce_type == Scan::LogAddExp) &&
+      scan_input.shape(scan_input.ndim() - 1) > 128) {
+    return false;
+  }
+
   array inclusive_out(scan_input.shape(), scan_input.dtype(), nullptr, {});
   inclusive_out.set_data(allocator::malloc(inclusive_out.nbytes()));
   if (inclusive_out.size() == 0) {
@@ -82,25 +90,60 @@ bool try_eval_scan_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
 
-    if (reduce_type == Scan::Sum) {
-      vulkan::dispatch_cumsum_op(
-          scan_input,
-          inclusive_out,
-          cumsum_i32 ? vulkan::StaticShaderId::cumsum_i32
-                     : vulkan::StaticShaderId::cumsum_f32,
-          command_buffer,
-          s,
-          reverse,
-          inclusive);
-    } else {
-      vulkan::dispatch_cumprod_op(
-          scan_input,
-          inclusive_out,
-          vulkan::StaticShaderId::cumprod_f32,
-          command_buffer,
-          s,
-          reverse,
-          inclusive);
+    switch (reduce_type) {
+      case Scan::Sum:
+        vulkan::dispatch_cumsum_op(
+            scan_input,
+            inclusive_out,
+            cumsum_i32 ? vulkan::StaticShaderId::cumsum_i32
+                       : vulkan::StaticShaderId::cumsum_f32,
+            command_buffer,
+            s,
+            reverse,
+            inclusive);
+        break;
+      case Scan::Prod:
+        vulkan::dispatch_scan_op(
+            scan_input,
+            inclusive_out,
+            vulkan::StaticShaderId::cumprod_f32,
+            command_buffer,
+            s,
+            reverse,
+            inclusive);
+        break;
+      case Scan::Min:
+        vulkan::dispatch_scan_op(
+            scan_input,
+            inclusive_out,
+            vulkan::StaticShaderId::cummin_f32,
+            command_buffer,
+            s,
+            reverse,
+            inclusive);
+        break;
+      case Scan::Max:
+        vulkan::dispatch_scan_op(
+            scan_input,
+            inclusive_out,
+            vulkan::StaticShaderId::cummax_f32,
+            command_buffer,
+            s,
+            reverse,
+            inclusive);
+        break;
+      case Scan::LogAddExp:
+        vulkan::dispatch_scan_op(
+            scan_input,
+            inclusive_out,
+            vulkan::StaticShaderId::cumlogaddexp_f32,
+            command_buffer,
+            s,
+            reverse,
+            inclusive);
+        break;
+      default:
+        throw std::runtime_error("Unsupported Vulkan scan reduce type.");
     }
 
     array scan_result = inclusive_out;

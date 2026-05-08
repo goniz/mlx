@@ -850,7 +850,7 @@ void dispatch_cumsum_op(
     bool reverse = false,
     bool inclusive = true);
 
-void dispatch_cumprod_op(
+void dispatch_scan_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,

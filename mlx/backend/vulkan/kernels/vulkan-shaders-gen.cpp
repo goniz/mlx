@@ -2817,8 +2817,12 @@ void process_shaders() {
           {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
   string_to_spv(
       "cumsum_f32",
-      "cumsum.comp",
-      merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_SUM", "1"}}));
   string_to_spv(
       "cumsum_i32",
       "cumsum.comp",
@@ -2831,8 +2835,36 @@ void process_shaders() {
            {"FLOAT_TYPE_VEC4", "ivec4"}}));
   string_to_spv(
       "cumprod_f32",
-      "cumprod.comp",
-      merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_PROD", "1"}}));
+  string_to_spv(
+      "cummax_f32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_MAX", "1"}}));
+  string_to_spv(
+      "cummin_f32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_MIN", "1"}}));
+  string_to_spv(
+      "cumlogaddexp_f32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_LOGADDEXP", "1"}}));
   string_to_spv(
       "cumsum_multipass1_f32",
       "cumsum_multipass1.comp",

@@ -3133,7 +3133,7 @@ void dispatch_cumsum_op(
   mark_scratch_array_written(s, kCumsumMultipassScratchLane);
 }
 
-void dispatch_cumprod_op(
+void dispatch_scan_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
@@ -3147,27 +3147,27 @@ void dispatch_cumprod_op(
 
   if (in.ndim() == 0) {
     throw std::runtime_error(
-        "[vulkan::kernels] Cumprod requires input rank >= 1.");
+        "[vulkan::kernels] Scan requires input rank >= 1.");
   }
 
   const uint32_t row_width =
-      checked_u32(in.shape(in.ndim() - 1), "cumprod n_cols");
+      checked_u32(in.shape(in.ndim() - 1), "scan n_cols");
   if (row_width == 0) {
     throw std::runtime_error(
-        "[vulkan::kernels] Cumprod requires non-zero row width.");
+        "[vulkan::kernels] Scan requires non-zero row width.");
   }
 
-  const uint32_t total_elements = checked_u32(out.size(), "cumprod elements");
+  const uint32_t total_elements = checked_u32(out.size(), "scan elements");
   if (total_elements % row_width != 0) {
     throw std::runtime_error(
-        "[vulkan::kernels] Cumprod elements are not divisible by row width.");
+        "[vulkan::kernels] Scan elements are not divisible by row width.");
   }
   const uint32_t row_count = total_elements / row_width;
   const uint32_t block_size = 128u;
   const uint32_t num_workgroups_x = (row_width + block_size - 1) / block_size;
   if (num_workgroups_x > 1) {
     throw std::runtime_error(
-        "[vulkan::kernels] Cumprod multipass is not implemented.");
+        "[vulkan::kernels] Scan multipass is not implemented for this shader.");
   }
 
   const auto push_constants = make_sum_rows_push_constants(in, out, 1.0f);

@@ -1,0 +1,158 @@
+#version 450
+
+#include "types.glsl"
+#include "sum_rows.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 128;
+layout (constant_id = 1) const uint SUBGROUP_SIZE = 32;
+layout (constant_id = 2) const uint ELEM_PER_THREAD = 4;
+layout (constant_id = 3) const bool REVERSE = false;
+layout (constant_id = 4) const bool INCLUSIVE = true;
+
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+
+shared FLOAT_TYPE partial[BLOCK_SIZE / SUBGROUP_SIZE];
+shared FLOAT_TYPE last_value;
+
+FLOAT_TYPE scan_init() {
+#if defined(SCAN_OP_SUM)
+    return FLOAT_TYPE(0);
+#elif defined(SCAN_OP_PROD)
+    return FLOAT_TYPE(1);
+#elif defined(SCAN_OP_MAX)
+    return FLOAT_TYPE(-1.0 / 0.0);
+#elif defined(SCAN_OP_MIN)
+    return FLOAT_TYPE(1.0 / 0.0);
+#elif defined(SCAN_OP_LOGADDEXP)
+    return FLOAT_TYPE(-1.0 / 0.0);
+#else
+#error unsupported scan op
+#endif
+}
+
+FLOAT_TYPE scan_combine(FLOAT_TYPE a, FLOAT_TYPE b) {
+#if defined(SCAN_OP_SUM)
+    return a + b;
+#elif defined(SCAN_OP_PROD)
+    return a * b;
+#elif defined(SCAN_OP_MAX)
+    return max(a, b);
+#elif defined(SCAN_OP_MIN)
+    return min(a, b);
+#elif defined(SCAN_OP_LOGADDEXP)
+    FLOAT_TYPE maxval = max(a, b);
+    FLOAT_TYPE minval = min(a, b);
+    if (isinf(maxval) || isinf(minval)) {
+        return maxval;
+    }
+    return maxval + log(1.0 + exp(minval - maxval));
+#else
+#error unsupported scan op
+#endif
+}
+
+FLOAT_TYPE subgroup_exclusive_scan(FLOAT_TYPE value) {
+#if defined(SCAN_OP_SUM)
+    return subgroupExclusiveAdd(value);
+#elif defined(SCAN_OP_PROD)
+    return subgroupExclusiveMul(value);
+#elif defined(SCAN_OP_MAX)
+    return subgroupExclusiveMax(value);
+#elif defined(SCAN_OP_MIN)
+    return subgroupExclusiveMin(value);
+#elif defined(SCAN_OP_LOGADDEXP)
+    FLOAT_TYPE result = scan_init();
+    for (uint offset = 1; offset < SUBGROUP_SIZE; offset <<= 1) {
+        FLOAT_TYPE other = subgroupShuffleUp(value, offset);
+        if (gl_SubgroupInvocationID >= offset) {
+            value = scan_combine(other, value);
+        }
+    }
+    if (gl_SubgroupInvocationID > 0) {
+        result = subgroupShuffleUp(value, 1);
+    }
+    return result;
+#else
+#error unsupported scan op
+#endif
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint i03 = fastdiv(row, p.ne0_12mp, p.ne0_12L);
+    const uint i03_offset = i03 * p.ne01*p.ne02;
+    const uint i02 = fastdiv(row - i03_offset, p.ne0_1mp, p.ne0_1L);
+    const uint i01 = row - i03_offset - i02*p.ne01;
+
+    const uint src_idx = get_aoffset() + i01 * p.nb01 + i02 * p.nb02 + i03 * p.nb03;
+    const uint dst_idx = get_doffset() + i01 * p.nb11 + i02 * p.nb12 + i03 * p.nb13;
+
+    uint subgroup_id = tid / SUBGROUP_SIZE;
+
+    if (tid == 0) {
+        last_value = scan_init();
+    }
+
+    uint col = tid * ELEM_PER_THREAD;
+    uint num_iter = CEIL_DIV(p.n_cols, BLOCK_SIZE * ELEM_PER_THREAD);
+    for (int i = 0; i < num_iter; ++i) {
+        FLOAT_TYPE v[ELEM_PER_THREAD];
+        FLOAT_TYPE exclusive_v[ELEM_PER_THREAD];
+        FLOAT_TYPE thread_value = scan_init();
+        [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
+            exclusive_v[j] = thread_value;
+            const uint logical_col = col + j;
+            if (logical_col < p.n_cols) {
+                const uint read_col = REVERSE ? (p.n_cols - 1 - logical_col) : logical_col;
+                thread_value = scan_combine(thread_value, FLOAT_TYPE(data_a[src_idx + read_col]));
+            }
+            v[j] = thread_value;
+        }
+
+        thread_value = subgroup_exclusive_scan(thread_value);
+        [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
+            exclusive_v[j] = scan_combine(thread_value, exclusive_v[j]);
+            v[j] = scan_combine(thread_value, v[j]);
+        }
+
+        if (gl_SubgroupInvocationID == SUBGROUP_SIZE - 1) {
+            partial[subgroup_id] = v[ELEM_PER_THREAD - 1];
+        }
+        barrier();
+
+        for (int s = 0; s < subgroup_id; ++s) {
+            [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
+                exclusive_v[j] = scan_combine(partial[s], exclusive_v[j]);
+                v[j] = scan_combine(partial[s], v[j]);
+            }
+        }
+        [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
+            exclusive_v[j] = scan_combine(last_value, exclusive_v[j]);
+            v[j] = scan_combine(last_value, v[j]);
+        }
+        barrier();
+        if (tid == BLOCK_SIZE - 1) {
+            last_value = v[ELEM_PER_THREAD - 1];
+        }
+        [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
+            const uint logical_col = col + j;
+            if (logical_col < p.n_cols) {
+                const uint write_col = REVERSE ? (p.n_cols - 1 - logical_col) : logical_col;
+                data_d[dst_idx + write_col] = D_TYPE(INCLUSIVE ? v[j] : exclusive_v[j]);
+            }
+        }
+        col += BLOCK_SIZE * ELEM_PER_THREAD;
+    }
+}

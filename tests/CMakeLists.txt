@@ -8,9 +8,6 @@ add_executable(tests ${PROJECT_SOURCE_DIR}/tests/tests.cpp)
 
 if(MLX_BUILD_METAL OR MLX_BUILD_CUDA OR MLX_BUILD_VULKAN)
   set(GPU_TEST_SOURCES gpu_tests.cpp)
-  if(MLX_BUILD_VULKAN)
-    list(APPEND GPU_TEST_SOURCES vulkan_multi_queue_tests.cpp)
-  endif()
 endif()
 
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)

@@ -108,51 +108,47 @@ array uniform(
   auto stream = to_stream(s);
   auto lo = astype(low, dtype, stream);
   auto hi = astype(high, dtype, stream);
+  array range({0}, float32);
   bool scalar_bounds = lo.size() == 1 && hi.size() == 1;
-  if (lo.size() == 1 && hi.size() == 1) {
+  if (scalar_bounds) {
     switch (dtype) {
       case float32: {
-        lo = array(lo.item<float>(), float32);
-        hi = array(hi.item<float>(), float32);
+        auto lo_val = lo.item<float>();
+        auto hi_val = hi.item<float>();
+        lo = array(lo_val, float32);
+        hi = array(hi_val, float32);
+        range = array(hi_val - lo_val, float32);
         break;
       }
       case float16: {
-        lo = array(lo.item<float16_t>(), float16);
-        hi = array(hi.item<float16_t>(), float16);
+        auto lo_val = lo.item<float16_t>();
+        auto hi_val = hi.item<float16_t>();
+        lo = array(lo_val, float16);
+        hi = array(hi_val, float16);
+        range = array(
+            static_cast<float16_t>(
+                static_cast<float>(hi_val) -
+                static_cast<float>(lo_val)),
+            float16);
         break;
       }
       case bfloat16: {
-        lo = array(lo.item<bfloat16_t>(), bfloat16);
-        hi = array(hi.item<bfloat16_t>(), bfloat16);
+        auto lo_val = lo.item<bfloat16_t>();
+        auto hi_val = hi.item<bfloat16_t>();
+        lo = array(lo_val, bfloat16);
+        hi = array(hi_val, bfloat16);
+        range = array(
+            static_cast<bfloat16_t>(
+                static_cast<float>(hi_val) -
+                static_cast<float>(lo_val)),
+            bfloat16);
         break;
       }
       default:
-        break;
+        throw std::runtime_error("[uniform] Unsupported type.");
     }
-  }
-  array range = scalar_bounds ? array(0.0f, dtype) : subtract(hi, lo, stream);
-  if (scalar_bounds) {
-    switch (dtype) {
-      case float32:
-        range = array(hi.item<float>() - lo.item<float>(), float32);
-        break;
-      case float16:
-        range = array(
-            static_cast<float16_t>(
-                static_cast<float>(hi.item<float16_t>()) -
-                static_cast<float>(lo.item<float16_t>())),
-            float16);
-        break;
-      case bfloat16:
-        range = array(
-            static_cast<bfloat16_t>(
-                static_cast<float>(hi.item<bfloat16_t>()) -
-                static_cast<float>(lo.item<bfloat16_t>())),
-            bfloat16);
-        break;
-      default:
-        break;
-    }
+  } else {
+    range = subtract(hi, lo, stream);
   }
   auto out_shape = broadcast_shapes(shape, range.shape());
   if (out_shape != shape) {

@@ -149,6 +149,23 @@ std::string build_integer_sign_shader(Dtype dtype) {
   return os.str();
 }
 
+std::string build_integer_abs_shader(Dtype dtype) {
+  const auto type = unary_glsl_storage_type(dtype);
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(dtype, dtype, dtype == int64);
+  os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer Input {" << type << " data[];} in_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer Output {" << type << " data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  " << type << " x = in_buf.data[idx + pc.in_offset];\n";
+  os << "  out_buf.data[idx + pc.out_offset] = x < " << unary_zero_literal(dtype)
+     << " ? -x : x;\n";
+  os << "}\n";
+  return os.str();
+}
+
 std::string build_complex_abs_shader() {
   std::ostringstream os;
   os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
@@ -746,6 +763,83 @@ bool try_eval_integer_sign_vulkan(
   return true;
 }
 
+bool try_eval_integer_abs_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 1 || inputs[0].dtype() != out.dtype() ||
+      !is_vulkan_signed_integer_dtype(inputs[0].dtype())) {
+    return false;
+  }
+
+  array in = inputs[0];
+  if (!is_supported_elementwise_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
+  }
+  const bool staged_output = !is_supported_elementwise_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  if (!is_supported_elementwise_layout(in) ||
+      !is_supported_elementwise_layout(out_work)) {
+    return false;
+  }
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::General, s);
+    }
+    return true;
+  }
+
+  const auto in_offset =
+      static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto total = static_cast<uint64_t>(out_work.data_size());
+  if (in_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  struct PushConstants {
+    uint32_t in_offset;
+    uint32_t out_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(in_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+
+  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out_work, 1}};
+  constexpr uint32_t kPushConstantSize = sizeof(PushConstants);
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_abs_" + dtype_suffix(in.dtype()),
+      build_integer_abs_shader(in.dtype()),
+      2,
+      arrays,
+      kPushConstantSize,
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  vkCmdDispatch(
+      dispatch.command_buffer,
+      (static_cast<uint32_t>(total) + 255u) / 256u,
+      1,
+      1);
+  vulkan::end_command_recording(s.index);
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::General, s);
+  }
+  return true;
+}
+
 template <typename Primitive>
 bool try_eval_unary_op_vulkan(
     const std::vector<array>& inputs,
@@ -978,6 +1072,9 @@ void eval_generic_unary_suffix_vulkan(
 // Generic unary ops
 void Abs::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_abs_vulkan(inputs, out, stream())) {
+    return;
+  }
+  if (try_eval_integer_abs_vulkan(inputs, out, stream())) {
     return;
   }
   if (inputs.size() == 1 && inputs[0].dtype() == out.dtype() &&

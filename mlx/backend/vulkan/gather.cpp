@@ -326,7 +326,89 @@ bool try_eval_gather_vulkan(
     const auto shader_id =
         gather_pair_shader_id(src_input.dtype(), idx0.dtype());
     if (!shader_id.has_value()) {
-      return false;
+      const int idx_ndim = idx0.ndim();
+      if (out.ndim() != idx_ndim + src_input.ndim()) {
+        return false;
+      }
+      Shape out_slice_shape(out.shape().begin() + idx_ndim, out.shape().end());
+      if (out_slice_shape != slice_sizes) {
+        return false;
+      }
+
+      idx0 = ensure_host_readable_row_contiguous(
+          reshape(idx0, {static_cast<ShapeElem>(idx0.size())}, s), s);
+      idx1 = ensure_host_readable_row_contiguous(
+          reshape(idx1, {static_cast<ShapeElem>(idx1.size())}, s), s);
+      const auto index_count =
+          checked_u32_size(idx0.size(), "gather_pair fallback index_count");
+
+      auto [out_work, staged_output] = make_output_work(out);
+      if (out_work.size() == 0) {
+        if (staged_output) {
+          copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+        }
+        return true;
+      }
+
+      Strides out_slice_strides(
+          out_work.strides().begin() + idx_ndim, out_work.strides().end());
+      size_t out_slice_elems = 1;
+      for (auto dim : out_slice_shape) {
+        out_slice_elems *= static_cast<size_t>(dim);
+      }
+      auto [out_slice_data_size, out_slice_row_contig, out_slice_col_contig] =
+          check_contiguity(out_slice_shape, out_slice_strides);
+      array::Flags out_slice_flags = {
+          out_slice_data_size == out_slice_elems,
+          out_slice_row_contig,
+          out_slice_col_contig};
+
+      Strides index_shape_strides(idx_ndim, 1);
+      for (int i = idx_ndim - 2; i >= 0; --i) {
+        index_shape_strides[i] =
+            index_shape_strides[i + 1] * inputs[1].shape(i + 1);
+      }
+
+      for (uint32_t i = 0; i < index_count; ++i) {
+        Shape start(src_input.ndim(), 0);
+        Shape stop = slice_sizes;
+        Shape unit_strides(src_input.ndim(), 1);
+        start[axis0] = normalize_gather_index(
+            read_contiguous_index(idx0, i), src_input.shape(axis0));
+        start[axis1] = normalize_gather_index(
+            read_contiguous_index(idx1, i), src_input.shape(axis1));
+        stop[axis0] += start[axis0];
+        stop[axis1] += start[axis1];
+        if (stop[axis0] > src_input.shape(axis0) ||
+            stop[axis1] > src_input.shape(axis1)) {
+          return false;
+        }
+
+        array gathered = slice(src_input, start, stop, unit_strides, s);
+
+        int64_t out_offset = 0;
+        size_t remainder = i;
+        for (int d = 0; d < idx_ndim; ++d) {
+          const size_t coord = remainder / index_shape_strides[d];
+          remainder %= index_shape_strides[d];
+          out_offset += coord * out_work.strides(d);
+        }
+
+        array out_slice(out_slice_shape, out.dtype(), nullptr, {});
+        out_slice.copy_shared_buffer(
+            out_work,
+            out_slice_strides,
+            out_slice_flags,
+            out_slice_data_size,
+            out_offset);
+        out_slice.set_status(array::Status::available);
+        copy_gpu_inplace(gathered, out_slice, CopyType::GeneralGeneral, s);
+      }
+
+      if (staged_output) {
+        copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      }
+      return true;
     }
 
     array src = ensure_row_contiguous(src_input, s);

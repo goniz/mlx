@@ -5,7 +5,9 @@
 #include <utility>
 
 #include "mlx/backend/common/slicing.h"
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
@@ -23,6 +25,18 @@ array ensure_row_contiguous(array arr, Stream s) {
     arr = contiguous_copy_gpu(arr, s);
   }
   return arr;
+}
+
+bool ensure_vulkan_storage(array& arr, Stream s) {
+  if (vulkan::is_vulkan_storage_array(arr)) {
+    return true;
+  }
+  array storage(arr.shape(), arr.dtype(), nullptr, {});
+  storage.set_data(allocator::malloc(storage.nbytes()));
+  storage.set_status(array::Status::available);
+  copy_gpu(arr, storage, CopyType::General, s);
+  arr = std::move(storage);
+  return vulkan::is_vulkan_storage_array(arr);
 }
 
 array ensure_host_readable_row_contiguous(array arr, Stream s) {
@@ -160,6 +174,253 @@ int64_t read_contiguous_index(const array& idx, int i) {
     }
     default:
       throw std::runtime_error("Unsupported index dtype for Vulkan scatter.");
+  }
+}
+
+constexpr uint32_t kMaxScatterPushConstants = 128;
+
+bool supports_dynamic_scatter_sum_dtype(Dtype dtype) {
+  return dtype == float32 || dtype == int32 || dtype == uint32;
+}
+
+std::string build_generic_scatter_shader(
+    Dtype value_dtype,
+    Dtype index_dtype,
+    int ndim,
+    int nidx,
+    Scatter::ReduceType reduce_type) {
+  std::ostringstream os;
+
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  os << "#extension GL_EXT_scalar_block_layout : require\n";
+
+  bool needs_int64 =
+      index_dtype == int64 || index_dtype == uint64 || value_dtype == int64 ||
+      value_dtype == uint64;
+  if (needs_int64) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
+  }
+  if (vulkan::uses_float16_extension(value_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+  }
+  if (vulkan::uses_16bit_storage(value_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+    os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  }
+  if (vulkan::uses_8bit_storage(value_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
+    os << "#extension GL_EXT_shader_8bit_storage : require\n";
+  }
+  if (reduce_type == Scatter::Sum && value_dtype == float32) {
+    os << "#extension GL_EXT_shader_atomic_float : require\n";
+  }
+
+  os << "\n#define SRC_NDIM " << ndim << "\n";
+  os << "#define NIDX " << nidx << "\n";
+
+  if (index_dtype == int64) {
+    os << "#define INDEX_IS_I64\n";
+    os << "#define INDEX_TYPE int64_t\n";
+  } else if (index_dtype == uint64) {
+    os << "#define INDEX_IS_I64\n";
+    os << "#define INDEX_IS_UNSIGNED\n";
+    os << "#define INDEX_TYPE uint64_t\n";
+  } else if (index_dtype == uint32) {
+    os << "#define INDEX_IS_UNSIGNED\n";
+    os << "#define INDEX_TYPE uint\n";
+  } else {
+    os << "#define INDEX_TYPE int\n";
+  }
+
+  os << "#define VALUE_TYPE "
+     << vulkan::dtype_to_glsl_storage_type(value_dtype) << "\n";
+
+  os << "\nlayout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;\n\n";
+
+  os << "layout(push_constant) uniform Params {\n";
+  os << "    uint ne;\n";
+  os << "    uint slice_size;\n";
+  os << "    uint src_shape[SRC_NDIM];\n";
+  os << "    uint src_strides[SRC_NDIM];\n";
+  os << "    uint slice_sizes[SRC_NDIM];\n";
+  os << "    uint axes[NIDX];\n";
+  os << "} p;\n\n";
+
+  os << "layout(scalar, binding = 0) readonly buffer Updates { VALUE_TYPE upd_data[]; };\n";
+  for (int j = 0; j < nidx; ++j) {
+    os << "layout(scalar, binding = " << (1 + j)
+       << ") readonly buffer Idx" << j
+       << " { INDEX_TYPE idx" << j << "_data[]; };\n";
+  }
+  os << "layout(scalar, binding = " << (1 + nidx)
+     << ") buffer Out { VALUE_TYPE out_data[]; };\n\n";
+
+  os << "uint normalize_index(INDEX_TYPE idx, uint axis_size) {\n";
+  os << "#if defined(INDEX_IS_UNSIGNED)\n";
+  os << "    return uint(idx);\n";
+  os << "#elif defined(INDEX_IS_I64)\n";
+  os << "    return uint(idx < int64_t(0) ? idx + int64_t(axis_size) : idx);\n";
+  os << "#else\n";
+  os << "    return uint(idx < 0 ? idx + int(axis_size) : idx);\n";
+  os << "#endif\n";
+  os << "}\n\n";
+
+  os << "void main() {\n";
+  os << "    uint linear_idx = gl_GlobalInvocationID.x;\n";
+  os << "    if (linear_idx >= p.ne) return;\n\n";
+  os << "    uint slice_elem = linear_idx % p.slice_size;\n";
+  os << "    uint idx_elem = linear_idx / p.slice_size;\n\n";
+  os << "    uint dst_offset = 0;\n";
+  os << "    uint rem = slice_elem;\n";
+  os << "    for (int d = SRC_NDIM - 1; d >= 0; --d) {\n";
+  os << "        uint sz = max(p.slice_sizes[d], 1u);\n";
+  os << "        dst_offset += (rem % sz) * p.src_strides[d];\n";
+  os << "        rem /= sz;\n";
+  os << "    }\n\n";
+
+  for (int j = 0; j < nidx; ++j) {
+    os << "    dst_offset += normalize_index(idx" << j
+       << "_data[idx_elem], p.src_shape[p.axes[" << j << "]])"
+       << " * p.src_strides[p.axes[" << j << "]];\n";
+  }
+
+  if (reduce_type == Scatter::Sum) {
+    os << "\n    atomicAdd(out_data[dst_offset], upd_data[linear_idx]);\n";
+  } else {
+    os << "\n    out_data[dst_offset] = upd_data[linear_idx];\n";
+  }
+  os << "}\n";
+
+  return os.str();
+}
+
+bool try_dispatch_generic_scatter(
+    const std::vector<array>& inputs,
+    const std::vector<int>& norm_axes,
+    const Shape& update_shape,
+    uint32_t index_count,
+    array& out,
+    Stream s,
+    Scatter::ReduceType reduce_type) {
+  if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
+    return false;
+  }
+
+  const auto& src_input = inputs[0];
+  const int ndim = static_cast<int>(src_input.ndim());
+  const int nidx = static_cast<int>(norm_axes.size());
+  const Dtype value_dtype = src_input.dtype();
+  const Dtype index_dtype = inputs[1].dtype();
+
+  if (reduce_type == Scatter::Sum && !supports_dynamic_scatter_sum_dtype(value_dtype)) {
+    return false;
+  }
+
+  std::vector<array> flat_indices;
+  flat_indices.reserve(nidx);
+  for (int i = 0; i < nidx; ++i) {
+    auto flat_idx = ensure_row_contiguous(
+        reshape(inputs[1 + i], {static_cast<ShapeElem>(index_count)}, s), s);
+    if (!ensure_vulkan_storage(flat_idx, s)) {
+      return false;
+    }
+    flat_indices.push_back(flat_idx);
+  }
+
+  array upd = ensure_row_contiguous(inputs.back(), s);
+  if (!ensure_vulkan_storage(upd, s)) {
+    return false;
+  }
+  auto [out_work, staged_output] = make_output_work(out);
+  copy_gpu(src_input, out_work, source_copy_type(src_input), s);
+  if (!ensure_vulkan_storage(out_work, s)) {
+    return false;
+  }
+
+  if (upd.size() == 0 || out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
+  std::vector<uint32_t> src_shape(ndim);
+  std::vector<uint32_t> src_strides(ndim);
+  for (int d = 0; d < ndim; ++d) {
+    src_shape[d] = static_cast<uint32_t>(src_input.shape(d));
+  }
+  for (int d = ndim - 1; d >= 0; --d) {
+    src_strides[d] =
+        (d == ndim - 1) ? 1u : src_strides[d + 1] * src_shape[d + 1];
+  }
+
+  std::vector<uint32_t> slice_sizes(ndim);
+  uint32_t slice_size = 1;
+  for (int d = 0; d < ndim; ++d) {
+    slice_sizes[d] = static_cast<uint32_t>(update_shape[d]);
+    slice_size = checked_mul_u32(slice_size, slice_sizes[d], "generic_scatter slice_size");
+  }
+
+  std::vector<uint32_t> px_axes(nidx);
+  for (int a = 0; a < nidx; ++a) {
+    px_axes[a] = static_cast<uint32_t>(norm_axes[a]);
+  }
+
+  const uint32_t ne = checked_mul_u32(index_count, slice_size, "generic_scatter ne");
+  std::vector<uint32_t> pc;
+  pc.push_back(ne);
+  pc.push_back(slice_size);
+  pc.insert(pc.end(), src_shape.begin(), src_shape.end());
+  pc.insert(pc.end(), src_strides.begin(), src_strides.end());
+  pc.insert(pc.end(), slice_sizes.begin(), slice_sizes.end());
+  pc.insert(pc.end(), px_axes.begin(), px_axes.end());
+
+  const uint32_t pc_size = static_cast<uint32_t>(pc.size() * sizeof(uint32_t));
+  if (pc_size > kMaxScatterPushConstants) {
+    return false;
+  }
+
+  std::string shader_name =
+      std::string(reduce_type == Scatter::Sum ? "dynamic_scatter_sum_generic_"
+                                              : "dynamic_scatter_generic_") +
+      dtype_suffix(value_dtype) + "_" + gather_index_suffix(index_dtype) + "_" +
+      std::to_string(ndim) + "d_" + std::to_string(nidx) + "a";
+  std::string glsl =
+      build_generic_scatter_shader(value_dtype, index_dtype, ndim, nidx, reduce_type);
+
+  const uint32_t num_bindings = static_cast<uint32_t>(2 + nidx);
+  std::vector<vulkan::DynamicArrayRef> refs;
+  refs.reserve(num_bindings);
+  refs.push_back({&upd, 0});
+  for (int j = 0; j < nidx; ++j) {
+    refs.push_back({&flat_indices[j], static_cast<uint32_t>(1 + j)});
+  }
+  refs.push_back({&out_work, static_cast<uint32_t>(1 + nidx)});
+
+  try {
+    auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+        shader_name, glsl, num_bindings, refs.data(), pc_size, s);
+
+    vkCmdPushConstants(
+        dispatch.command_buffer,
+        dispatch.pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        pc_size,
+        pc.data());
+    vkCmdDispatch(dispatch.command_buffer, (ne + 511u) / 512u, 1, 1);
+    vulkan::end_command_recording(s.index);
+
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  } catch (const std::runtime_error&) {
+    if (trace_fallback_enabled()) {
+      trace_fallback("generic_scatter_dispatch_failed reason=dynamic_shader_error");
+    }
+    return false;
   }
 }
 
@@ -457,56 +718,17 @@ bool try_eval_scatter_vulkan(
             }
           }
 
-          if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
-            return false;
+          if (try_dispatch_generic_scatter(
+                  inputs,
+                  norm_axes,
+                  update_shape,
+                  checked_u32_size(inputs[1].size(), "scatter_generic index_count"),
+                  out,
+                  s,
+                  reduce_type)) {
+            return true;
           }
-
-          upd = ensure_host_readable_row_contiguous(upd, s);
-
-          array result = contiguous_copy_gpu(src, s);
-          result.set_status(array::Status::available);
-          Shape flat_shape = {
-              static_cast<ShapeElem>(checked_u32_size(inputs[1].size(), "scatter_generic index_count")),
-              static_cast<ShapeElem>(slice_elems)};
-          array flat_upd = reshape(upd, flat_shape, s);
-
-          for (int i = 0; i < flat_indices[0].size(); ++i) {
-            Shape start(src.ndim(), 0);
-            Shape stop = update_shape;
-            Shape unit_strides(src.ndim(), 1);
-            for (int j = 0; j < norm_axes.size(); ++j) {
-              int axis = norm_axes[j];
-              start[axis] = normalize_scatter_index(
-                  read_flat_index_item(flat_indices[j], i, s), src.shape(axis));
-              stop[axis] += start[axis];
-              if (stop[axis] > src.shape(axis)) {
-                return false;
-              }
-            }
-
-          array update_view = reshape(
-              slice(
-                  flat_upd,
-                  {static_cast<ShapeElem>(i), 0},
-                  {static_cast<ShapeElem>(i + 1),
-                   static_cast<ShapeElem>(slice_elems)},
-                  s),
-              update_shape,
-              s);
-
-            array next(src.shape(), src.dtype(), nullptr, {});
-            next.set_data(allocator::malloc(next.nbytes()));
-            next.set_status(array::Status::available);
-            SliceUpdate::ReduceType slice_reduce = SliceUpdate::None;
-            if (reduce_type == Scatter::Sum) {
-              slice_reduce = SliceUpdate::Sum;
-            }
-            SliceUpdate op(s, slice_reduce, start, stop, unit_strides);
-            op.eval_gpu({result, update_view}, next);
-            result = std::move(next);
-          }
-          out.copy_shared_buffer(result);
-          return true;
+          return false;
         }
       }
     }
@@ -562,17 +784,11 @@ bool try_eval_scatter_vulkan(
               checked_u32_size(idx0.size(), "scatter_pair composed index_count"),
               slice_elems,
               "scatter_pair composed update_size") == upd.size() &&
-          !(reduce_type == Scatter::Sum && slice_elems == 1) &&
-          (reduce_type == Scatter::None || reduce_type == Scatter::Sum ||
-           reduce_type == Scatter::Prod || reduce_type == Scatter::Max ||
+          (reduce_type == Scatter::Prod || reduce_type == Scatter::Max ||
            reduce_type == Scatter::Min)) {
         idx0 = ensure_host_readable_row_contiguous(idx0, s);
         idx1 = ensure_host_readable_row_contiguous(idx1, s);
         upd = ensure_row_contiguous(upd, s);
-        array flat_idx0 =
-            reshape(idx0, {static_cast<ShapeElem>(idx0.size())}, s);
-        array flat_idx1 =
-            reshape(idx1, {static_cast<ShapeElem>(idx1.size())}, s);
         Shape flat_shape = {
             static_cast<ShapeElem>(index_count),
             static_cast<ShapeElem>(slice_elems)};
@@ -585,10 +801,10 @@ bool try_eval_scatter_vulkan(
           Shape unit_strides(src.ndim(), 1);
           auto idx0_value =
               normalize_scatter_index(
-                  read_contiguous_index(flat_idx0, i), src.shape(axis0));
+                  read_contiguous_index(idx0, i), src.shape(axis0));
           auto idx1_value =
               normalize_scatter_index(
-                  read_contiguous_index(flat_idx1, i), src.shape(axis1));
+                  read_contiguous_index(idx1, i), src.shape(axis1));
           start[axis0] = idx0_value;
           start[axis1] = idx1_value;
           stop[axis0] += start[axis0];
@@ -667,6 +883,26 @@ bool try_eval_scatter_vulkan(
         out.copy_shared_buffer(result);
         return true;
       }
+
+      if (update_shape.size() == src.ndim() &&
+          checked_mul_u32(
+              checked_u32_size(idx0.size(), "scatter_pair composed index_count"),
+              slice_elems,
+              "scatter_pair composed update_size") == upd.size() &&
+          (reduce_type == Scatter::None || reduce_type == Scatter::Sum)) {
+        std::vector<int> norm_axes = {axis0, axis1};
+        std::vector<array> generic_inputs = {src, idx0, idx1, upd};
+        if (try_dispatch_generic_scatter(
+                generic_inputs,
+                norm_axes,
+                update_shape,
+                index_count,
+                out,
+                s,
+                reduce_type)) {
+          return true;
+        }
+      }
     }
     if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
       return false;
@@ -702,75 +938,7 @@ bool try_eval_scatter_vulkan(
         ? scatter_sum_pair_shader_id(out.dtype(), idx0.dtype())
         : scatter_pair_shader_id(out.dtype(), idx0.dtype());
     if (!shader_id.has_value()) {
-      Shape update_shape(
-          upd.shape().begin() + idx_ndim,
-          upd.shape().end());
-      if (reduce_type != Scatter::None) {
-        return false;
-      }
-
-      idx0 = ensure_host_readable_row_contiguous(idx0, s);
-      idx1 = ensure_host_readable_row_contiguous(idx1, s);
-      upd = ensure_host_readable_row_contiguous(upd, s);
-      array flat_idx0 =
-          reshape(idx0, {static_cast<ShapeElem>(idx0.size())}, s);
-      array flat_idx1 =
-          reshape(idx1, {static_cast<ShapeElem>(idx1.size())}, s);
-
-      array result = src;
-
-      Strides update_strides(update_shape.size(), 1);
-      for (int d = static_cast<int>(update_shape.size()) - 2; d >= 0; --d) {
-        update_strides[d] = update_strides[d + 1] * update_shape[d + 1];
-      }
-      auto [update_data_size, update_row_contig, update_col_contig] =
-          check_contiguity(update_shape, update_strides);
-
-      for (int i = 0; i < idx0.size(); ++i) {
-        auto normalized_index0 =
-            normalize_scatter_index(
-                read_flat_index_item(flat_idx0, i, s), src.shape(axis0));
-        auto normalized_index1 =
-            normalize_scatter_index(
-                read_flat_index_item(flat_idx1, i, s), src.shape(axis1));
-        Shape start(src.ndim(), 0);
-        Shape stop = update_shape;
-        Shape unit_strides(src.ndim(), 1);
-        start[axis0] = normalized_index0;
-        stop[axis0] += normalized_index0;
-        start[axis1] = normalized_index1;
-        stop[axis1] += normalized_index1;
-        if (stop[axis0] > src.shape(axis0) || stop[axis1] > src.shape(axis1)) {
-          return false;
-        }
-
-        array update_view(update_shape, upd.dtype(), nullptr, {});
-        update_view.copy_shared_buffer(
-            upd,
-            update_strides,
-            {update_data_size == slice_size, update_row_contig, update_col_contig},
-            slice_size,
-            static_cast<int64_t>(i) * slice_size);
-        update_view.set_status(array::Status::available);
-
-        array next(src.shape(), src.dtype(), nullptr, {});
-        next.set_data(allocator::malloc(next.nbytes()));
-        next.set_status(array::Status::available);
-        SliceUpdate op(
-            s,
-            SliceUpdate::None,
-            start,
-            stop,
-            unit_strides);
-        op.eval_gpu({result, update_view}, next);
-        result = std::move(next);
-      }
-
-      if (result.has_primitive()) {
-        result.eval();
-      }
-      copy_gpu(result, out, CopyType::GeneralGeneral, s);
-      return true;
+      return false;
     }
 
     idx0 = ensure_row_contiguous(idx0, s);
@@ -859,27 +1027,12 @@ bool try_eval_scatter_vulkan(
       checked_u32_size(idx.size(), "scatter_take index_count");
   const uint32_t take_slice_size = checked_mul_u32(
       size_pre, size_post, "scatter_take slice_size");
-  if (reduce_type == Scatter::Sum && take_slice_size == 1 && out.dtype() == float32) {
-    array src_host = ensure_host_readable_row_contiguous(src, s);
-    array idx_host =
-        ensure_host_readable_row_contiguous(reshape(idx, {static_cast<ShapeElem>(index_count)}, s), s);
-    array upd_host =
-        ensure_host_readable_row_contiguous(reshape(upd, {static_cast<ShapeElem>(index_count)}, s), s);
-    std::vector<float> result(src.size());
-    std::copy(
-        src_host.data<float>(),
-        src_host.data<float>() + src.size(),
-        result.begin());
-    for (uint32_t i = 0; i < index_count; ++i) {
-      auto normalized_index =
-          normalize_scatter_index(read_contiguous_index(idx_host, i), src.shape(axis));
-      result[normalized_index] += upd_host.data<float>()[i];
-    }
-    array host_result(result.begin(), src.shape(), float32);
-    out.set_data(allocator::malloc(out.nbytes()));
-    copy_gpu_inplace(host_result, out, CopyType::GeneralGeneral, s);
+
+  if (idx.size() == 0 || upd.size() == 0) {
+    copy_gpu(src, out, source_copy_type(src), s);
     return true;
   }
+
   if (upd.ndim() == idx.ndim() + src.ndim()) {
     Shape update_shape(
         upd.shape().begin() + idx.ndim(),
@@ -891,47 +1044,42 @@ bool try_eval_scatter_vulkan(
           checked_mul_u32(slice_elems, checked_u32_size(dim, "scatter slice_elems"),
                           "scatter slice_elems");
     }
-    if (reduce_type == Scatter::None && idx.size() == 1 &&
-        update_shape.size() == src.ndim()) {
-      array flat_idx = reshape(idx, {1}, s);
-      auto singleton_index =
-          normalize_scatter_index(read_flat_index_item(flat_idx, 0, s), src.shape(axis));
-      Shape start(src.ndim(), 0);
-      Shape stop = target_slice_shape;
-      Shape unit_strides(src.ndim(), 1);
-      start[axis] = singleton_index;
-      stop[axis] += singleton_index;
-      if (stop[axis] > src.shape(axis)) {
-        return false;
-      }
-      return try_host_scatter_none_single_axis(
-          src, singleton_index, upd, out, axis, update_shape, slice_elems, s);
-    }
     if (update_shape.size() == src.ndim() &&
         checked_mul_u32(
             checked_u32_size(idx.size(), "scatter composed index_count"),
             slice_elems,
             "scatter composed update_size") == upd.size() &&
-        !(reduce_type == Scatter::None && idx.size() == 1) &&
         (reduce_type == Scatter::None || reduce_type == Scatter::Sum)) {
-      if (reduce_type == Scatter::Sum &&
-          try_host_scatter_sum_single_axis(
-              src, idx, upd, out, axis, update_shape, slice_elems, s)) {
+      std::vector<int> norm_axes = {axis};
+      if (try_dispatch_generic_scatter(
+              inputs, norm_axes, update_shape, index_count, out, s, reduce_type)) {
         return true;
       }
+      return false;
+    }
+
+    if (update_shape.size() == src.ndim() &&
+        checked_mul_u32(
+            checked_u32_size(idx.size(), "scatter composed index_count"),
+            slice_elems,
+            "scatter composed update_size") == upd.size() &&
+        (reduce_type == Scatter::Prod || reduce_type == Scatter::Max ||
+         reduce_type == Scatter::Min)) {
+      idx = ensure_host_readable_row_contiguous(
+          reshape(idx, {static_cast<ShapeElem>(index_count)}, s), s);
+      upd = ensure_row_contiguous(upd, s);
       Shape flat_shape = {
           static_cast<ShapeElem>(index_count),
           static_cast<ShapeElem>(slice_elems)};
-      array flat_idx =
-          reshape(idx, {static_cast<ShapeElem>(index_count)}, s);
       array flat_upd = reshape(upd, flat_shape, s);
       array result(src.shape(), src.dtype(), nullptr, {});
       result.set_data(allocator::malloc(result.nbytes()));
+      result.set_status(array::Status::available);
       copy_gpu(src, result, source_copy_type(src), s);
-      for (int i = 0; i < idx.size(); ++i) {
-        auto normalized_index =
-            normalize_scatter_index(
-                read_flat_index_item(flat_idx, i, s), src.shape(axis));
+
+      for (uint32_t i = 0; i < index_count; ++i) {
+        auto normalized_index = normalize_scatter_index(
+            read_contiguous_index(idx, i), src.shape(axis));
         Shape start(src.ndim(), 0);
         Shape stop = target_slice_shape;
         Shape unit_strides(src.ndim(), 1);
@@ -940,6 +1088,7 @@ bool try_eval_scatter_vulkan(
         if (stop[axis] > src.shape(axis)) {
           return false;
         }
+
         array update_value = reshape(
             slice(
                 flat_upd,
@@ -950,160 +1099,30 @@ bool try_eval_scatter_vulkan(
             update_shape,
             s);
 
-        if (reduce_type == Scatter::None) {
-          array next(src.shape(), src.dtype(), nullptr, {});
-          next.set_data(allocator::malloc(next.nbytes()));
-          next.set_status(array::Status::available);
-          SliceUpdate op(
-              s,
-              SliceUpdate::None,
-              start,
-              stop,
-              unit_strides);
-          op.eval_gpu({result, update_value}, next);
-          result = std::move(next);
-          continue;
-        }
-
-        if (reduce_type == Scatter::Sum) {
-          auto current = slice(result, start, stop, unit_strides, s);
-          auto merged = add(current, update_value, s);
-          result = slice_update(
-              result,
-              merged,
-              std::move(start),
-              std::move(stop),
-              std::move(unit_strides),
-              s);
-          continue;
-        }
-
-        auto current = slice(result, start, stop, unit_strides, s);
-        array merged = current;
+        array next(src.shape(), src.dtype(), nullptr, {});
+        next.set_data(allocator::malloc(next.nbytes()));
+        next.set_status(array::Status::available);
+        SliceUpdate::ReduceType op_reduce = SliceUpdate::None;
         switch (reduce_type) {
           case Scatter::Prod:
-            merged = multiply(current, update_value, s);
+            op_reduce = SliceUpdate::Prod;
             break;
           case Scatter::Max:
-            merged = maximum(current, update_value, s);
+            op_reduce = SliceUpdate::Max;
             break;
           case Scatter::Min:
-            merged = minimum(current, update_value, s);
+            op_reduce = SliceUpdate::Min;
             break;
           default:
             break;
         }
-        result = slice_update(result, merged, std::move(start), std::move(stop), std::move(unit_strides), s);
+        SliceUpdate op(s, op_reduce, start, stop, unit_strides);
+        op.eval_gpu({result, update_value}, next);
+        result = std::move(next);
       }
-      if (result.has_primitive()) {
-        result.eval();
-      }
+
       copy_gpu(result, out, CopyType::GeneralGeneral, s);
       return true;
-    }
-  }
-  if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
-    const uint32_t slice_size = take_slice_size;
-    const uint32_t expected_update_size = checked_mul_u32(
-        index_count, slice_size, "scatter_take expected_update_size");
-    if (upd.size() != expected_update_size) {
-      trace_vulkan_unsupported("Scatter", "update size does not match indices");
-      return false;
-    }
-    Shape flat_shape = {
-        static_cast<ShapeElem>(index_count),
-        static_cast<ShapeElem>(slice_size)};
-    array flat_idx =
-        reshape(idx, {static_cast<ShapeElem>(index_count)}, s);
-    array flat_upd = reshape(upd, flat_shape, s);
-    Shape slice_shape = src.shape();
-    slice_shape[axis] = 1;
-    array result = src;
-    for (uint32_t i = 0; i < index_count; ++i) {
-      Shape unit_strides(src.ndim(), 1);
-      auto idx_value =
-          normalize_scatter_index(
-              read_flat_index_item(flat_idx, i, s),
-              src.shape(axis));
-      Shape start(src.ndim(), 0);
-      Shape stop = slice_shape;
-      start[axis] = idx_value;
-      stop[axis] += idx_value;
-      auto current = slice(result, start, stop, unit_strides, s);
-      auto update = reshape(
-          slice(
-              flat_upd,
-              {static_cast<ShapeElem>(i), 0},
-              {static_cast<ShapeElem>(i + 1), static_cast<ShapeElem>(slice_size)},
-              s),
-          slice_shape,
-          s);
-      array reduced = current;
-      switch (reduce_type) {
-        case Scatter::Prod:
-          reduced = multiply(current, update, s);
-          break;
-        case Scatter::Max:
-          reduced = maximum(current, update, s);
-          break;
-        case Scatter::Min:
-          reduced = minimum(current, update, s);
-          break;
-        default:
-          return false;
-      }
-      result = slice_update(
-          result,
-          reduced,
-          std::move(start),
-          std::move(stop),
-          std::move(unit_strides),
-          s);
-    }
-    copy_gpu(result, out, CopyType::GeneralGeneral, s);
-    return true;
-  }
-
-  if (reduce_type == Scatter::None) {
-    if (auto scalar_index = scalar_index_value(idx); scalar_index.has_value()) {
-      Shape start(src.ndim(), 0);
-      Shape stop = upd.shape();
-      Shape strides(src.ndim(), 1);
-      auto normalized_index =
-          normalize_scatter_index(*scalar_index, src.shape(axis));
-      start[axis] = normalized_index;
-      stop[axis] += normalized_index;
-      array update_value = ensure_row_contiguous(upd, s);
-      array next(src.shape(), src.dtype(), nullptr, {});
-      next.set_data(allocator::malloc(next.nbytes()));
-      next.set_status(array::Status::available);
-      SliceUpdate op(s, SliceUpdate::None, start, stop, strides);
-      op.eval_gpu({src, update_value}, next);
-      out.copy_shared_buffer(next);
-      return true;
-    }
-    if (idx.size() == 1) {
-      if (auto single_idx = singleton_index_value(idx); single_idx.has_value()) {
-        Shape slice_shape(
-            upd.shape().begin() + idx.ndim(),
-            upd.shape().end());
-        Shape start(src.ndim(), 0);
-        Shape stop = slice_shape;
-        Shape strides(src.ndim(), 1);
-        auto normalized_index =
-            normalize_scatter_index(*single_idx, src.shape(axis));
-        start[axis] = normalized_index;
-        stop[axis] += normalized_index;
-        array update_value =
-            ensure_row_contiguous(reshape(upd, slice_shape, s), s);
-        array next(src.shape(), src.dtype(), nullptr, {});
-        next.set_data(allocator::malloc(next.nbytes()));
-        next.set_status(array::Status::available);
-        SliceUpdate op(s, SliceUpdate::None, start, stop, strides);
-        op.eval_gpu({src, update_value}, next);
-        out.copy_shared_buffer(next);
-        return true;
-      }
     }
   }
   const uint32_t slice_size = take_slice_size;
@@ -1113,6 +1132,12 @@ bool try_eval_scatter_vulkan(
     trace_vulkan_unsupported("Scatter", "update size does not match indices");
     return false;
   }
+  if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
+    trace_vulkan_unsupported(
+        "Scatter", "single-axis non-composed reduction is not supported by Vulkan");
+    return false;
+  }
+
   if (reduce_type == Scatter::Sum && out.dtype() == float32 &&
       !vulkan::VulkanContext::get().shader_buffer_atomic_float32_supported()) {
     trace_vulkan_unsupported(

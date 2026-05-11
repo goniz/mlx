@@ -6,6 +6,7 @@
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/ops.h"
 
 namespace mlx::core {
@@ -151,6 +152,237 @@ bool is_full_range_index_for_axis(const array& idx, int64_t axis_size, Stream s)
   return true;
 }
 
+constexpr uint32_t kMaxGatherPushConstants = 128;
+
+std::string build_generic_gather_shader(
+    Dtype value_dtype,
+    Dtype index_dtype,
+    int ndim,
+    int nidx) {
+  std::ostringstream os;
+
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  os << "#extension GL_EXT_scalar_block_layout : require\n";
+
+  bool needs_int64 = (index_dtype == int64 || index_dtype == uint64 ||
+                      value_dtype == int64 || value_dtype == uint64);
+  if (needs_int64) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
+  }
+
+  if (vulkan::uses_float16_extension(value_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+  }
+  if (vulkan::uses_16bit_storage(value_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+    os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  }
+  if (vulkan::uses_8bit_storage(value_dtype)) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
+    os << "#extension GL_EXT_shader_8bit_storage : require\n";
+  }
+
+  os << "\n#define SRC_NDIM " << ndim << "\n";
+  os << "#define NIDX " << nidx << "\n";
+
+  if (index_dtype == int64) {
+    os << "#define INDEX_IS_I64\n";
+    os << "#define INDEX_TYPE int64_t\n";
+  } else if (index_dtype == uint64) {
+    os << "#define INDEX_IS_I64\n";
+    os << "#define INDEX_IS_UNSIGNED\n";
+    os << "#define INDEX_TYPE uint64_t\n";
+  } else if (index_dtype == uint32) {
+    os << "#define INDEX_IS_UNSIGNED\n";
+    os << "#define INDEX_TYPE uint\n";
+  } else {
+    os << "#define INDEX_TYPE int\n";
+  }
+
+  os << "#define VALUE_TYPE "
+     << vulkan::dtype_to_glsl_storage_type(value_dtype) << "\n";
+
+  os << "\nlayout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;\n\n";
+
+  os << "layout(push_constant) uniform Params {\n";
+  os << "    uint ne;\n";
+  os << "    uint slice_size;\n";
+  os << "    uint src_shape[SRC_NDIM];\n";
+  os << "    uint src_strides[SRC_NDIM];\n";
+  os << "    uint slice_sizes[SRC_NDIM];\n";
+  os << "    uint axes[NIDX];\n";
+  os << "} p;\n\n";
+
+  os << "layout(scalar, binding = 0) readonly buffer Src { VALUE_TYPE src_data[]; };\n";
+  for (int j = 0; j < nidx; ++j) {
+    os << "layout(scalar, binding = " << (1 + j)
+       << ") readonly buffer Idx" << j << " { INDEX_TYPE idx" << j << "_data[]; };\n";
+  }
+  os << "layout(scalar, binding = " << (1 + nidx)
+     << ") writeonly buffer Out { VALUE_TYPE out_data[]; };\n\n";
+
+  os << "uint normalize_index(INDEX_TYPE idx, uint axis_size) {\n";
+  os << "#if defined(INDEX_IS_UNSIGNED)\n";
+  os << "    return uint(idx);\n";
+  os << "#elif defined(INDEX_IS_I64)\n";
+  os << "    return uint(idx < int64_t(0) ? idx + int64_t(axis_size) : idx);\n";
+  os << "#else\n";
+  os << "    return uint(idx < 0 ? idx + int(axis_size) : idx);\n";
+  os << "#endif\n";
+  os << "}\n\n";
+
+  os << "void main() {\n";
+  os << "    uint linear_idx = gl_GlobalInvocationID.x;\n";
+  os << "    if (linear_idx >= p.ne) return;\n\n";
+  os << "    uint src_elem = linear_idx % p.slice_size;\n";
+  os << "    uint idx_elem = linear_idx / p.slice_size;\n\n";
+  os << "    uint src_offset = 0;\n";
+  os << "    uint rem = src_elem;\n";
+  os << "    for (int d = SRC_NDIM - 1; d >= 0; --d) {\n";
+  os << "        uint sz = uint(max(p.slice_sizes[d], 1));\n";
+  os << "        src_offset += (rem % sz) * p.src_strides[d];\n";
+  os << "        rem /= sz;\n";
+  os << "    }\n\n";
+
+  for (int j = 0; j < nidx; ++j) {
+    os << "    src_offset += normalize_index(idx" << j
+       << "_data[idx_elem], p.src_shape[p.axes[" << j << "]]) "
+       << "* p.src_strides[p.axes[" << j << "]];\n";
+  }
+
+  os << "\n    out_data[linear_idx] = src_data[src_offset];\n";
+  os << "}\n";
+
+  return os.str();
+}
+
+bool try_dispatch_generic_gather(
+    const std::vector<array>& inputs,
+    const std::vector<int>& norm_axes,
+    const Shape& slice_sizes,
+    int idx_ndim,
+    uint32_t index_count,
+    array& out,
+    Stream s) {
+  const auto& src_input = inputs[0];
+  const int ndim = static_cast<int>(src_input.ndim());
+  const int nidx = static_cast<int>(norm_axes.size());
+  const Dtype value_dtype = src_input.dtype();
+  const Dtype index_dtype = inputs[1].dtype();
+
+  std::vector<array> flat_indices;
+  flat_indices.reserve(nidx);
+  for (int i = 0; i < nidx; ++i) {
+    flat_indices.push_back(ensure_row_contiguous(
+        reshape(
+            inputs[1 + i], {static_cast<ShapeElem>(index_count)}, s),
+        s));
+  }
+
+  array src = ensure_row_contiguous(src_input, s);
+
+  auto [out_work, staged_output] = make_output_work(out);
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
+  std::vector<uint32_t> src_shape(ndim);
+  std::vector<uint32_t> src_strides(ndim);
+  for (int d = 0; d < ndim; ++d) {
+    src_shape[d] = static_cast<uint32_t>(src_input.shape(d));
+  }
+  for (int d = ndim - 1; d >= 0; --d) {
+    src_strides[d] =
+        (d == ndim - 1) ? 1u : src_strides[d + 1] * src_shape[d + 1];
+  }
+
+  std::vector<uint32_t> ss(ndim);
+  for (int d = 0; d < ndim; ++d) {
+    ss[d] = static_cast<uint32_t>(slice_sizes[d]);
+  }
+
+  std::vector<uint32_t> px_axes(nidx);
+  for (int a = 0; a < nidx; ++a) {
+    px_axes[a] = static_cast<uint32_t>(norm_axes[a]);
+  }
+
+  const uint32_t slice_size = std::accumulate(
+      ss.begin(), ss.end(), 1u, std::multiplies<uint32_t>());
+  const uint32_t ne = index_count * slice_size;
+
+  std::vector<uint32_t> pc;
+  pc.push_back(ne);
+  pc.push_back(slice_size);
+  pc.insert(pc.end(), src_shape.begin(), src_shape.end());
+  pc.insert(pc.end(), src_strides.begin(), src_strides.end());
+  pc.insert(pc.end(), ss.begin(), ss.end());
+  pc.insert(pc.end(), px_axes.begin(), px_axes.end());
+
+  const uint32_t pc_size =
+      static_cast<uint32_t>(pc.size() * sizeof(uint32_t));
+  if (pc_size > kMaxGatherPushConstants) {
+    return false;
+  }
+
+  std::string shader_name = "dynamic_gather_generic_" +
+      dtype_suffix(value_dtype) + "_" + gather_index_suffix(index_dtype) +
+      "_" + std::to_string(ndim) + "d_" + std::to_string(nidx) + "a";
+
+  std::string glsl =
+      build_generic_gather_shader(value_dtype, index_dtype, ndim, nidx);
+
+  const uint32_t num_bindings =
+      static_cast<uint32_t>(2 + nidx);
+  std::vector<vulkan::DynamicArrayRef> refs;
+  refs.reserve(num_bindings);
+  refs.push_back({&src, 0});
+  for (int j = 0; j < nidx; ++j) {
+    refs.push_back(
+        {&flat_indices[j], static_cast<uint32_t>(1 + j)});
+  }
+  refs.push_back({&out_work, static_cast<uint32_t>(1 + nidx)});
+
+  try {
+    auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+        shader_name,
+        glsl,
+        num_bindings,
+        refs.data(),
+        pc_size,
+        s);
+
+    vkCmdPushConstants(
+        dispatch.command_buffer,
+        dispatch.pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        pc_size,
+        pc.data());
+
+    vkCmdDispatch(
+        dispatch.command_buffer,
+        (ne + 511u) / 512u,
+        1,
+        1);
+
+    vulkan::end_command_recording(s.index);
+
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  } catch (const std::runtime_error&) {
+    if (trace_fallback_enabled()) {
+      trace_fallback("generic_gather_dispatch_failed reason=dynamic_shader_error");
+    }
+    return false;
+  }
+}
+
 bool try_eval_gather_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -220,9 +452,20 @@ bool try_eval_gather_vulkan(
       return false;
     }
 
+    const auto index_count =
+        checked_u32_size(inputs[1].size(), "gather_generic index_count");
+
+    if (try_dispatch_generic_gather(
+            inputs, norm_axes, slice_sizes, idx_ndim, index_count, out, s)) {
+      return true;
+    }
+
+    if (trace_fallback_enabled()) {
+      trace_fallback("generic_gather_gpu_unavailable fallback=host_loop");
+    }
+
     std::vector<array> flat_indices;
     flat_indices.reserve(inputs.size() - 1);
-    const auto index_count = checked_u32_size(inputs[1].size(), "gather_generic index_count");
     for (int i = 1; i < inputs.size(); ++i) {
       flat_indices.push_back(ensure_host_readable_row_contiguous(
           reshape(inputs[i], {static_cast<ShapeElem>(index_count)}, s), s));

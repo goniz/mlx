@@ -769,6 +769,39 @@ bool try_eval_power_vulkan(
         return std::nullopt;
     }
   };
+  auto is_supported_integral_power_dtype = [](Dtype dtype) {
+    return dtype == bool_ || dtype == int32 || dtype == uint32 || dtype == int64 ||
+        dtype == uint64;
+  };
+  auto scalar_integral_value = [&](const array& arr) -> std::optional<int64_t> {
+    array scalar = arr;
+    if (arr.size() != 1) {
+      if (arr.data_size() != 1) {
+        return std::nullopt;
+      }
+      scalar = slice(arr, Shape(arr.ndim(), 0), Shape(arr.ndim(), 1), s);
+    }
+    scalar.eval();
+    switch (scalar.dtype()) {
+      case bool_:
+        return static_cast<int64_t>(scalar.item<bool>());
+      case int32:
+        return static_cast<int64_t>(scalar.item<int32_t>());
+      case uint32:
+        return static_cast<int64_t>(scalar.item<uint32_t>());
+      case int64:
+        return scalar.item<int64_t>();
+      case uint64: {
+        auto value = scalar.item<uint64_t>();
+        if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+          return std::nullopt;
+        }
+        return static_cast<int64_t>(value);
+      }
+      default:
+        return std::nullopt;
+    }
+  };
 
   if (a.size() == 1 && b.size() == 1 && out.size() == 1 &&
       a.dtype() == b.dtype() && a.dtype() == out.dtype()) {
@@ -883,6 +916,52 @@ bool try_eval_power_vulkan(
       uint64_t exp = static_cast<uint64_t>(*scalar_exp);
       if (exp == 0) {
         copy_gpu(array(1.0f, out.dtype()), out, CopyType::Scalar, s);
+        return true;
+      }
+
+      array base = a;
+      if (base.shape() != out.shape()) {
+        if (broadcast_shapes(base.shape(), out.shape()) != out.shape()) {
+          return false;
+        }
+        array view(out.shape(), base.dtype(), nullptr, {});
+        broadcast(base, view);
+        base = view;
+      }
+
+      array result = base;
+      uint64_t remaining = exp - 1;
+      array factor = base;
+      while (remaining > 0) {
+        if (remaining & 1u) {
+          result = multiply(result, factor, s);
+        }
+        remaining >>= 1;
+        if (remaining > 0) {
+          factor = multiply(factor, factor, s);
+        }
+      }
+      copy_gpu(result, out, CopyType::General, s);
+      return true;
+    }
+  }
+
+  if (is_supported_integral_power_dtype(a.dtype()) && a.dtype() == b.dtype() &&
+      a.dtype() == out.dtype()) {
+    auto scalar_exp = scalar_integral_value(b);
+    if (scalar_exp.has_value()) {
+      if (*scalar_exp < 0) {
+        copy_gpu(zeros(out.shape(), out.dtype(), s), out, CopyType::General, s);
+        return true;
+      }
+
+      uint64_t exp = static_cast<uint64_t>(*scalar_exp);
+      if (exp == 0) {
+        copy_gpu(
+            full(out.shape(), array(1, out.dtype()), out.dtype(), s),
+            out,
+            CopyType::General,
+            s);
         return true;
       }
 

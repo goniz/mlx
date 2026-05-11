@@ -30,6 +30,18 @@ array ensure_row_contiguous(array arr, Stream s) {
   return arr;
 }
 
+bool ensure_vulkan_storage(array& arr, Stream s) {
+  if (vulkan::is_vulkan_storage_array(arr)) {
+    return true;
+  }
+  array storage(arr.shape(), arr.dtype(), nullptr, {});
+  storage.set_data(allocator::malloc(storage.nbytes()));
+  storage.set_status(array::Status::available);
+  copy_gpu(arr, storage, CopyType::General, s);
+  arr = std::move(storage);
+  return vulkan::is_vulkan_storage_array(arr);
+}
+
 array ensure_host_readable_row_contiguous(array arr, Stream s) {
   if (arr.has_primitive()) {
     arr.eval();
@@ -274,15 +286,25 @@ bool try_dispatch_generic_gather(
   std::vector<array> flat_indices;
   flat_indices.reserve(nidx);
   for (int i = 0; i < nidx; ++i) {
-    flat_indices.push_back(ensure_row_contiguous(
+    auto flat_idx = ensure_row_contiguous(
         reshape(
             inputs[1 + i], {static_cast<ShapeElem>(index_count)}, s),
-        s));
+        s);
+    if (!ensure_vulkan_storage(flat_idx, s)) {
+      return false;
+    }
+    flat_indices.push_back(flat_idx);
   }
 
   array src = ensure_row_contiguous(src_input, s);
+  if (!ensure_vulkan_storage(src, s)) {
+    return false;
+  }
 
   auto [out_work, staged_output] = make_output_work(out);
+  if (!ensure_vulkan_storage(out_work, s)) {
+    return false;
+  }
   if (out_work.size() == 0) {
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::GeneralGeneral, s);

@@ -1261,6 +1261,22 @@ std::optional<float> scalar_fill_value_as_float(const array& val) {
 } // namespace
 
 void copy_gpu(const array& src, array& out, CopyType ctype, const Stream& s) {
+  if ((ctype == CopyType::Vector || ctype == CopyType::General) &&
+      src.data_size() == 1 && out.size() != 1 && src.dtype() != out.dtype()) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    copy_gpu_inplace(
+        src,
+        out,
+        out.shape(),
+        Strides(out.ndim(), 0),
+        out.strides(),
+        0,
+        0,
+        CopyType::GeneralGeneral,
+        s);
+    return;
+  }
+
   // A broadcasted scalar can still appear as a general or vector copy with a
   // single backing element. Those paths must become scalar fills, otherwise we
   // only copy the lone raw element instead of the broadcasted value.

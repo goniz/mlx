@@ -8,6 +8,7 @@
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/matmul.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1289,6 +1291,125 @@ bool try_eval_matmul_vulkan_impl(
   return try_eval_mul_mm_vulkan(inputs, out, s);
 }
 
+std::string build_addmm_epilogue_shader(int ndim) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(float32, false);
+  os << "#define NDIM " << ndim << "\n";
+  os << "layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n";
+  os << "layout(push_constant) uniform Params {\n";
+  os << "  uint total;\n";
+  os << "  uint mm_offset;\n";
+  os << "  uint c_offset;\n";
+  os << "  uint out_offset;\n";
+  os << "  float alpha;\n";
+  os << "  float beta;\n";
+  os << "  uint shape[4];\n";
+  os << "  uint c_strides[4];\n";
+  os << "} p;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer MM { float data[]; } mm;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer C { float data[]; } c;\n";
+  os << "layout(set = 0, binding = 2) buffer Out { float data[]; } out_buf;\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= p.total) return;\n";
+  os << "  uint c_idx = p.c_offset;\n";
+  os << "  uint rem = idx;\n";
+  os << "  for (int d = NDIM - 1; d >= 0; --d) {\n";
+  os << "    uint coord = rem % p.shape[d];\n";
+  os << "    rem /= p.shape[d];\n";
+  os << "    c_idx += coord * p.c_strides[d];\n";
+  os << "  }\n";
+  os << "  out_buf.data[idx + p.out_offset] = p.alpha * mm.data[idx + p.mm_offset] + p.beta * c.data[c_idx];\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_addmm_epilogue_vulkan(
+    const array& mm,
+    array c,
+    array& out,
+    float alpha,
+    float beta,
+    Stream s) {
+  if (mm.dtype() != float32 || c.dtype() != float32 || out.dtype() != float32 ||
+      out.ndim() > 4 || mm.shape() != out.shape()) {
+    return false;
+  }
+
+  if (c.shape() != out.shape()) {
+    if (broadcast_shapes(c.shape(), out.shape()) != out.shape()) {
+      return false;
+    }
+    if (!ensure_vulkan_buffer(c, s)) {
+      return false;
+    }
+    array view(out.shape(), c.dtype(), nullptr, {});
+    broadcast(c, view);
+    c = view;
+  }
+  if (!ensure_vulkan_buffer(c, s)) {
+    return false;
+  }
+  for (auto stride : c.strides()) {
+    if (stride < 0 || stride > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+
+  const auto total = static_cast<uint64_t>(out.size());
+  const auto mm_offset = static_cast<uint64_t>(mm.offset() / size_of(mm.dtype()));
+  const auto c_offset = static_cast<uint64_t>(c.offset() / size_of(c.dtype()));
+  if (total > std::numeric_limits<uint32_t>::max() ||
+      mm_offset > std::numeric_limits<uint32_t>::max() ||
+      c_offset > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (!ensure_vulkan_buffer(out, s)) {
+    return false;
+  }
+
+  struct PushConstants {
+    uint32_t total;
+    uint32_t mm_offset;
+    uint32_t c_offset;
+    uint32_t out_offset;
+    float alpha;
+    float beta;
+    uint32_t shape[4];
+    uint32_t c_strides[4];
+  } pc{};
+  pc.total = static_cast<uint32_t>(total);
+  pc.mm_offset = static_cast<uint32_t>(mm_offset);
+  pc.c_offset = static_cast<uint32_t>(c_offset);
+  pc.alpha = alpha;
+  pc.beta = beta;
+  for (int i = 0; i < out.ndim(); ++i) {
+    pc.shape[i] = static_cast<uint32_t>(out.shape(i));
+    pc.c_strides[i] = static_cast<uint32_t>(c.strides(i));
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {{&mm, 0}, {&c, 1}, {&out, 2}};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_addmm_epilogue_f32_" + std::to_string(out.ndim()) + "d",
+      build_addmm_epilogue_shader(static_cast<int>(out.ndim())),
+      3,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 } // namespace
 
 bool try_eval_matmul_vulkan(
@@ -1310,7 +1431,24 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  throw std::runtime_error("AddMM has no Vulkan implementation.");
+  assert(inputs.size() == 3);
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    return;
+  }
+
+  auto& s = stream();
+  array mm(out.shape(), out.dtype(), nullptr, {});
+  if (!try_eval_matmul_vulkan_impl({inputs[0], inputs[1]}, mm, s, nullptr)) {
+    throw std::runtime_error(
+        "AddMM operation failed on Vulkan (unsupported matmul input).");
+  }
+  mm.set_status(array::Status::evaluated);
+
+  if (!try_eval_addmm_epilogue_vulkan(mm, inputs[2], out, alpha_, beta_, s)) {
+    throw std::runtime_error(
+        "AddMM operation failed on Vulkan (unsupported epilogue input).");
+  }
 }
 
 void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {

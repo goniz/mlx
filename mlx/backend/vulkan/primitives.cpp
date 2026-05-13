@@ -285,6 +285,35 @@ std::string build_power_shader(Dtype a_dtype, Dtype b_dtype, Dtype out_dtype) {
   if (a_dtype == bfloat16 || b_dtype == bfloat16 || out_dtype == bfloat16) {
     os << emit_bf16_power_helpers();
   }
+  if (!uses_integral_power && !uses_complex_power) {
+    os << R"(
+float safe_real_pow(float x, float y) {
+  float yi = round(y);
+  if (abs(y - yi) <= 0.00001 && abs(yi) <= 64.0) {
+    int n = int(yi);
+    float base = abs(x);
+    float result = 1.0;
+    int exp = abs(n);
+    while (exp > 0) {
+      if ((exp & 1) != 0) {
+        result *= base;
+      }
+      base *= base;
+      exp >>= 1;
+    }
+    if (n < 0) {
+      result = 1.0 / result;
+    }
+    if (x < 0.0 && (abs(n) & 1) != 0) {
+      result = -result;
+    }
+    return result;
+  }
+  return pow(x, y);
+}
+
+)";
+  }
   os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
   os << "layout(set = 0, binding = 0) readonly buffer InputA {"
      << vulkan::dtype_to_glsl_storage_type(a_dtype) << " data[];} a_buf;\n";
@@ -336,7 +365,7 @@ std::string build_power_shader(Dtype a_dtype, Dtype b_dtype, Dtype out_dtype) {
     os << "  float rhs = " << power_input_expr(b_dtype, "b_buf", "b_idx")
        << ";\n";
     os << "  out_buf.data[idx + pc.out_offset] = "
-       << power_output_expr(out_dtype, "pow(lhs, rhs)") << ";\n";
+       << power_output_expr(out_dtype, "safe_real_pow(lhs, rhs)") << ";\n";
   }
   os << "}\n";
   return os.str();
@@ -880,6 +909,12 @@ bool try_eval_power_vulkan(
     }
     if (!ensure_vulkan_buffer_power(in, s)) {
       return false;
+    }
+    if (in.data_size() == 1) {
+      array materialized(out.shape(), in.dtype(), nullptr, {});
+      copy_gpu(in, materialized, CopyType::Scalar, s);
+      in = materialized;
+      return true;
     }
     array view(out.shape(), in.dtype(), nullptr, {});
     broadcast(in, view);

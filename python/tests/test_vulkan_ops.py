@@ -943,6 +943,13 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
 
         self._assert_cpu_gpu_same(fn, atol=1e-3, rtol=1e-3)
 
+    def test_power_tensor_scalar_exponent_regression(self):
+        def fn():
+            base = mx.linspace(0.5, 8.0, 4096, dtype=mx.float32).reshape(64, 64)
+            return mx.power(base, 3.0).astype(mx.float32)
+
+        self._assert_cpu_gpu_same(fn, atol=1e-5, rtol=1e-5)
+
     def test_compiled_nonzero_runtime_offsets_regression(self):
         def eager(a, b):
             return (a + b) * 0.5

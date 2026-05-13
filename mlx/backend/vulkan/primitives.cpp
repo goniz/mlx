@@ -3,6 +3,7 @@
 #include "mlx/distributed/primitives.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/slicing.h"
+#include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/kernels.h"
@@ -78,6 +79,51 @@ array flatten_compare_array(const array& arr, Stream s) {
   array flat({static_cast<ShapeElem>(arr.size())}, arr.dtype(), nullptr, {});
   copy_gpu(arr, flat, CopyType::General, s);
   return flat;
+}
+
+bool try_eval_complex_component_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    int64_t component_offset) {
+  if (inputs.size() != 1 || inputs[0].dtype() != complex64 ||
+      out.dtype() != float32 || inputs[0].shape() != out.shape()) {
+    return false;
+  }
+
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return true;
+  }
+
+  const auto& in = inputs[0];
+  Strides component_strides(in.strides());
+  for (auto& stride : component_strides) {
+    stride *= 2;
+  }
+
+  int64_t low_idx = 0;
+  int64_t high_idx = 0;
+  for (int i = 0; i < out.ndim(); ++i) {
+    auto delta = component_strides[i] * (out.shape()[i] - 1);
+    if (delta > 0) {
+      high_idx += delta;
+    } else {
+      low_idx += delta;
+    }
+  }
+
+  // complex64 is stored as interleaved float32 lanes, so expose the requested
+  // lane as a strided float32 view instead of synchronizing back to the host.
+  const size_t data_size = static_cast<size_t>(high_idx - low_idx + 1);
+  auto [no_bsx_size, is_row_contiguous, is_col_contiguous] =
+      check_contiguity(out.shape(), component_strides);
+  auto flags = in.flags();
+  flags.row_contiguous = is_row_contiguous;
+  flags.col_contiguous = is_col_contiguous;
+  flags.contiguous = no_bsx_size == data_size;
+  out.copy_shared_buffer(
+      in, component_strides, flags, data_size, component_offset);
+  return true;
 }
 
 bool ensure_vulkan_buffer_power(array& arr, Stream s) {
@@ -205,13 +251,28 @@ std::string power_output_expr(Dtype out_dtype, const std::string& expr) {
   return expr;
 }
 
+bool is_integral_power_dtype(Dtype dtype) {
+  return dtype == bool_ || dtype == int32 || dtype == uint32 ||
+      dtype == int64 || dtype == uint64;
+}
+
+bool is_signed_power_dtype(Dtype dtype) {
+  return dtype == int32 || dtype == int64;
+}
+
 std::string build_power_shader(Dtype a_dtype, Dtype b_dtype, Dtype out_dtype) {
   std::ostringstream os;
+  const bool uses_integral_power = is_integral_power_dtype(a_dtype) &&
+      a_dtype == b_dtype && a_dtype == out_dtype;
+  const bool uses_complex_power =
+      a_dtype == complex64 && b_dtype == complex64 && out_dtype == complex64;
   const bool uses_bfloat16 =
       a_dtype == bfloat16 || b_dtype == bfloat16 || out_dtype == bfloat16;
   const bool uses_float16 =
       a_dtype == float16 || b_dtype == float16 || out_dtype == float16;
-  if (uses_bfloat16 || uses_float16) {
+  if (uses_integral_power || uses_complex_power) {
+    os << vulkan::emit_dynamic_shader_preamble(a_dtype, out_dtype, false);
+  } else if (uses_bfloat16 || uses_float16) {
     os << "#version 450\n";
     os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
     os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
@@ -238,12 +299,45 @@ std::string build_power_shader(Dtype a_dtype, Dtype b_dtype, Dtype out_dtype) {
   os << "  uint idx = linear_idx;\n";
   os << "  uint a_idx = idx + pc.a_offset;\n";
   os << "  uint b_idx = idx + pc.b_offset;\n";
-  os << "  float lhs = " << power_input_expr(a_dtype, "a_buf", "a_idx")
-     << ";\n";
-  os << "  float rhs = " << power_input_expr(b_dtype, "b_buf", "b_idx")
-     << ";\n";
-  os << "  out_buf.data[idx + pc.out_offset] = "
-     << power_output_expr(out_dtype, "pow(lhs, rhs)") << ";\n";
+  if (uses_complex_power) {
+    os << "  vec2 base = a_buf.data[a_idx];\n";
+    os << "  vec2 expv = b_buf.data[b_idx];\n";
+    os << "  vec2 log_base = vec2(log(length(base)), atan(base.y, base.x));\n";
+    os << "  vec2 z = vec2(expv.x * log_base.x - expv.y * log_base.y, expv.x * log_base.y + expv.y * log_base.x);\n";
+    os << "  float exp_x = exp(z.x);\n";
+    os << "  out_buf.data[idx + pc.out_offset] = vec2(exp_x * cos(z.y), exp_x * sin(z.y));\n";
+  } else if (uses_integral_power) {
+    if (a_dtype == bool_) {
+      os << "  bool base = a_buf.data[a_idx] != uint8_t(0);\n";
+      os << "  bool exp = b_buf.data[b_idx] != uint8_t(0);\n";
+      os << "  out_buf.data[idx + pc.out_offset] = (!exp || base) ? uint8_t(1) : uint8_t(0);\n";
+      os << "}\n";
+      return os.str();
+    }
+    const std::string type_name = vulkan::dtype_to_glsl_storage_type(a_dtype);
+    os << "  " << type_name << " base = a_buf.data[a_idx];\n";
+    os << "  " << type_name << " exp = b_buf.data[b_idx];\n";
+    if (is_signed_power_dtype(a_dtype)) {
+      os << "  if (exp < " << type_name
+         << "(0)) { out_buf.data[idx + pc.out_offset] = " << type_name
+         << "(0); return; }\n";
+    }
+    os << "  " << type_name << " res = " << type_name << "(1);\n";
+    os << "  while (exp != " << type_name << "(0)) {\n";
+    os << "    if ((exp & " << type_name << "(1)) != " << type_name
+       << "(0)) res *= base;\n";
+    os << "    exp >>= " << type_name << "(1);\n";
+    os << "    base *= base;\n";
+    os << "  }\n";
+    os << "  out_buf.data[idx + pc.out_offset] = res;\n";
+  } else {
+    os << "  float lhs = " << power_input_expr(a_dtype, "a_buf", "a_idx")
+       << ";\n";
+    os << "  float rhs = " << power_input_expr(b_dtype, "b_buf", "b_idx")
+       << ";\n";
+    os << "  out_buf.data[idx + pc.out_offset] = "
+       << power_output_expr(out_dtype, "pow(lhs, rhs)") << ";\n";
+  }
   os << "}\n";
   return os.str();
 }
@@ -486,7 +580,8 @@ bool try_eval_equal_vulkan(
     b = collapse_compare_leading_dims(b, s);
   }
 
-  const bool staged_output = flatten_rank || !is_supported_elementwise_layout(out);
+  const bool staged_output =
+      flatten_rank || !is_supported_elementwise_layout(out);
   array out_work = staged_output
       ? array(
             flatten_rank ? Shape{static_cast<ShapeElem>(out.size())}
@@ -513,7 +608,8 @@ bool try_eval_equal_vulkan(
   if (out_work.size() == 0) {
     if (staged_output) {
       if (flatten_rank) {
-        out.copy_shared_buffer(out_work, out.strides(), out.flags(), out.size());
+        out.copy_shared_buffer(
+            out_work, out.strides(), out.flags(), out.size());
       } else {
         copy_gpu(out_work, out, CopyType::General, s);
       }
@@ -643,7 +739,8 @@ bool try_eval_compare_vulkan(
     b = collapse_compare_leading_dims(b, s);
   }
 
-  const bool staged_output = flatten_rank || !is_supported_elementwise_layout(out);
+  const bool staged_output =
+      flatten_rank || !is_supported_elementwise_layout(out);
   array out_work = staged_output
       ? array(
             flatten_rank ? Shape{static_cast<ShapeElem>(out.size())}
@@ -670,7 +767,8 @@ bool try_eval_compare_vulkan(
   if (out_work.size() == 0) {
     if (staged_output) {
       if (flatten_rank) {
-        out.copy_shared_buffer(out_work, out.strides(), out.flags(), out.size());
+        out.copy_shared_buffer(
+            out_work, out.strides(), out.flags(), out.size());
       } else {
         copy_gpu(out_work, out, CopyType::General, s);
       }
@@ -744,252 +842,24 @@ bool try_eval_power_vulkan(
   array a = inputs[0];
   array b = inputs[1];
   auto is_supported_dtype = [](Dtype dtype) {
-    return dtype == float16 || dtype == float32 || dtype == bfloat16;
-  };
-  auto scalar_float_value = [&](const array& arr) -> std::optional<double> {
-    array scalar = arr;
-    if (arr.size() != 1) {
-      if (arr.data_size() != 1) {
-        return std::nullopt;
-      }
-      scalar = slice(arr, Shape(arr.ndim(), 0), Shape(arr.ndim(), 1), s);
-    }
-    if (!ensure_vulkan_buffer_power(scalar, s)) {
-      return std::nullopt;
-    }
-    scalar.wait();
-    switch (scalar.dtype()) {
-      case float16:
-        return static_cast<double>(scalar.item<float16_t>());
-      case float32:
-        return static_cast<double>(scalar.item<float>());
-      case bfloat16:
-        return static_cast<double>(scalar.item<bfloat16_t>());
-      default:
-        return std::nullopt;
-    }
-  };
-  auto is_supported_integral_power_dtype = [](Dtype dtype) {
-    return dtype == bool_ || dtype == int32 || dtype == uint32 || dtype == int64 ||
-        dtype == uint64;
-  };
-  auto scalar_integral_value = [&](const array& arr) -> std::optional<int64_t> {
-    array scalar = arr;
-    if (arr.size() != 1) {
-      if (arr.data_size() != 1) {
-        return std::nullopt;
-      }
-      scalar = slice(arr, Shape(arr.ndim(), 0), Shape(arr.ndim(), 1), s);
-    }
-    scalar.eval();
-    switch (scalar.dtype()) {
-      case bool_:
-        return static_cast<int64_t>(scalar.item<bool>());
-      case int32:
-        return static_cast<int64_t>(scalar.item<int32_t>());
-      case uint32:
-        return static_cast<int64_t>(scalar.item<uint32_t>());
-      case int64:
-        return scalar.item<int64_t>();
-      case uint64: {
-        auto value = scalar.item<uint64_t>();
-        if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-          return std::nullopt;
-        }
-        return static_cast<int64_t>(value);
-      }
-      default:
-        return std::nullopt;
-    }
+    return dtype == float16 || dtype == float32 || dtype == bfloat16 ||
+        dtype == complex64 || is_integral_power_dtype(dtype);
   };
 
-  if (a.size() == 1 && b.size() == 1 && out.size() == 1 &&
-      a.dtype() == b.dtype() && a.dtype() == out.dtype()) {
-    if (is_supported_dtype(a.dtype()) && b.has_primitive()) {
-      double base = 0.0;
-      switch (a.dtype()) {
-        case float16:
-          base = static_cast<double>(a.item<float16_t>());
-          break;
-        case bfloat16:
-          base = static_cast<double>(a.item<bfloat16_t>());
-          break;
-        case float32:
-          base = static_cast<double>(a.item<float>());
-          break;
-        default:
-          break;
-      }
-      if (base > 0.0) {
-        auto result = exp(multiply(log(a, s), b, s), s);
-        copy_gpu(result, out, CopyType::General, s);
-        return true;
-      }
-    }
-
-    auto integer_power = [](auto base, auto exp) {
-      using T = decltype(base);
-      T res = 1;
-      if constexpr (std::is_signed_v<T>) {
-        if (exp < 0) {
-          return T(0);
-        }
-      }
-      while (exp) {
-        if (exp & 1) {
-          res *= base;
-        }
-        exp >>= 1;
-        base *= base;
-      }
-      return res;
-    };
-
-    switch (a.dtype()) {
-      case bool_: {
-        auto result = integer_power(a.item<bool>(), b.item<bool>());
-        copy_gpu(array(result, bool_), out, CopyType::General, s);
-        return true;
-      }
-      case int32: {
-        auto result = integer_power(a.item<int32_t>(), b.item<int32_t>());
-        copy_gpu(array(result, int32), out, CopyType::General, s);
-        return true;
-      }
-      case uint32: {
-        auto result = integer_power(a.item<uint32_t>(), b.item<uint32_t>());
-        copy_gpu(array(result, uint32), out, CopyType::General, s);
-        return true;
-      }
-      case int64: {
-        auto result = integer_power(a.item<int64_t>(), b.item<int64_t>());
-        copy_gpu(array(result, int64), out, CopyType::General, s);
-        return true;
-      }
-      case uint64: {
-        auto result = integer_power(a.item<uint64_t>(), b.item<uint64_t>());
-        copy_gpu(array(result, uint64), out, CopyType::General, s);
-        return true;
-      }
-      case complex64: {
-        auto result = std::pow(a.item<complex64_t>(), b.item<complex64_t>());
-        copy_gpu(array(result, complex64), out, CopyType::General, s);
-        return true;
-      }
-      default:
-        break;
-    }
-
-    if (is_supported_dtype(a.dtype())) {
-      array b_norm = add(b, array(0.0f, b.dtype()), s);
-      auto base = scalar_float_value(a);
-      auto exp = scalar_float_value(b_norm);
-      if (base.has_value() && exp.has_value()) {
-        double result = 0.0;
-        if (std::isfinite(*exp) && *exp >= 0.0 && std::floor(*exp) == *exp) {
-          uint64_t n = static_cast<uint64_t>(*exp);
-          double factor = *base;
-          result = 1.0;
-          while (n > 0) {
-            if (n & 1u) {
-              result *= factor;
-            }
-            n >>= 1;
-            if (n > 0) {
-              factor *= factor;
-            }
-          }
-        } else {
-          result = std::pow(*base, *exp);
-        }
-        copy_gpu(array(static_cast<float>(result), out.dtype()), out, CopyType::General, s);
-        return true;
-      }
-    }
+  const bool uses_integral_power = is_integral_power_dtype(a.dtype()) ||
+      is_integral_power_dtype(b.dtype()) ||
+      is_integral_power_dtype(out.dtype());
+  if (uses_integral_power &&
+      (a.dtype() != b.dtype() || a.dtype() != out.dtype() ||
+       !is_integral_power_dtype(a.dtype()))) {
+    return false;
   }
-
-  if (is_supported_dtype(a.dtype()) && is_supported_dtype(b.dtype()) &&
-      is_supported_dtype(out.dtype()) && a.dtype() == out.dtype()) {
-    auto scalar_exp = scalar_float_value(b);
-    if (scalar_exp.has_value() && std::isfinite(*scalar_exp) && *scalar_exp >= 0.0 &&
-        std::floor(*scalar_exp) == *scalar_exp) {
-      uint64_t exp = static_cast<uint64_t>(*scalar_exp);
-      if (exp == 0) {
-        copy_gpu(array(1.0f, out.dtype()), out, CopyType::Scalar, s);
-        return true;
-      }
-
-      array base = a;
-      if (base.shape() != out.shape()) {
-        if (broadcast_shapes(base.shape(), out.shape()) != out.shape()) {
-          return false;
-        }
-        array view(out.shape(), base.dtype(), nullptr, {});
-        broadcast(base, view);
-        base = view;
-      }
-
-      array result = base;
-      uint64_t remaining = exp - 1;
-      array factor = base;
-      while (remaining > 0) {
-        if (remaining & 1u) {
-          result = multiply(result, factor, s);
-        }
-        remaining >>= 1;
-        if (remaining > 0) {
-          factor = multiply(factor, factor, s);
-        }
-      }
-      copy_gpu(result, out, CopyType::General, s);
-      return true;
-    }
-  }
-
-  if (is_supported_integral_power_dtype(a.dtype()) && a.dtype() == b.dtype() &&
-      a.dtype() == out.dtype()) {
-    auto scalar_exp = scalar_integral_value(b);
-    if (scalar_exp.has_value()) {
-      if (*scalar_exp < 0) {
-        copy_gpu(zeros(out.shape(), out.dtype(), s), out, CopyType::General, s);
-        return true;
-      }
-
-      uint64_t exp = static_cast<uint64_t>(*scalar_exp);
-      if (exp == 0) {
-        copy_gpu(
-            full(out.shape(), array(1, out.dtype()), out.dtype(), s),
-            out,
-            CopyType::General,
-            s);
-        return true;
-      }
-
-      array base = a;
-      if (base.shape() != out.shape()) {
-        if (broadcast_shapes(base.shape(), out.shape()) != out.shape()) {
-          return false;
-        }
-        array view(out.shape(), base.dtype(), nullptr, {});
-        broadcast(base, view);
-        base = view;
-      }
-
-      array result = base;
-      uint64_t remaining = exp - 1;
-      array factor = base;
-      while (remaining > 0) {
-        if (remaining & 1u) {
-          result = multiply(result, factor, s);
-        }
-        remaining >>= 1;
-        if (remaining > 0) {
-          factor = multiply(factor, factor, s);
-        }
-      }
-      copy_gpu(result, out, CopyType::General, s);
-      return true;
-    }
+  const bool uses_complex_power = a.dtype() == complex64 ||
+      b.dtype() == complex64 || out.dtype() == complex64;
+  if (uses_complex_power &&
+      (a.dtype() != complex64 || b.dtype() != complex64 ||
+       out.dtype() != complex64)) {
+    return false;
   }
 
   if (!is_supported_dtype(a.dtype()) || !is_supported_dtype(b.dtype()) ||
@@ -2017,7 +1887,10 @@ void ArgSort::eval_gpu(const std::vector<array>& inputs, array& out) {
 void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   auto result = take_along_axis(
-      inputs[0], argpartition(inputs[0], kth_, axis_, stream()), axis_, stream());
+      inputs[0],
+      argpartition(inputs[0], kth_, axis_, stream()),
+      axis_,
+      stream());
   copy_gpu(result, out, CopyType::General, stream());
 }
 
@@ -2033,7 +1906,6 @@ NYI_OP(BitwiseInvert)
 NYI_OP(Cosh)
 NYI_OP_STATE(GatherMM)
 NYI_OP_STATE(Hadamard)
-NYI_OP(Imag)
 // Linear algebra operations - throw NYI like Metal backend
 NO_GPU_MULTI(LUF)
 NO_GPU_MULTI(QRF)
@@ -2052,8 +1924,9 @@ void LogAddExp::eval_gpu(const std::vector<array>& inputs, array& out) {
   const auto& x = inputs[0];
   const auto& y = inputs[1];
 
-  if (x.dtype() == complex64 && y.dtype() == complex64 && out.dtype() == complex64 &&
-      x.size() == 1 && y.size() == 1 && out.size() == 1) {
+  if (x.dtype() == complex64 && y.dtype() == complex64 &&
+      out.dtype() == complex64 && x.size() == 1 && y.size() == 1 &&
+      out.size() == 1) {
     constexpr float neginf = -std::numeric_limits<float>::infinity();
     const auto xv = x.item<complex64_t>();
     const auto yv = y.item<complex64_t>();
@@ -2072,15 +1945,13 @@ void LogAddExp::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto maxval = maximum(x, y, s);
   auto minval = minimum(x, y, s);
-  auto result = add(
-      maxval,
-      log(
-          add(
-              array(1.0f, maxval.dtype()),
-              exp(subtract(minval, maxval, s), s),
+  auto result =
+      add(maxval,
+          log(add(array(1.0f, maxval.dtype()),
+                  exp(subtract(minval, maxval, s), s),
+                  s),
               s),
-          s),
-      s);
+          s);
   auto any_inf = logical_or(isneginf(minval, s), isposinf(maxval, s), s);
   result = where(any_inf, maxval, result, s);
   copy_gpu(result, out, CopyType::General, s);
@@ -2094,7 +1965,18 @@ void Power::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 // QuantizedMatmul and QQMatmul are implemented in quantized.cpp.
 
-NYI_OP(Real)
+void Imag::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!try_eval_complex_component_vulkan(inputs, out, 1)) {
+    throw std::runtime_error("Imag has no Vulkan implementation.");
+  }
+}
+
+void Real::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!try_eval_complex_component_vulkan(inputs, out, 0)) {
+    throw std::runtime_error("Real has no Vulkan implementation.");
+  }
+}
+
 NYI_OP(Sinh)
 NYI_OP_STATE(Sort)
 NYI_OP(Tan)

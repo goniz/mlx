@@ -682,11 +682,8 @@ bool try_eval_divmod_vulkan(
   }
 
   auto ensure_binary_input = [&](array& in) {
-    if (in.data_size() == 1) {
-      if (in.has_primitive()) {
-        ensure_materialized_scalar_input(in);
-      }
-      return true;
+    if (in.data_size() == 1 && in.has_primitive()) {
+      ensure_materialized_scalar_input(in);
     }
     return ensure_vulkan_buffer(in, s);
   };

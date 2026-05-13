@@ -4,6 +4,7 @@
 #include "mlx/backend/vulkan/vulkan.h"
 
 #include <cstring>
+#include <optional>
 #include <vector>
 
 namespace mlx::core {
@@ -15,6 +16,57 @@ array stage_zero_offset_row_contiguous(const array& in, Stream s) {
   staged.set_data(allocator::malloc(staged.nbytes()));
   copy_gpu_inplace(in, staged, CopyType::Vector, s);
   return staged;
+}
+
+std::optional<vulkan::StaticShaderId> integer_reduce_rows_shader(
+    Reduce::ReduceType reduce_type,
+    Dtype in_dtype,
+    Dtype out_dtype) {
+  if (reduce_type == Reduce::Sum) {
+    if (in_dtype == uint8 && out_dtype == uint32) {
+      return vulkan::StaticShaderId::sum_rows_u8_u32;
+    }
+    if (in_dtype == uint16 && out_dtype == uint32) {
+      return vulkan::StaticShaderId::sum_rows_u16_u32;
+    }
+    if (in_dtype == uint32 && out_dtype == uint32) {
+      return vulkan::StaticShaderId::sum_rows_u32;
+    }
+    if (in_dtype == int32 && out_dtype == int32) {
+      return vulkan::StaticShaderId::sum_rows_i32;
+    }
+  }
+  if (reduce_type == Reduce::Prod) {
+    if (in_dtype == uint8 && out_dtype == uint32) {
+      return vulkan::StaticShaderId::prod_rows_u8_u32;
+    }
+    if (in_dtype == uint16 && out_dtype == uint32) {
+      return vulkan::StaticShaderId::prod_rows_u16_u32;
+    }
+    if (in_dtype == uint32 && out_dtype == uint32) {
+      return vulkan::StaticShaderId::prod_rows_u32;
+    }
+    if (in_dtype == int32 && out_dtype == int32) {
+      return vulkan::StaticShaderId::prod_rows_i32;
+    }
+  }
+  if (reduce_type == Reduce::Max) {
+    if (in_dtype == uint32 && out_dtype == uint32) {
+      return vulkan::StaticShaderId::max_rows_u32;
+    }
+    if (in_dtype == int32 && out_dtype == int32) {
+      return vulkan::StaticShaderId::max_rows_i32;
+    }
+  }
+  if (reduce_type == Reduce::Min) {
+    if (in_dtype == uint32 && out_dtype == uint32) {
+      return vulkan::StaticShaderId::min_rows_u32;
+    }
+    if (in_dtype == int32 && out_dtype == int32) {
+      return vulkan::StaticShaderId::min_rows_i32;
+    }
+  }
+  return std::nullopt;
 }
 
 bool try_eval_reduce_sum_rows_vulkan(
@@ -30,8 +82,8 @@ bool try_eval_reduce_sum_rows_vulkan(
   array in = inputs[0];
   const bool sum_reduce = reduce_type == Reduce::Sum;
   const bool prod_reduce = reduce_type == Reduce::Prod;
-  const bool bool_prod =
-      reduce_type == Reduce::Prod && in.dtype() == bool_ && out.dtype() == int32;
+  const bool bool_prod = reduce_type == Reduce::Prod && in.dtype() == bool_ &&
+      out.dtype() == int32;
   const bool max_reduce = reduce_type == Reduce::Max;
   const bool min_reduce = reduce_type == Reduce::Min;
   const bool logic_reduce =
@@ -48,14 +100,12 @@ bool try_eval_reduce_sum_rows_vulkan(
       sum_reduce && in.dtype() == bool_ && out.dtype() == int32;
   const bool bool_io = in.dtype() == bool_ && out.dtype() == bool_;
   const bool bool_min_max = (max_reduce || min_reduce) && bool_io;
-  const bool integer_sum_prod =
-      (sum_reduce || prod_reduce) &&
+  const bool integer_sum_prod = (sum_reduce || prod_reduce) &&
       ((in.dtype() == uint8 && out.dtype() == uint32) ||
        (in.dtype() == uint16 && out.dtype() == uint32) ||
        (in.dtype() == uint32 && out.dtype() == uint32) ||
        (in.dtype() == int32 && out.dtype() == int32));
-  const bool integer_min_max =
-      (max_reduce || min_reduce) &&
+  const bool integer_min_max = (max_reduce || min_reduce) &&
       ((in.dtype() == uint32 && out.dtype() == uint32) ||
        (in.dtype() == int32 && out.dtype() == int32));
   if ((sum_reduce || prod_reduce || max_reduce || min_reduce) && !f32_io &&
@@ -69,8 +119,7 @@ bool try_eval_reduce_sum_rows_vulkan(
 
   const bool use_f32_staging_io =
       (sum_reduce || prod_reduce || max_reduce || min_reduce) &&
-      (f16_io || bf16_io || bool_sum || bool_prod || integer_sum_prod ||
-       integer_min_max);
+      (f16_io || bf16_io || bool_sum || bool_prod);
   const bool use_u8_staging_io = logic_reduce || bool_min_max;
   if (use_f32_staging_io) {
     if (in.offset() > 0xFFFF && in.flags().row_contiguous) {
@@ -94,8 +143,9 @@ bool try_eval_reduce_sum_rows_vulkan(
 
   array reduce_out_target = use_f32_staging_io
       ? array(out.shape(), float32, nullptr, {})
-      : use_u8_staging_io ? array(out.shape(), bool_prod ? int32 : bool_, nullptr, {})
-                          : out;
+      : use_u8_staging_io
+      ? array(out.shape(), bool_prod ? int32 : bool_, nullptr, {})
+      : out;
   if (use_u8_staging_io) {
     reduce_out_target.set_data(allocator::malloc(reduce_out_target.nbytes()));
   }
@@ -138,7 +188,8 @@ bool try_eval_reduce_sum_rows_vulkan(
     normalized_axes = {0, 1, 2, 3};
   }
 
-  const bool staged_full_reduce_output = reduce_out_target.ndim() > 4 && full_reduce;
+  const bool staged_full_reduce_output =
+      reduce_out_target.ndim() > 4 && full_reduce;
   if (staged_full_reduce_output) {
     reduce_out_target =
         array(Shape{1, 1, 1, 1}, reduce_out_target.dtype(), nullptr, {});
@@ -177,9 +228,13 @@ bool try_eval_reduce_sum_rows_vulkan(
       in_kernel = contiguous_copy_gpu(in_kernel, s);
     }
 
+    const auto integer_shader =
+        integer_reduce_rows_shader(reduce_type, in_kernel.dtype(), out.dtype());
+    const auto kernel_out_dtype =
+        integer_shader ? out.dtype() : in_kernel.dtype();
     array kernel_out(
         keepdims_shape_for_axis(in_kernel, in_kernel.ndim() - 1),
-        in_kernel.dtype(),
+        kernel_out_dtype,
         nullptr,
         {});
 
@@ -197,13 +252,13 @@ bool try_eval_reduce_sum_rows_vulkan(
     } else {
       try {
         auto command_buffer = vulkan::begin_command_recording(s.index);
-        const auto shader_id = sum_reduce ? vulkan::StaticShaderId::sum_rows_f32
-            : prod_reduce                ? vulkan::StaticShaderId::prod_rows_f32
-            : bool_min_max               ? (max_reduce
-                                ? vulkan::StaticShaderId::any_rows_u8
-                                : vulkan::StaticShaderId::all_rows_u8)
-            : max_reduce                 ? vulkan::StaticShaderId::max_rows_f32
-            : min_reduce                 ? vulkan::StaticShaderId::min_rows_f32
+        const auto shader_id = integer_shader ? *integer_shader
+            : sum_reduce   ? vulkan::StaticShaderId::sum_rows_f32
+            : prod_reduce  ? vulkan::StaticShaderId::prod_rows_f32
+            : bool_min_max ? (max_reduce ? vulkan::StaticShaderId::any_rows_u8
+                                         : vulkan::StaticShaderId::all_rows_u8)
+            : max_reduce   ? vulkan::StaticShaderId::max_rows_f32
+            : min_reduce   ? vulkan::StaticShaderId::min_rows_f32
             : reduce_type == Reduce::And ? vulkan::StaticShaderId::all_rows_u8
                                          : vulkan::StaticShaderId::any_rows_u8;
         vulkan::dispatch_sum_rows_op(

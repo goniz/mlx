@@ -217,6 +217,9 @@ std::string cast_expr_for_dtype(const std::string& expr, Dtype in, Dtype out) {
     }
     return "vec2(float(" + expr + "), 0.0)";
   }
+  if (in == mlx::core::complex64) {
+    return dtype_to_glsl_storage_type(out) + "(" + expr + ".x)";
+  }
   return dtype_to_glsl_storage_type(out) + "(" + expr + ")";
 }
 

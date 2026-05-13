@@ -29,8 +29,10 @@ bool try_eval_scan_vulkan(
   array in = inputs[0];
   const bool cumsum_i32 =
       reduce_type == Scan::Sum && in.dtype() == int32 && out.dtype() == int32;
+  const bool cumprod_i32 =
+      reduce_type == Scan::Prod && in.dtype() == int32 && out.dtype() == int32;
   const bool scan_f32 = in.dtype() == float32 && out.dtype() == float32;
-  if (in.ndim() == 0 || (!scan_f32 && !cumsum_i32)) {
+  if (in.ndim() == 0 || (!scan_f32 && !cumsum_i32 && !cumprod_i32)) {
     return false;
   }
 
@@ -106,7 +108,8 @@ bool try_eval_scan_vulkan(
         vulkan::dispatch_scan_op(
             scan_input,
             inclusive_out,
-            vulkan::StaticShaderId::cumprod_f32,
+            cumprod_i32 ? vulkan::StaticShaderId::cumprod_i32
+                        : vulkan::StaticShaderId::cumprod_f32,
             command_buffer,
             s,
             reverse,

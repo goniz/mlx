@@ -2893,6 +2893,17 @@ void process_shaders() {
            {"D_TYPE", "float"},
            {"SCAN_OP_PROD", "1"}}));
   string_to_spv(
+      "cumprod_i32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "int"},
+           {"D_TYPE", "int"},
+           {"FLOAT_TYPE", "int"},
+           {"FLOAT_TYPE_VEC2", "ivec2"},
+           {"FLOAT_TYPE_VEC4", "ivec4"},
+           {"SCAN_OP_PROD", "1"}}));
+  string_to_spv(
       "cummax_f32",
       "scan.comp",
       merge_maps(

@@ -2302,17 +2302,17 @@ std::vector<array> FFT::vjp(
             axes,
             fft::FFTNorm::Backward,
             stream()),
-        array(static_cast<float>(n_elements), float32),
+        array(n_elements, in.dtype()),
         stream())};
   } else if (inverse_) {
     return {multiply(
         fft::fftn(cotangents[0], axes, fft::FFTNorm::Backward, stream()),
-        array(static_cast<float>(1.0 / n_elements), complex64),
+        array(1 / n_elements, complex64),
         stream())};
   } else {
     return {multiply(
         fft::ifftn(cotangents[0], axes, fft::FFTNorm::Backward, stream()),
-        array(static_cast<float>(n_elements), complex64),
+        array(n_elements, complex64),
         stream())};
   }
 }
@@ -3951,7 +3951,7 @@ std::vector<array> Reduce::vjp(
           auto p1 = cumprod(x, axis, /*reverse=*/false, /*inclusive=*/false, s);
           auto p2 = cumprod(x, axis, /*reverse=*/true, /*inclusive=*/false, s);
           auto exclusive_prod = multiply(p1, p2, s);
-          return multiply(exclusive_prod, cotan, s);
+          return multiply(conjugate(exclusive_prod, s), cotan, s);
         };
 
     // To compute a numerically stable gradient for prod we need an exclusive

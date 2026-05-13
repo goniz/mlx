@@ -29,8 +29,8 @@ inline bool set_copy_output_data(
     std::function<allocator::Buffer(size_t)> mallocfn = allocator::malloc) {
   if (ctype == CopyType::Vector) {
     // If the input is donateable, we are doing a vector copy and the types
-    // match exactly, then the input buffer can hold the output.
-    if (is_donatable(in, out) && in.dtype() == out.dtype()) {
+    // have the same size, then the input buffer can hold the output.
+    if (is_donatable(in, out)) {
       out.copy_shared_buffer(in);
       return true;
     } else {

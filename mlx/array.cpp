@@ -200,12 +200,6 @@ void array::copy_shared_buffer(
   array_desc_->data_size = data_size;
   array_desc_->offset =
       sizeof(char) * itemsize() * offset + other.array_desc_->offset;
-  if (!other.has_primitive()) {
-    array_desc_->status = other.array_desc_->status;
-  }
-  if (other.event().valid()) {
-    array_desc_->event = other.event();
-  }
 }
 
 void array::copy_shared_buffer(const array& other) {

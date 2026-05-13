@@ -48,7 +48,8 @@ void main() {
     sum = sumsh[0];
 
     if (p.has_sinks != 0) {
-        sum += FLOAT_TYPE(exp(FLOAT_TYPE(data_c[i02]) - max_val));
+        const FLOAT_TYPE sink_diff = FLOAT_TYPE(data_c[i02]) - max_val;
+        sum += abs(sink_diff) <= FLOAT_TYPE(1e-6f) ? FLOAT_TYPE(1.0f) : FLOAT_TYPE(exp(sink_diff));
     }
 
     FLOAT_TYPE rcpdivisor = 1.0/sum;

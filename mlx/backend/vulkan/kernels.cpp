@@ -390,6 +390,7 @@ enum class KernelSpecId {
   Gather,
   GatherAxis,
   GatherPair,
+  MaskedScatter,
   Rope,
   FlashAttention,
   FlashAttentionSplitKReduce,
@@ -404,6 +405,7 @@ enum class KernelSpecId {
   LayerNormAffine,
   Argsort,
   ArgsortLarge,
+  FFT,
 };
 
 struct KernelSpec {
@@ -429,7 +431,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 36> kKernelSpecs = {
+const std::array<KernelSpec, 38> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -519,6 +521,10 @@ const std::array<KernelSpec, 36> kKernelSpecs = {
         sizeof(GatherPairPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
+        {0, 1, 2},
+        sizeof(MaskedScatterPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
         {0, 1, 2, 3, 4},
         sizeof(RopePushConstants),
         DispatchGridKind::Linear1D),
@@ -574,6 +580,10 @@ const std::array<KernelSpec, 36> kKernelSpecs = {
         {0, 1, 2},
         sizeof(ArgsortPushConstants),
         DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1},
+        sizeof(FFTPushConstants),
+        DispatchGridKind::Linear1D),
 };
 
 size_t kernel_spec_index(KernelSpecId id) {
@@ -740,10 +750,8 @@ GenericPushConstants make_generic_push_constants(
 }
 
 template <typename T>
-ArangePushConstants make_arange_push_constants_t(
-    uint32_t num_elements,
-    double start,
-    double step) {
+ArangePushConstants
+make_arange_push_constants_t(uint32_t num_elements, double start, double step) {
   const T start_t = static_cast<T>(start);
   const T next_t = static_cast<T>(start + step);
   const T step_t = static_cast<T>(next_t - start_t);
@@ -776,10 +784,13 @@ ArangePushConstants make_arange_push_constants(
       return make_arange_push_constants_t<int16_t>(num_elements, start, step);
     case int32:
       return make_arange_push_constants_t<int32_t>(num_elements, start, step);
+    case int64:
+      return make_arange_push_constants_t<int64_t>(num_elements, start, step);
     case float16:
       return make_arange_push_constants_t<float16_t>(num_elements, start, step);
     case bfloat16:
-      return make_arange_push_constants_t<bfloat16_t>(num_elements, start, step);
+      return make_arange_push_constants_t<bfloat16_t>(
+          num_elements, start, step);
     case float32:
       return make_arange_push_constants_t<float>(num_elements, start, step);
     default:
@@ -787,7 +798,9 @@ ArangePushConstants make_arange_push_constants(
   }
 }
 
-ArangePushConstants make_fill_push_constants(uint32_t num_elements, float value) {
+ArangePushConstants make_fill_push_constants(
+    uint32_t num_elements,
+    float value) {
   ArangePushConstants push_constants{};
   push_constants.KX = num_elements;
   push_constants.KY = 1;
@@ -916,7 +929,8 @@ void dispatch_with_spec(
       static_cast<uint32_t>(sizeof(PushConstants)),
       specialization_constants);
 
-  // Prepare descriptor writes (used for both push descriptor and traditional path)
+  // Prepare descriptor writes (used for both push descriptor and traditional
+  // path)
   std::vector<VkDescriptorBufferInfo> descriptor_infos(bound_arrays.size());
   std::vector<VkWriteDescriptorSet> descriptor_writes(bound_arrays.size());
 
@@ -960,12 +974,13 @@ void dispatch_with_spec(
     VkDescriptorSet descriptor_set =
         manager.allocate_descriptor_set(pipeline->descriptor_layout);
     const uint64_t descriptor_epoch = descriptor_epoch_for_stream(s);
-    manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+    manager.defer_descriptor_set_free(
+        s.index, descriptor_epoch, descriptor_set);
     if (trace_descriptor_epochs_enabled()) {
       std::ostringstream oss;
       oss << "defer stream=" << s.index << " epoch=" << descriptor_epoch
-          << " set=0x" << std::hex << reinterpret_cast<uintptr_t>(descriptor_set)
-          << std::dec;
+          << " set=0x" << std::hex
+          << reinterpret_cast<uintptr_t>(descriptor_set) << std::dec;
       trace_descriptor_epochs(oss.str());
     }
 
@@ -2429,7 +2444,7 @@ void dispatch_sum_rows_op(
   const auto push_constants = make_sum_rows_push_constants(in, out, weight);
   const auto row_count = checked_u32(out.size(), "sum_rows output rows");
   const uint32_t block_size = push_constants.n_cols <= 32u ? 32u
-      : push_constants.n_cols <= 64u                      ? 64u
+      : push_constants.n_cols <= 64u                       ? 64u
                                                            : 128u;
 
   const std::array<BoundArray, 2> bound_arrays = {{
@@ -2515,13 +2530,14 @@ void dispatch_argsort_op(
   constexpr uint32_t signed_min_as_u32 = 1u << 31;
   const bool topk_suffix_partition = order > signed_min_as_u32 && ncols == 256u;
   const bool large_sort = ncols > 1024u;
-  const uint32_t large_ncols_padded = large_sort ? next_power_of_two_u32(ncols) : 0u;
+  const uint32_t large_ncols_padded =
+      large_sort ? next_power_of_two_u32(ncols) : 0u;
   const uint32_t ncols_padded = topk_suffix_partition ? 256u
-      : large_sort                              ? large_ncols_padded
-                                                : 1024u;
+      : large_sort                                    ? large_ncols_padded
+                                                      : 1024u;
   const uint32_t ncols_padded_log2 = topk_suffix_partition ? 8u
-      : large_sort                                   ? log2_exact_u32(ncols_padded)
-                                                     : 10u;
+      : large_sort ? log2_exact_u32(ncols_padded)
+                   : 10u;
   ArgsortPushConstants push_constants{};
   push_constants.ncols = ncols;
   push_constants.ncols_padded = ncols_padded;
@@ -2538,7 +2554,11 @@ void dispatch_argsort_op(
 
   if (large_sort) {
     const uint32_t wg_unroll = ncols_padded / 1024u;
-    array tmp({static_cast<int>(nrows), static_cast<int>(ncols_padded), 2}, int32, nullptr, {});
+    array tmp(
+        {static_cast<int>(nrows), static_cast<int>(ncols_padded), 2},
+        int32,
+        nullptr,
+        {});
     tmp.set_data(allocator::malloc(tmp.nbytes()));
 
     const std::array<BoundArray, 3> bound_arrays = {{
@@ -2573,6 +2593,30 @@ void dispatch_argsort_op(
       s,
       grid,
       {ncols_padded, ncols_padded_log2});
+}
+
+void dispatch_fft_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const FFTPushConstants& push_constants,
+    const std::vector<uint32_t>& specialization_constants) {
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::FFT,
+      bound_arrays,
+      push_constants,
+      push_constants.batch_count,
+      cmd_buffer,
+      s,
+      std::array<uint32_t, 3>{push_constants.batch_count, 1, 1},
+      specialization_constants);
 }
 
 void dispatch_softmax_op(
@@ -2971,7 +3015,9 @@ void dispatch_cumsum_op(
     array& out,
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
-    const Stream& s) {
+    const Stream& s,
+    bool reverse,
+    bool inclusive) {
   if (out.size() == 0) {
     return;
   }
@@ -3015,8 +3061,13 @@ void dispatch_cumsum_op(
         cmd_buffer,
         s,
         std::nullopt,
-        {128u, 32u, 4u});
+        {128u, 32u, 4u, reverse ? 1u : 0u, inclusive ? 1u : 0u});
     return;
+  }
+
+  if (reverse || !inclusive) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumsum reverse/exclusive requires single-pass row width.");
   }
 
   const uint64_t tmp_elements_u64 = static_cast<uint64_t>(num_workgroups_x) *
@@ -3080,6 +3131,60 @@ void dispatch_cumsum_op(
       {128u, 32u});
 
   mark_scratch_array_written(s, kCumsumMultipassScratchLane);
+}
+
+void dispatch_scan_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    bool reverse,
+    bool inclusive) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (in.ndim() == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Scan requires input rank >= 1.");
+  }
+
+  const uint32_t row_width =
+      checked_u32(in.shape(in.ndim() - 1), "scan n_cols");
+  if (row_width == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Scan requires non-zero row width.");
+  }
+
+  const uint32_t total_elements = checked_u32(out.size(), "scan elements");
+  if (total_elements % row_width != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Scan elements are not divisible by row width.");
+  }
+  const uint32_t row_count = total_elements / row_width;
+  const uint32_t block_size = 128u;
+  const uint32_t num_workgroups_x = (row_width + block_size - 1) / block_size;
+  if (num_workgroups_x > 1) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Scan multipass is not implemented for this shader.");
+  }
+
+  const auto push_constants = make_sum_rows_push_constants(in, out, 1.0f);
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::SumRows,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s,
+      std::nullopt,
+      {128u, 32u, 4u, reverse ? 1u : 0u, inclusive ? 1u : 0u});
 }
 
 void dispatch_mul_mm_op(
@@ -3210,7 +3315,8 @@ void dispatch_mul_mat_vec_op(
 
   const bool force_single_column_dispatch =
       VulkanContext::get().architecture() == GpuArchitecture::AmdRdna;
-  const uint32_t col_chunk = force_single_column_dispatch ? 1u : kMaxMulMatVecCols;
+  const uint32_t col_chunk =
+      force_single_column_dispatch ? 1u : kMaxMulMatVecCols;
 
   for (uint32_t base_work_group_y = 0; base_work_group_y < batch_rows;
        base_work_group_y += col_chunk) {
@@ -3602,6 +3708,35 @@ void dispatch_scatter_pair_op(
       s);
 }
 
+void dispatch_masked_scatter_op(
+    const array& mask,
+    const array& src,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t src_batch_size,
+    uint32_t mask_batch_size) {
+  MaskedScatterPushConstants push_constants{};
+  push_constants.ne = checked_u32(mask.size(), "masked_scatter elements");
+  push_constants.src_batch_size = src_batch_size;
+  push_constants.mask_batch_size = mask_batch_size;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&mask, "mask"},
+      {&src, "src"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::MaskedScatter,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
+}
+
 void dispatch_rope_op(
     const array& in,
     const array& positions,
@@ -3943,7 +4078,8 @@ DynamicComputeDispatch dispatch_dynamic_compute_begin(
       manager.get_pipeline(shader_name, bindings, push_constant_size);
   auto command_buffer = begin_command_recording(s.index);
 
-  // Prepare descriptor writes (used for both push descriptor and traditional path)
+  // Prepare descriptor writes (used for both push descriptor and traditional
+  // path)
   std::vector<VkDescriptorBufferInfo> infos;
   std::vector<VkWriteDescriptorSet> writes;
   infos.reserve(num_bindings);
@@ -3953,8 +4089,10 @@ DynamicComputeDispatch dispatch_dynamic_compute_begin(
   if (!pipeline->supports_push_descriptor) {
     // Traditional path: allocate descriptor set
     const uint64_t descriptor_epoch = descriptor_epoch_for_stream(s);
-    descriptor_set = manager.allocate_descriptor_set(pipeline->descriptor_layout);
-    manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+    descriptor_set =
+        manager.allocate_descriptor_set(pipeline->descriptor_layout);
+    manager.defer_descriptor_set_free(
+        s.index, descriptor_epoch, descriptor_set);
   }
 
   for (uint32_t i = 0; i < num_bindings; ++i) {

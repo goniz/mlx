@@ -97,6 +97,12 @@ uint64_t score_physical_device(
   return type_score + local_mem_score + queue_topology_score + vendor_score;
 }
 
+template <typename Feature>
+void append_pnext(void**& tail, Feature& feature) {
+  *tail = &feature;
+  tail = reinterpret_cast<void**>(&feature.pNext);
+}
+
 uint32_t find_queue_family(
     const std::vector<vk::QueueFamilyProperties>& queue_families,
     const vk::QueueFlags& required,
@@ -489,6 +495,7 @@ void VulkanContext::init() {
   bool storage_buffer_8bit_supported = false;
   bool scalar_block_layout_supported = false;
   bool shader_bfloat16_supported = false;
+  bool shader_buffer_atomic_float32_supported = false;
   bool subgroup_size_control_supported = false;
   bool subgroup_require_full_support = false;
   uint32_t subgroup_min_size = 0;
@@ -598,6 +605,8 @@ void VulkanContext::init() {
         extensions, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
     const bool has_shader_bfloat16_ext =
         has_device_extension(extensions, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+    const bool has_shader_atomic_float_ext = has_device_extension(
+        extensions, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     const bool has_push_descriptor_ext = has_device_extension(
         extensions, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
@@ -671,7 +680,12 @@ void VulkanContext::init() {
     supported_storage_8bit.pNext = &supported_scalar_block_layout;
     vk::PhysicalDeviceShaderIntegerDotProductFeatures
         supported_shader_integer_dot_product{};
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT supported_shader_atomic_float{};
     supported_scalar_block_layout.pNext = &supported_shader_integer_dot_product;
+    if (has_shader_atomic_float_ext) {
+      supported_shader_atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+      supported_shader_integer_dot_product.pNext = &supported_shader_atomic_float;
+    }
 
     vk::PhysicalDeviceSubgroupSizeControlFeatures
         supported_subgroup_size_control{};
@@ -681,46 +695,21 @@ void VulkanContext::init() {
         supported_cooperative_matrix{};
     vk::PhysicalDeviceShaderBfloat16FeaturesKHR supported_shader_bfloat16{};
 
+    void** supported_feature_tail = has_shader_atomic_float_ext
+        ? reinterpret_cast<void**>(&supported_shader_atomic_float.pNext)
+        : reinterpret_cast<void**>(
+              &supported_shader_integer_dot_product.pNext);
     if (has_subgroup_size_control_ext) {
-      supported_shader_integer_dot_product.pNext =
-          &supported_subgroup_size_control;
-      if (has_pipeline_robustness_ext) {
-        supported_subgroup_size_control.pNext = &supported_pipeline_robustness;
-        if (has_cooperative_matrix_ext) {
-          supported_pipeline_robustness.pNext = &supported_cooperative_matrix;
-          if (has_shader_bfloat16_ext) {
-            supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
-          }
-        } else if (has_shader_bfloat16_ext) {
-          supported_pipeline_robustness.pNext = &supported_shader_bfloat16;
-        }
-      } else if (has_cooperative_matrix_ext) {
-        supported_subgroup_size_control.pNext = &supported_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        supported_shader_integer_dot_product.pNext = &supported_shader_bfloat16;
-      }
-    } else if (has_pipeline_robustness_ext) {
-      supported_shader_integer_dot_product.pNext =
-          &supported_pipeline_robustness;
-      if (has_cooperative_matrix_ext) {
-        supported_pipeline_robustness.pNext = &supported_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        supported_pipeline_robustness.pNext = &supported_shader_bfloat16;
-      }
-    } else if (has_cooperative_matrix_ext) {
-      supported_shader_integer_dot_product.pNext =
-          &supported_cooperative_matrix;
-      if (has_shader_bfloat16_ext) {
-        supported_cooperative_matrix.pNext = &supported_shader_bfloat16;
-      }
-    } else if (has_shader_bfloat16_ext) {
-      supported_shader_integer_dot_product.pNext = &supported_shader_bfloat16;
+      append_pnext(supported_feature_tail, supported_subgroup_size_control);
+    }
+    if (has_pipeline_robustness_ext) {
+      append_pnext(supported_feature_tail, supported_pipeline_robustness);
+    }
+    if (has_cooperative_matrix_ext) {
+      append_pnext(supported_feature_tail, supported_cooperative_matrix);
+    }
+    if (has_shader_bfloat16_ext) {
+      append_pnext(supported_feature_tail, supported_shader_bfloat16);
     }
 
     physical_device.getFeatures2(&supported_features);
@@ -751,6 +740,15 @@ void VulkanContext::init() {
         enabled_shader_integer_dot_product{};
     enabled_scalar_block_layout.pNext = &enabled_shader_integer_dot_product;
 
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT enabled_shader_atomic_float{};
+    enabled_shader_atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+
+    // Link enabled atomic float feature if extension is available
+    if (has_shader_atomic_float_ext) {
+      enabled_shader_integer_dot_product.pNext =
+          &enabled_shader_atomic_float;
+    }
+
     vk::PhysicalDeviceSubgroupSizeControlFeatures
         enabled_subgroup_size_control{};
     vk::PhysicalDevicePipelineRobustnessFeaturesEXT
@@ -759,44 +757,20 @@ void VulkanContext::init() {
     VkPhysicalDeviceCooperativeMatrix2FeaturesNV enabled_cooperative_matrix2{};
     vk::PhysicalDeviceShaderBfloat16FeaturesKHR enabled_shader_bfloat16{};
 
-    // Link enabled feature chain (same pattern as supported features)
+    void** enabled_feature_tail = has_shader_atomic_float_ext
+        ? reinterpret_cast<void**>(&enabled_shader_atomic_float.pNext)
+        : reinterpret_cast<void**>(&enabled_shader_integer_dot_product.pNext);
     if (has_subgroup_size_control_ext) {
-      enabled_shader_integer_dot_product.pNext = &enabled_subgroup_size_control;
-      if (has_pipeline_robustness_ext) {
-        enabled_subgroup_size_control.pNext = &enabled_pipeline_robustness;
-        if (has_cooperative_matrix_ext) {
-          enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
-          if (has_shader_bfloat16_ext) {
-            enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-          }
-        } else if (has_shader_bfloat16_ext) {
-          enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_cooperative_matrix_ext) {
-        enabled_subgroup_size_control.pNext = &enabled_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        enabled_shader_integer_dot_product.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (has_pipeline_robustness_ext) {
-      enabled_shader_integer_dot_product.pNext = &enabled_pipeline_robustness;
-      if (has_cooperative_matrix_ext) {
-        enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
-        if (has_shader_bfloat16_ext) {
-          enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-        }
-      } else if (has_shader_bfloat16_ext) {
-        enabled_pipeline_robustness.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (has_cooperative_matrix_ext) {
-      enabled_shader_integer_dot_product.pNext = &enabled_cooperative_matrix;
-      if (has_shader_bfloat16_ext) {
-        enabled_cooperative_matrix.pNext = &enabled_shader_bfloat16;
-      }
-    } else if (has_shader_bfloat16_ext) {
-      enabled_shader_integer_dot_product.pNext = &enabled_shader_bfloat16;
+      append_pnext(enabled_feature_tail, enabled_subgroup_size_control);
+    }
+    if (has_pipeline_robustness_ext) {
+      append_pnext(enabled_feature_tail, enabled_pipeline_robustness);
+    }
+    if (has_cooperative_matrix_ext) {
+      append_pnext(enabled_feature_tail, enabled_cooperative_matrix);
+    }
+    if (has_shader_bfloat16_ext) {
+      append_pnext(enabled_feature_tail, enabled_shader_bfloat16);
     }
 
     if (supported_vulkan11_features.storageBuffer16BitAccess) {
@@ -825,6 +799,11 @@ void VulkanContext::init() {
         supported_shader_bfloat16.shaderBFloat16Type) {
       enabled_shader_bfloat16.shaderBFloat16Type = VK_TRUE;
       shader_bfloat16_supported = true;
+    }
+    if (has_shader_atomic_float_ext &&
+        supported_shader_atomic_float.shaderBufferFloat32AtomicAdd) {
+      enabled_shader_atomic_float.shaderBufferFloat32AtomicAdd = VK_TRUE;
+      shader_buffer_atomic_float32_supported = true;
     }
     if (has_subgroup_size_control_ext &&
         supported_subgroup_size_control.subgroupSizeControl &&
@@ -958,6 +937,9 @@ void VulkanContext::init() {
     if (shader_bfloat16_supported) {
       device_extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
     }
+    if (shader_buffer_atomic_float32_supported) {
+      device_extensions.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+    }
     if (has_device_extension(extensions, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME)) {
       device_extensions.push_back(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME);
     }
@@ -1025,6 +1007,7 @@ void VulkanContext::init() {
     this->shader_int8_supported_ = shader_int8_supported;
     this->storage_buffer_8bit_supported_ = storage_buffer_8bit_supported;
     this->scalar_block_layout_supported_ = scalar_block_layout_supported;
+    this->shader_buffer_atomic_float32_supported_ = shader_buffer_atomic_float32_supported;
     this->shader_bfloat16_extension_present_ = has_shader_bfloat16_ext;
     this->shader_bfloat16_reported_supported_ = shader_bfloat16_supported;
     this->shader_bfloat16_supported_ = false;

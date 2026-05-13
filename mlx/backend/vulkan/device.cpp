@@ -664,6 +664,7 @@ array make_scratch_view(const array& owner, Shape shape, Dtype dtype) {
 }
 
 struct StreamData {
+  std::thread::id owner_thread_id;
   vk::Semaphore timeline_semaphore;
   std::unique_ptr<SubmissionResources> recording_resources;
   std::vector<std::unique_ptr<SubmissionResources>> available_resources;
@@ -707,6 +708,14 @@ class VulkanDevice {
 
   void ensure_stream(int index) {
     (void)get_stream(index);
+  }
+
+  void validate_stream_thread(Stream s) {
+    auto* stream = get_stream(s.index);
+    if (stream->owner_thread_id != std::this_thread::get_id()) {
+      throw std::runtime_error(
+          "[vulkan] Stream accessed from a different thread than the one that created it.");
+    }
   }
 
   StreamData* get_stream(int index) {
@@ -826,6 +835,7 @@ class VulkanDevice {
   }
 
   void clear_streams() {
+    const auto current_thread = std::this_thread::get_id();
     vk::Device device;
     vk::Queue compute_queue;
     vk::Queue transfer_queue;
@@ -838,7 +848,13 @@ class VulkanDevice {
       has_transfer_queue = ctx.has_separate_transfer_queue();
     } catch (...) {
       std::lock_guard<std::mutex> lock(mutex_);
-      streams_.clear();
+      for (auto it = streams_.begin(); it != streams_.end();) {
+        if (it->second->owner_thread_id == current_thread) {
+          it = streams_.erase(it);
+        } else {
+          ++it;
+        }
+      }
       return;
     }
 
@@ -851,7 +867,12 @@ class VulkanDevice {
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& [_, stream] : streams_) {
+    for (auto it = streams_.begin(); it != streams_.end();) {
+      auto& stream = it->second;
+      if (stream->owner_thread_id != current_thread) {
+        ++it;
+        continue;
+      }
       destroy_submission_resources(device, stream->recording_resources);
       for (auto& resources : stream->available_resources) {
         destroy_submission_resources(device, resources);
@@ -865,8 +886,8 @@ class VulkanDevice {
         device.destroySemaphore(stream->timeline_semaphore);
         stream->timeline_semaphore = nullptr;
       }
+      it = streams_.erase(it);
     }
-    streams_.clear();
   }
 
   void synchronize_buffer_for_host_access(VulkanBuffer* buffer) {
@@ -919,8 +940,8 @@ class VulkanDevice {
     wait_info.pSemaphores = &wait_semaphore;
     wait_info.pValues = &wait_timeline_value;
 
-    auto result = VulkanContext::get().device().waitSemaphores(
-        wait_info, UINT64_MAX);
+    auto result =
+        VulkanContext::get().device().waitSemaphores(wait_info, UINT64_MAX);
     if (result != vk::Result::eSuccess) {
       throw_if_vk_error(
           static_cast<VkResult>(result),
@@ -1101,7 +1122,7 @@ class VulkanDevice {
     if (arr.size() == 0) {
       return 0;
     }
-    return static_cast<uint64_t>(arr.data_size()) *
+    return static_cast<uint64_t>(arr.size()) *
         static_cast<uint64_t>(size_of(arr.dtype()));
   }
 
@@ -1617,7 +1638,7 @@ class VulkanDevice {
 
     for (const auto& arr : arrays) {
       auto data = arr.data_shared_ptr();
-      if (!data || arr.data_size() == 0) {
+      if (!data || arr.size() == 0) {
         continue;
       }
 
@@ -1637,6 +1658,8 @@ class VulkanDevice {
       }
 
       const uint64_t begin = static_cast<uint64_t>(offset_bytes);
+      // Use data_size() (storage span) instead of size() (logical elements)
+      // so that non-contiguous views correctly report their full byte range.
       const uint64_t size_bytes =
           static_cast<uint64_t>(arr.data_size()) * item_size;
       const uint64_t buffer_size = static_cast<uint64_t>(storage->size);
@@ -1717,7 +1740,7 @@ class VulkanDevice {
     }
 
     const uint64_t bytes =
-        static_cast<uint64_t>(arr.data_size()) * size_of(arr.dtype());
+        static_cast<uint64_t>(arr.size()) * size_of(arr.dtype());
     const uint64_t offset =
         arr.offset() < 0 ? 0ull : static_cast<uint64_t>(arr.offset());
     if (offset > 0 || (bytes > 0 && bytes < buffer->size)) {
@@ -2010,6 +2033,7 @@ class VulkanDevice {
   std::unique_ptr<StreamData> create_stream(int index) {
     auto stream = std::make_unique<StreamData>();
     stream->stream_index = index;
+    stream->owner_thread_id = std::this_thread::get_id();
 
     vk::SemaphoreTypeCreateInfo timeline_ci;
     timeline_ci.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
@@ -2382,6 +2406,7 @@ void new_stream(Stream s) {
 }
 
 void synchronize(Stream s) {
+  mlx::core::vulkan::validate_stream_thread(s);
   mlx::core::vulkan::VulkanDevice::get().synchronize(s);
 }
 
@@ -2423,6 +2448,10 @@ void end_transfer_command_recording(int stream_index) {
 
 bool deferred_submission_active() {
   return deferred_submission_enabled();
+}
+
+void validate_stream_thread(Stream s) {
+  VulkanDevice::get().validate_stream_thread(s);
 }
 
 void retain_array_for_stream(const Stream& s, const array& arr) {

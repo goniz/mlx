@@ -20,7 +20,15 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03);
 
-        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) / FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+        precise FLOAT_TYPE x = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]);
+        precise FLOAT_TYPE y = FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
+        precise FLOAT_TYPE result = x / y;
+#if REFINE_DIV
+        if (y != FLOAT_TYPE(0.0) && !isnan(result) && !isinf(result)) {
+        result += (x - result * y) / y;
+        }
+#endif
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(result);
 
         idx += num_threads;
     }

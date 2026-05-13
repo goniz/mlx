@@ -41,6 +41,53 @@ constexpr char kFlashAttnQCastScratchLane[] = "flash_attn.q_cast";
 constexpr char kFlashAttnKCastScratchLane[] = "flash_attn.k_cast";
 constexpr char kFlashAttnVCastScratchLane[] = "flash_attn.v_cast";
 
+bool needs_host_row_contiguous(const array& arr) {
+  return !arr.flags().row_contiguous || arr.offset() != 0;
+}
+
+array ensure_host_readable_row_contiguous(array arr, Stream s) {
+  if (needs_host_row_contiguous(arr) || arr.has_primitive()) {
+    arr = contiguous_copy_gpu(arr, s);
+  }
+  arr.wait();
+  return arr;
+}
+
+template <typename T>
+T bit_cast_scalar(const auto& value) {
+  return std::bit_cast<T>(value);
+}
+
+uint8_t to_fp8_e4m3_scalar(float x) {
+  constexpr uint32_t fp8_max = 543u << 21;
+  constexpr uint32_t denorm_mask = 141u << 23;
+  uint32_t f_bits = bit_cast_scalar<uint32_t>(x);
+  uint32_t sign = f_bits & 0x80000000u;
+  f_bits ^= sign;
+
+  uint32_t f_bits_low = bit_cast_scalar<uint32_t>(
+      bit_cast_scalar<float>(f_bits) + bit_cast_scalar<float>(denorm_mask));
+  uint8_t result_low = static_cast<uint8_t>(f_bits_low - denorm_mask);
+
+  uint8_t mant_odd = static_cast<uint8_t>((f_bits >> 20) & 1u);
+  uint32_t f_bits_high = f_bits + (((7u - 127u) << 23) + 0x7FFFFu);
+  f_bits_high += mant_odd;
+  uint8_t result_high = static_cast<uint8_t>(f_bits_high >> 20);
+
+  uint8_t result = f_bits < (121u << 23) ? result_low : result_high;
+  if (f_bits >= fp8_max) {
+    result = 0x7E;
+  }
+  return result | static_cast<uint8_t>(sign >> 24);
+}
+
+float from_fp8_e4m3_scalar(uint8_t x) {
+  uint16_t bits = static_cast<uint16_t>(x & 127u) << 7;
+  float16_t half = bit_cast_scalar<float16_t>(bits);
+  float out = static_cast<float>(half) * 256.0f;
+  return (x & 128u) ? -out : out;
+}
+
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
 array ensure_sdpa_rowwise_layout(array arr, Stream s);
 
@@ -2422,7 +2469,73 @@ void RMSNormVJP::eval_gpu(
 void ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("ConvertFP8 has no Vulkan implementation.");
+  if (inputs.size() != 1 || outputs.size() != 1) {
+    throw std::runtime_error("[ConvertFP8::eval_gpu] Expected one input and one output.");
+  }
+
+  auto in = ensure_host_readable_row_contiguous(inputs[0], stream());
+  auto& out = outputs[0];
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (to_fp8_) {
+    auto* dst = out.data<uint8_t>();
+    switch (in.dtype()) {
+      case float16: {
+        auto* src = in.data<float16_t>();
+        for (int i = 0; i < in.size(); ++i) {
+          dst[i] = to_fp8_e4m3_scalar(static_cast<float>(src[i]));
+        }
+        return;
+      }
+      case bfloat16: {
+        auto* src = in.data<bfloat16_t>();
+        for (int i = 0; i < in.size(); ++i) {
+          dst[i] = to_fp8_e4m3_scalar(static_cast<float>(src[i]));
+        }
+        return;
+      }
+      case float32: {
+        auto* src = in.data<float>();
+        for (int i = 0; i < in.size(); ++i) {
+          dst[i] = to_fp8_e4m3_scalar(src[i]);
+        }
+        return;
+      }
+      default:
+        throw std::runtime_error("[ConvertFP8::eval_gpu] Unsupported input dtype.");
+    }
+  }
+
+  auto* src = in.data<uint8_t>();
+  switch (out.dtype()) {
+    case float16: {
+      auto* dst = out.data<float16_t>();
+      for (int i = 0; i < in.size(); ++i) {
+        dst[i] = float16_t(from_fp8_e4m3_scalar(src[i]));
+      }
+      return;
+    }
+    case bfloat16: {
+      auto* dst = out.data<bfloat16_t>();
+      for (int i = 0; i < in.size(); ++i) {
+        dst[i] = bfloat16_t(from_fp8_e4m3_scalar(src[i]));
+      }
+      return;
+    }
+    case float32: {
+      auto* dst = out.data<float>();
+      for (int i = 0; i < in.size(); ++i) {
+        dst[i] = from_fp8_e4m3_scalar(src[i]);
+      }
+      return;
+    }
+    default:
+      throw std::runtime_error("[ConvertFP8::eval_gpu] Unsupported output dtype.");
+  }
 }
 
 void Quantize::eval_gpu(

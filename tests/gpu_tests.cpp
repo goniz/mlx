@@ -275,6 +275,7 @@ TEST_CASE("test gpu binary ops") {
     CHECK(array_equal(out, array({2, 4, 6}), Device::cpu).item<bool>());
   }
 
+
   // Check division
   {
     auto x = array(1.0f);
@@ -380,6 +381,7 @@ TEST_CASE("test gpu unary ops") {
     expected = array({1.0f, 1.0f, 3.0f, 3.0f});
     CHECK(array_equal(abs(y, Device::gpu), expected, Device::cpu).item<bool>());
   }
+
 
   // Test negative
   {

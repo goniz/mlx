@@ -1326,8 +1326,126 @@ void process_shaders() {
   indexing_shaders("gather_pair", "gather_pair.comp");
   indexing_shaders("gather_axis", "gather_axis.comp");
   indexing_shaders("scatter_take", "scatter_take.comp");
+  // scatter_sum_take: f32, i32, u32 use atomicAdd with VALUE_TYPE
+  // parameterization
+  auto scatter_sum_take_shaders =
+      [&](const std::string& value_tag,
+          const std::string& value_type,
+          const std::string& shader,
+          const std::map<std::string, std::string>& extra_value_defines) {
+        auto add_variant =
+            [&](const std::string& index_tag,
+                const std::map<std::string, std::string>& extra_index_defines) {
+              auto defines = merge_maps(
+                  {{"VALUE_TYPE", value_type}}, extra_value_defines);
+              defines =
+                  merge_maps(defines, extra_index_defines);
+              string_to_spv(
+                  "scatter_sum_take_" + value_tag + "_" + index_tag,
+                  shader,
+                  defines);
+            };
+        add_variant("i32", {});
+        add_variant("i64", {{"INDEX_IS_I64", "1"}});
+        add_variant("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+        add_variant("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+      };
+
+  scatter_sum_take_shaders("f32", "float", "scatter_sum_take.comp", {{"VALUE_IS_FLOAT", "1"}});
+  scatter_sum_take_shaders("i32", "int", "scatter_sum_take.comp", {{"VALUE_IS_INT", "1"}});
+  scatter_sum_take_shaders("u32", "uint", "scatter_sum_take.comp", {{"VALUE_IS_UINT", "1"}});
+
+  // scatter_sum_take: f16 uses CAS loop on packed uint
+  auto scatter_sum_take_f16_shaders = [&](const std::string& index_tag,
+                                          const std::map<std::string, std::string>& index_defines) {
+    string_to_spv(
+        "scatter_sum_take_f16_" + index_tag,
+        "scatter_sum_take_f16.comp",
+        merge_maps({{"VALUE_IS_F16", "1"}}, index_defines));
+  };
+  scatter_sum_take_f16_shaders("i32", {});
+  scatter_sum_take_f16_shaders("i64", {{"INDEX_IS_I64", "1"}});
+  scatter_sum_take_f16_shaders("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+  scatter_sum_take_f16_shaders("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+
+  // scatter_sum_take: bf16 uses CAS loop on packed uint with bf16<->f32 conversion
+  auto scatter_sum_take_bf16_shaders = [&](const std::string& index_tag,
+                                            const std::map<std::string, std::string>& index_defines) {
+    string_to_spv(
+        "scatter_sum_take_bf16_" + index_tag,
+        "scatter_sum_take_bf16.comp",
+        merge_maps({{"VALUE_IS_BF16", "1"}}, index_defines));
+  };
+  scatter_sum_take_bf16_shaders("i32", {});
+  scatter_sum_take_bf16_shaders("i64", {{"INDEX_IS_I64", "1"}});
+  scatter_sum_take_bf16_shaders("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+  scatter_sum_take_bf16_shaders("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+
+  auto scatter_sum_pair_shaders =
+      [&](const std::string& value_tag,
+          const std::string& value_type,
+          const std::string& shader,
+          const std::map<std::string, std::string>& extra_value_defines) {
+        auto add_variant =
+            [&](const std::string& index_tag,
+                const std::map<std::string, std::string>& extra_index_defines) {
+              auto defines = merge_maps(
+                  {{"VALUE_TYPE", value_type}}, extra_value_defines);
+              defines = merge_maps(defines, extra_index_defines);
+              string_to_spv(
+                  "scatter_sum_pair_" + value_tag + "_" + index_tag,
+                  shader,
+                  defines);
+            };
+        add_variant("i32", {});
+        add_variant("i64", {{"INDEX_IS_I64", "1"}});
+        add_variant("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+        add_variant("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+      };
+
+  scatter_sum_pair_shaders("f32", "float", "scatter_sum_pair.comp", {{"VALUE_IS_FLOAT", "1"}});
+  scatter_sum_pair_shaders("i32", "int", "scatter_sum_pair.comp", {{"VALUE_IS_INT", "1"}});
+  scatter_sum_pair_shaders("u32", "uint", "scatter_sum_pair.comp", {{"VALUE_IS_UINT", "1"}});
+
+  auto scatter_sum_pair_f16_shaders = [&](const std::string& index_tag,
+                                           const std::map<std::string, std::string>& index_defines) {
+    string_to_spv(
+        "scatter_sum_pair_f16_" + index_tag,
+        "scatter_sum_pair_f16.comp",
+        merge_maps({{"VALUE_IS_F16", "1"}}, index_defines));
+  };
+  scatter_sum_pair_f16_shaders("i32", {});
+  scatter_sum_pair_f16_shaders("i64", {{"INDEX_IS_I64", "1"}});
+  scatter_sum_pair_f16_shaders("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+  scatter_sum_pair_f16_shaders("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+
+  auto scatter_sum_pair_bf16_shaders = [&](const std::string& index_tag,
+                                            const std::map<std::string, std::string>& index_defines) {
+    string_to_spv(
+        "scatter_sum_pair_bf16_" + index_tag,
+        "scatter_sum_pair_bf16.comp",
+        merge_maps({{"VALUE_IS_BF16", "1"}}, index_defines));
+  };
+  scatter_sum_pair_bf16_shaders("i32", {});
+  scatter_sum_pair_bf16_shaders("i64", {{"INDEX_IS_I64", "1"}});
+  scatter_sum_pair_bf16_shaders("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+  scatter_sum_pair_bf16_shaders("u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+
   indexing_shaders("scatter_pair", "scatter_pair.comp");
   indexing_shaders("scatter_axis", "scatter_axis.comp");
+
+  auto masked_scatter_shader = [&](const std::string& value_tag,
+                                   const std::string& value_type) {
+    string_to_spv(
+        "masked_scatter_" + value_tag,
+        "masked_scatter.comp",
+        {{"VALUE_TYPE", value_type}});
+  };
+  masked_scatter_shader("f32", "float");
+  masked_scatter_shader("f16", "float16_t");
+  masked_scatter_shader("bf16", "uint16_t");
+  masked_scatter_shader("i32", "int");
+  masked_scatter_shader("u32", "uint");
 
   string_to_spv(
       "mul_mat_vec_p021_f16_f32_subgroup_add",
@@ -1763,6 +1881,7 @@ void process_shaders() {
             defs.insert({
                 {"FLOAT_TYPE", "float"},
                 {"NAN_GUARD", (op == "minimum" || op == "maximum") ? "1" : "0"},
+                {"REFINE_DIV", op == "div" ? "1" : "0"},
                 {"RTE16", rte ? "1" : "0"},
                 {"ADD_RMS", add_rms},
             });
@@ -1797,6 +1916,7 @@ void process_shaders() {
            {"D_TYPE", t},
            {"FLOAT_TYPE", t},
            {"NAN_GUARD", "0"},
+           {"REFINE_DIV", "0"},
            {"RTE16", "0"},
            {"ADD_RMS", "0"}});
     }
@@ -2040,11 +2160,23 @@ void process_shaders() {
       "square_c64.comp",
       {{"A_TYPE", "vec2"}, {"D_TYPE", "vec2"}, {"FLOAT_TYPE", "vec2"}});
   string_to_spv(
+      "conj_c64",
+      "conj_c64.comp",
+      {{"A_TYPE", "vec2"}, {"D_TYPE", "vec2"}, {"FLOAT_TYPE", "vec2"}});
+  string_to_spv(
+      "neg_c64",
+      "neg_c64.comp",
+      {{"A_TYPE", "vec2"}, {"D_TYPE", "vec2"}, {"FLOAT_TYPE", "vec2"}});
+  string_to_spv(
       "sqr_f16",
       "square.comp",
       {{"A_TYPE", "float16_t"},
        {"D_TYPE", "float16_t"},
        {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "sqr_i32",
+      "square.comp",
+      {{"A_TYPE", "int"}, {"D_TYPE", "int"}, {"FLOAT_TYPE", "int"}});
 
   string_to_spv(
       "sqrt_f32",
@@ -2171,6 +2303,8 @@ void process_shaders() {
         {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"RTE16", rte ? "1" : "0"}});
   }
   string_to_spv(
+      "log1p_f32", "log1p.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
       "gelu_f16",
       "gelu.comp",
       {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
@@ -2211,6 +2345,16 @@ void process_shaders() {
   string_to_spv(
       "neg_f32", "neg.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
   string_to_spv(
+      "neg_i32", "neg_int.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
+  string_to_spv(
+      "neg_u32",
+      "neg_int.comp",
+      {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"UNSIGNED_NEGATE", "1"}});
+  string_to_spv(
+      "neg_i64",
+      "neg_int.comp",
+      {{"A_TYPE", "int64_t"}, {"D_TYPE", "int64_t"}});
+  string_to_spv(
       "tanh_f16",
       "tanh.comp",
       {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
@@ -2224,6 +2368,12 @@ void process_shaders() {
       "sigmoid_f32",
       "sigmoid.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "sign_f16",
+      "sign.comp",
+      {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+  string_to_spv(
+      "sign_f32", "sign.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
   string_to_spv(
       "hardsigmoid_f16",
       "hardsigmoid.comp",
@@ -2246,6 +2396,10 @@ void process_shaders() {
       {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
   string_to_spv(
       "abs_f32", "abs.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "abs_i32",
+      "abs.comp",
+      {{"A_TYPE", "int"}, {"D_TYPE", "int"}, {"INT_ABS", "1"}});
   string_to_spv(
       "xielu_f16",
       "xielu.comp",
@@ -2316,6 +2470,10 @@ void process_shaders() {
       "arange_i32",
       "arange_int.comp",
       {{"A_TYPE", "int"}, {"D_TYPE", "int"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "arange_i64",
+      "arange_int.comp",
+      {{"A_TYPE", "int64_t"}, {"D_TYPE", "int64_t"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
       "arange_u32",
       "arange_int.comp",
@@ -2668,6 +2826,7 @@ void process_shaders() {
       "argsort_partition_f32", "argsort_partition.comp", {{"A_TYPE", "float"}});
   string_to_spv(
       "argsort_large_f32", "argsort_large.comp", {{"A_TYPE", "float"}});
+  string_to_spv("fft_c64", "fft.comp", {});
 
   string_to_spv("topk_argsort_f32", "topk_argsort.comp", {{"A_TYPE", "float"}});
   string_to_spv(
@@ -2688,6 +2847,10 @@ void process_shaders() {
       "sum_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv(
+      "prod_rows_f32",
+      "prod_rows.comp",
+      merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv(
       "max_rows_f32",
       "max_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -2705,8 +2868,65 @@ void process_shaders() {
           {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
   string_to_spv(
       "cumsum_f32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_SUM", "1"}}));
+  string_to_spv(
+      "cumsum_i32",
       "cumsum.comp",
-      merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "int"},
+           {"D_TYPE", "int"},
+           {"FLOAT_TYPE", "int"},
+           {"FLOAT_TYPE_VEC2", "ivec2"},
+           {"FLOAT_TYPE_VEC4", "ivec4"}}));
+  string_to_spv(
+      "cumprod_f32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_PROD", "1"}}));
+  string_to_spv(
+      "cumprod_i32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "int"},
+           {"D_TYPE", "int"},
+           {"FLOAT_TYPE", "int"},
+           {"FLOAT_TYPE_VEC2", "ivec2"},
+           {"FLOAT_TYPE_VEC4", "ivec4"},
+           {"SCAN_OP_PROD", "1"}}));
+  string_to_spv(
+      "cummax_f32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_MAX", "1"}}));
+  string_to_spv(
+      "cummin_f32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_MIN", "1"}}));
+  string_to_spv(
+      "cumlogaddexp_f32",
+      "scan.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"},
+           {"D_TYPE", "float"},
+           {"SCAN_OP_LOGADDEXP", "1"}}));
   string_to_spv(
       "cumsum_multipass1_f32",
       "cumsum_multipass1.comp",

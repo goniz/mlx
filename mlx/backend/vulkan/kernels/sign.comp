@@ -17,9 +17,6 @@ void main() {
         return;
     }
 
-#ifdef INT_ABS
-    data_d[i] = D_TYPE(abs(data_a[i]));
-#else
-    data_d[i] = D_TYPE(abs(float(data_a[i])));
-#endif
+    const float x = float(data_a[i]);
+    data_d[i] = D_TYPE((x > 0.0 ? 1.0 : 0.0) - (x < 0.0 ? 1.0 : 0.0));
 }

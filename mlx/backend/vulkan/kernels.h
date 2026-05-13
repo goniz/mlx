@@ -361,6 +361,14 @@ struct ArgsortPushConstants {
   uint32_t inner_end;
 };
 
+struct FFTPushConstants {
+  uint32_t in_offset;
+  uint32_t out_offset;
+  uint32_t batch_count;
+  uint32_t n;
+  uint32_t inverse;
+};
+
 struct DiagMaskInfPushConstants {
   uint32_t ncols;
   uint32_t rows_per_channel;
@@ -528,6 +536,12 @@ struct GatherPairPushConstants {
   uint32_t slice1_size;
   uint32_t inner_size;
   uint32_t index_count;
+};
+
+struct MaskedScatterPushConstants {
+  uint32_t ne;
+  uint32_t src_batch_size;
+  uint32_t mask_batch_size;
 };
 
 struct RopePushConstants {
@@ -748,6 +762,15 @@ void dispatch_argsort_op(
     const Stream& s,
     uint32_t order = 0u);
 
+void dispatch_fft_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const FFTPushConstants& push_constants,
+    const std::vector<uint32_t>& specialization_constants = {});
+
 void dispatch_softmax_op(
     const array& in,
     array& out,
@@ -823,7 +846,18 @@ void dispatch_cumsum_op(
     array& out,
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,
-    const Stream& s);
+    const Stream& s,
+    bool reverse = false,
+    bool inclusive = true);
+
+void dispatch_scan_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    bool reverse,
+    bool inclusive);
 
 void dispatch_mul_mm_op(
     const array& a,
@@ -976,6 +1010,16 @@ void dispatch_scatter_pair_op(
     uint32_t slice1_size,
     uint32_t inner_size,
     uint32_t index_count);
+
+void dispatch_masked_scatter_op(
+    const array& mask,
+    const array& src,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t src_batch_size,
+    uint32_t mask_batch_size);
 
 void dispatch_rope_op(
     const array& in,

@@ -203,6 +203,9 @@ void array::copy_shared_buffer(
   if (!other.has_primitive()) {
     array_desc_->status = other.array_desc_->status;
   }
+  if (other.event().valid()) {
+    array_desc_->event = other.event();
+  }
 }
 
 void array::copy_shared_buffer(const array& other) {

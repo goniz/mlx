@@ -86,6 +86,9 @@ class VulkanContext {
   bool scalar_block_layout_supported() const {
     return scalar_block_layout_supported_;
   }
+  bool shader_buffer_atomic_float32_supported() const {
+    return shader_buffer_atomic_float32_supported_;
+  }
   bool shader_bfloat16_supported() const;
   bool subgroup_size_control_supported() const {
     return subgroup_size_control_supported_;
@@ -187,6 +190,7 @@ class VulkanContext {
   bool coopmat_flash_attention_f32acc_supported_{false};
   bool coopmat2_conv2d_supported_{false};
   bool integer_dot_product_supported_{false};
+  bool shader_buffer_atomic_float32_supported_{false};
   bool push_descriptor_supported_{false};
   PFN_vkCmdPushDescriptorSetKHR push_descriptor_fn_{nullptr};
   uint32_t vendor_id_{0};

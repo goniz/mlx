@@ -254,6 +254,7 @@ std::optional<vulkan::StaticShaderId>
 generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte) {
   MLX_VK_GENERIC_UNARY_CASE(Abs, float32, false, abs_f32);
   MLX_VK_GENERIC_UNARY_CASE(Abs, float16, false, abs_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Abs, int32, false, abs_i32);
   MLX_VK_GENERIC_UNARY_CASE(Ceil, float32, false, ceil_f32);
   MLX_VK_GENERIC_UNARY_CASE(Ceil, float16, false, ceil_f16);
   MLX_VK_GENERIC_UNARY_CASE(Exp, float32, false, exp_f32);
@@ -263,10 +264,16 @@ generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte) {
   MLX_VK_GENERIC_UNARY_CASE(Floor, float16, false, floor_f16);
   MLX_VK_GENERIC_UNARY_CASE(Negative, float32, false, neg_f32);
   MLX_VK_GENERIC_UNARY_CASE(Negative, float16, false, neg_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, int32, false, neg_i32);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, uint32, false, neg_u32);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, int64, false, neg_i64);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, complex64, false, neg_c64);
   MLX_VK_GENERIC_UNARY_CASE(Round, float32, false, round_f32);
   MLX_VK_GENERIC_UNARY_CASE(Round, float16, false, round_f16);
   MLX_VK_GENERIC_UNARY_CASE(Sigmoid, float32, false, sigmoid_f32);
   MLX_VK_GENERIC_UNARY_CASE(Sigmoid, float16, false, sigmoid_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Sign, float32, false, sign_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Sign, float16, false, sign_f16);
   MLX_VK_GENERIC_UNARY_CASE(Tanh, float32, false, tanh_f32);
   MLX_VK_GENERIC_UNARY_CASE(Tanh, float16, false, tanh_f16);
   return std::nullopt;
@@ -282,6 +289,7 @@ generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte) {
 std::optional<vulkan::StaticShaderId> unary_shader_id(
     UnaryShaderOp op,
     Dtype dtype) {
+  MLX_VK_UNARY_CASE(Conjugate, complex64, conj_c64);
   MLX_VK_UNARY_CASE(Cos, float32, cos_f32);
   MLX_VK_UNARY_CASE(Erf, float32, erf_f32);
   MLX_VK_UNARY_CASE(ErfInv, float32, erfinv_f32);
@@ -292,6 +300,7 @@ std::optional<vulkan::StaticShaderId> unary_shader_id(
   MLX_VK_UNARY_CASE(Square, float32, sqr_f32);
   MLX_VK_UNARY_CASE(Square, float16, sqr_f16);
   MLX_VK_UNARY_CASE(Square, bfloat16, sqr_f32);
+  MLX_VK_UNARY_CASE(Square, int32, sqr_i32);
   MLX_VK_UNARY_CASE(Square, complex64, sqr_c64);
   MLX_VK_UNARY_CASE(Sqrt, float32, sqrt_f32);
   MLX_VK_UNARY_CASE(Sqrt, float16, sqrt_f16);
@@ -415,6 +424,32 @@ std::optional<vulkan::StaticShaderId> scatter_shader_id(
   return std::nullopt;
 }
 
+std::optional<vulkan::StaticShaderId> scatter_sum_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, scatter_sum_take_f32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, scatter_sum_take_f32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, scatter_sum_take_f32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, scatter_sum_take_f32_u64);
+  MLX_VK_GATHER_CASE(float16, int32, scatter_sum_take_f16_i32);
+  MLX_VK_GATHER_CASE(float16, int64, scatter_sum_take_f16_i64);
+  MLX_VK_GATHER_CASE(float16, uint32, scatter_sum_take_f16_u32);
+  MLX_VK_GATHER_CASE(float16, uint64, scatter_sum_take_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, int32, scatter_sum_take_bf16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int64, scatter_sum_take_bf16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, scatter_sum_take_bf16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, scatter_sum_take_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, int32, scatter_sum_take_i32_i32);
+  MLX_VK_GATHER_CASE(int32, int64, scatter_sum_take_i32_i64);
+  MLX_VK_GATHER_CASE(int32, uint32, scatter_sum_take_i32_u32);
+  MLX_VK_GATHER_CASE(int32, uint64, scatter_sum_take_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, int32, scatter_sum_take_u32_i32);
+  MLX_VK_GATHER_CASE(uint32, int64, scatter_sum_take_u32_i64);
+  MLX_VK_GATHER_CASE(uint32, uint32, scatter_sum_take_u32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint64, scatter_sum_take_u32_u64);
+  return std::nullopt;
+}
+
 std::optional<vulkan::StaticShaderId> scatter_pair_shader_id(
     Dtype value_dtype,
     Dtype index_dtype) {
@@ -438,6 +473,32 @@ std::optional<vulkan::StaticShaderId> scatter_pair_shader_id(
   MLX_VK_GATHER_CASE(bfloat16, uint64, scatter_pair_bf16_u64);
   MLX_VK_GATHER_CASE(int32, uint64, scatter_pair_i32_u64);
   MLX_VK_GATHER_CASE(uint32, uint64, scatter_pair_u32_u64);
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> scatter_sum_pair_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, scatter_sum_pair_f32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, scatter_sum_pair_f32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, scatter_sum_pair_f32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, scatter_sum_pair_f32_u64);
+  MLX_VK_GATHER_CASE(float16, int32, scatter_sum_pair_f16_i32);
+  MLX_VK_GATHER_CASE(float16, int64, scatter_sum_pair_f16_i64);
+  MLX_VK_GATHER_CASE(float16, uint32, scatter_sum_pair_f16_u32);
+  MLX_VK_GATHER_CASE(float16, uint64, scatter_sum_pair_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, int32, scatter_sum_pair_bf16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int64, scatter_sum_pair_bf16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, scatter_sum_pair_bf16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, scatter_sum_pair_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, int32, scatter_sum_pair_i32_i32);
+  MLX_VK_GATHER_CASE(int32, int64, scatter_sum_pair_i32_i64);
+  MLX_VK_GATHER_CASE(int32, uint32, scatter_sum_pair_i32_u32);
+  MLX_VK_GATHER_CASE(int32, uint64, scatter_sum_pair_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, int32, scatter_sum_pair_u32_i32);
+  MLX_VK_GATHER_CASE(uint32, int64, scatter_sum_pair_u32_i64);
+  MLX_VK_GATHER_CASE(uint32, uint32, scatter_sum_pair_u32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint64, scatter_sum_pair_u32_u64);
   return std::nullopt;
 }
 
@@ -465,6 +526,24 @@ std::optional<vulkan::StaticShaderId> scatter_axis_shader_id(
   MLX_VK_GATHER_CASE(int32, uint64, scatter_axis_i32_u64);
   MLX_VK_GATHER_CASE(uint32, uint64, scatter_axis_u32_u64);
   return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> masked_scatter_shader_id(
+    Dtype value_dtype) {
+  switch (value_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::masked_scatter_f32;
+    case float16:
+      return vulkan::StaticShaderId::masked_scatter_f16;
+    case bfloat16:
+      return vulkan::StaticShaderId::masked_scatter_bf16;
+    case int32:
+      return vulkan::StaticShaderId::masked_scatter_i32;
+    case uint32:
+      return vulkan::StaticShaderId::masked_scatter_u32;
+    default:
+      return std::nullopt;
+  }
 }
 
 #undef MLX_VK_GATHER_CASE

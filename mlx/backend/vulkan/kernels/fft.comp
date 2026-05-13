@@ -1,0 +1,243 @@
+#version 450
+
+layout(constant_id = 0) const uint RADIX_13_STEPS = 0;
+layout(constant_id = 1) const uint RADIX_11_STEPS = 0;
+layout(constant_id = 2) const uint RADIX_8_STEPS = 0;
+layout(constant_id = 3) const uint RADIX_7_STEPS = 0;
+layout(constant_id = 4) const uint RADIX_6_STEPS = 0;
+layout(constant_id = 5) const uint RADIX_5_STEPS = 0;
+layout(constant_id = 6) const uint RADIX_4_STEPS = 0;
+layout(constant_id = 7) const uint RADIX_3_STEPS = 0;
+layout(constant_id = 8) const uint RADIX_2_STEPS = 0;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+  uint in_offset;
+  uint out_offset;
+  uint batch_count;
+  uint n;
+  uint inverse;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Input { vec2 data[]; } in_buf;
+layout(set = 0, binding = 1) buffer Output { vec2 data[]; } out_buf;
+
+shared vec2 shared_buf[4096];
+
+vec2 complex_mul(vec2 a, vec2 b) {
+  return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+vec2 complex_conj(vec2 x) {
+  return vec2(x.x, -x.y);
+}
+
+vec2 get_twiddle(uint k, uint p) {
+  float theta = -6.2831853071795864769 * float(k) / float(p);
+  return vec2(cos(theta), sin(theta));
+}
+
+void radix2(inout vec2 x0, inout vec2 x1) {
+  vec2 a = x0 + x1;
+  vec2 b = x0 - x1;
+  x0 = a;
+  x1 = b;
+}
+
+void radix3(vec2 x[3], out vec2 y[3]) {
+  const float pi_2_3 = -0.8660254037844387;
+  vec2 a1 = x[1] + x[2];
+  vec2 a2 = x[1] - x[2];
+  y[0] = x[0] + a1;
+  vec2 b1 = x[0] - 0.5 * a1;
+  vec2 b2 = pi_2_3 * a2;
+  vec2 b2j = vec2(-b2.y, b2.x);
+  y[1] = b1 + b2j;
+  y[2] = b1 - b2j;
+}
+
+void radix4(vec2 x[4], out vec2 y[4]) {
+  vec2 z0 = x[0] + x[2];
+  vec2 z1 = x[0] - x[2];
+  vec2 z2 = x[1] + x[3];
+  vec2 z3 = x[1] - x[3];
+  vec2 z3i = vec2(z3.y, -z3.x);
+  y[0] = z0 + z2;
+  y[1] = z1 + z3i;
+  y[2] = z0 - z2;
+  y[3] = z1 - z3i;
+}
+
+void radix5(vec2 x[5], out vec2 y[5]) {
+  const float root_5_4 = 0.5590169943749475;
+  const float sin_2pi_5 = 0.9510565162951535;
+  const float sin_1pi_5 = 0.5877852522924731;
+
+  vec2 a1 = x[1] + x[4];
+  vec2 a2 = x[2] + x[3];
+  vec2 a3 = x[1] - x[4];
+  vec2 a4 = x[2] - x[3];
+  vec2 a5 = a1 + a2;
+  vec2 a6 = root_5_4 * (a1 - a2);
+  vec2 a7 = x[0] - a5 / 4.0;
+  vec2 a8 = a7 + a6;
+  vec2 a9 = a7 - a6;
+  vec2 a10 = sin_2pi_5 * a3 + sin_1pi_5 * a4;
+  vec2 a11 = sin_1pi_5 * a3 - sin_2pi_5 * a4;
+  vec2 a10j = vec2(a10.y, -a10.x);
+  vec2 a11j = vec2(a11.y, -a11.x);
+
+  y[0] = x[0] + a5;
+  y[1] = a8 + a10j;
+  y[2] = a9 + a11j;
+  y[3] = a9 - a11j;
+  y[4] = a8 - a10j;
+}
+
+void radix6(vec2 x[6], out vec2 y[6]) {
+  const float sin_pi_3 = 0.8660254037844387;
+  vec2 a1 = x[2] + x[4];
+  vec2 a2 = x[0] - a1 / 2.0;
+  vec2 a3 = sin_pi_3 * (x[2] - x[4]);
+  vec2 a4 = x[5] + x[1];
+  vec2 a5 = x[3] - a4 / 2.0;
+  vec2 a6 = sin_pi_3 * (x[5] - x[1]);
+  vec2 a7 = x[0] + a1;
+  vec2 a3i = vec2(a3.y, -a3.x);
+  vec2 a6i = vec2(a6.y, -a6.x);
+  vec2 a8 = a2 + a3i;
+  vec2 a9 = a2 - a3i;
+  vec2 a10 = x[3] + a4;
+  vec2 a11 = a5 + a6i;
+  vec2 a12 = a5 - a6i;
+  y[0] = a7 + a10;
+  y[1] = a8 - a11;
+  y[2] = a9 + a12;
+  y[3] = a7 - a10;
+  y[4] = a8 + a11;
+  y[5] = a9 - a12;
+}
+
+void apply_radix(uint radix, vec2 x[13], out vec2 y[13]) {
+  if (radix == 2u) {
+    vec2 a = x[0];
+    vec2 b = x[1];
+    radix2(a, b);
+    y[0] = a;
+    y[1] = b;
+    return;
+  }
+  if (radix == 3u) {
+    vec2 xx[3] = vec2[3](x[0], x[1], x[2]);
+    vec2 yy[3];
+    radix3(xx, yy);
+    for (uint i = 0; i < 3u; ++i) y[i] = yy[i];
+    return;
+  }
+  if (radix == 4u) {
+    vec2 xx[4] = vec2[4](x[0], x[1], x[2], x[3]);
+    vec2 yy[4];
+    radix4(xx, yy);
+    for (uint i = 0; i < 4u; ++i) y[i] = yy[i];
+    return;
+  }
+  if (radix == 5u) {
+    vec2 xx[5] = vec2[5](x[0], x[1], x[2], x[3], x[4]);
+    vec2 yy[5];
+    radix5(xx, yy);
+    for (uint i = 0; i < 5u; ++i) y[i] = yy[i];
+    return;
+  }
+  if (radix == 6u) {
+    vec2 xx[6] = vec2[6](x[0], x[1], x[2], x[3], x[4], x[5]);
+    vec2 yy[6];
+    radix6(xx, yy);
+    for (uint i = 0; i < 6u; ++i) y[i] = yy[i];
+    return;
+  }
+
+  for (uint k = 0u; k < radix; ++k) {
+    vec2 sum = vec2(0.0);
+    for (uint j = 0u; j < radix; ++j) {
+      sum += complex_mul(x[j], get_twiddle(k * j, radix));
+    }
+    y[k] = sum;
+  }
+}
+
+void radix_step(uint radix, uint num_steps, uint fft_idx, inout uint p, uint n) {
+  const uint m = gl_WorkGroupSize.x;
+  const uint m_r = n / radix;
+  const uint iter_count = (m_r + m - 1u) / m;
+  for (uint step = 0u; step < num_steps; ++step) {
+    for (uint iter = 0u; iter < iter_count; ++iter) {
+      vec2 x[13];
+      vec2 y[13];
+      uint index = fft_idx + iter * m;
+      bool is_active = index < m_r;
+      uint k = 0u;
+      uint j = 0u;
+      if (is_active) {
+        k = p > 0u ? index % p : 0u;
+        j = (index / p) * radix * p + k;
+        for (uint r = 0u; r < radix; ++r) {
+          x[r] = shared_buf[index + r * m_r];
+        }
+        if (p > 1u) {
+          vec2 twiddle1 = get_twiddle(k, radix * p);
+          vec2 twiddle = twiddle1;
+          x[1] = complex_mul(x[1], twiddle);
+          for (uint t = 2u; t < radix; ++t) {
+            twiddle = complex_mul(twiddle, twiddle1);
+            x[t] = complex_mul(x[t], twiddle);
+          }
+        }
+        apply_radix(radix, x, y);
+      }
+      barrier();
+      if (is_active) {
+        for (uint r = 0u; r < radix; ++r) {
+          shared_buf[j + r * p] = y[r];
+        }
+      }
+      barrier();
+    }
+    p *= radix;
+  }
+}
+
+void main() {
+  uint batch = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  if (batch >= pc.batch_count) {
+    return;
+  }
+
+  uint base = batch * pc.n;
+  for (uint idx = tid; idx < pc.n; idx += gl_WorkGroupSize.x) {
+    vec2 value = in_buf.data[pc.in_offset + base + idx];
+    shared_buf[idx] = pc.inverse != 0u ? complex_conj(value) : value;
+  }
+  barrier();
+
+  uint p = 1u;
+  radix_step(2u, RADIX_2_STEPS, tid, p, pc.n);
+  radix_step(3u, RADIX_3_STEPS, tid, p, pc.n);
+  radix_step(4u, RADIX_4_STEPS, tid, p, pc.n);
+  radix_step(5u, RADIX_5_STEPS, tid, p, pc.n);
+  radix_step(6u, RADIX_6_STEPS, tid, p, pc.n);
+  radix_step(7u, RADIX_7_STEPS, tid, p, pc.n);
+  radix_step(8u, RADIX_8_STEPS, tid, p, pc.n);
+  radix_step(11u, RADIX_11_STEPS, tid, p, pc.n);
+  radix_step(13u, RADIX_13_STEPS, tid, p, pc.n);
+
+  barrier();
+  for (uint idx = tid; idx < pc.n; idx += gl_WorkGroupSize.x) {
+    vec2 out_val = shared_buf[idx];
+    if (pc.inverse != 0u) {
+      out_val = complex_conj(out_val) / float(pc.n);
+    }
+    out_buf.data[pc.out_offset + base + idx] = out_val;
+  }
+}

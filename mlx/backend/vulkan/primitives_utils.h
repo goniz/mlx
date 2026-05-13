@@ -68,10 +68,12 @@ enum class GenericUnaryShaderOp {
   Negative,
   Round,
   Sigmoid,
+  Sign,
   Tanh,
 };
 
 enum class UnaryShaderOp {
+  Conjugate,
   Cos,
   Erf,
   ErfInv,
@@ -105,12 +107,20 @@ std::optional<vulkan::StaticShaderId> gather_axis_shader_id(
 std::optional<vulkan::StaticShaderId> scatter_shader_id(
     Dtype value_dtype,
     Dtype index_dtype);
+std::optional<vulkan::StaticShaderId> scatter_sum_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype);
 std::optional<vulkan::StaticShaderId> scatter_pair_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype);
+std::optional<vulkan::StaticShaderId> scatter_sum_pair_shader_id(
     Dtype value_dtype,
     Dtype index_dtype);
 std::optional<vulkan::StaticShaderId> scatter_axis_shader_id(
     Dtype value_dtype,
     Dtype index_dtype);
+std::optional<vulkan::StaticShaderId> masked_scatter_shader_id(
+    Dtype value_dtype);
 bool is_supported_elementwise_layout(const array& arr);
 bool is_supported_unary_layout(const array& arr);
 bool is_supported_generic_unary_layout(const array& arr);

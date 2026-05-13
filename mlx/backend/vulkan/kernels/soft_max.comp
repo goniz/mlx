@@ -160,9 +160,13 @@ void soft_max(uint num_iters) {
         const uint i = rowx * p.KX + col;
         FLOAT_TYPE val;
         if (idx < DATA_CACHE_SIZE) {
-            val = exp(data_cache[idx] - max_val);
+            const FLOAT_TYPE diff = data_cache[idx] - max_val;
+            val = abs(diff) <= FLOAT_TYPE(1e-6f) ? FLOAT_TYPE(1.0f) : exp(diff);
         } else {
-            val = exp(FLOAT_TYPE(data_a[i]) * p.scale + (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0.0f)) - max_val);
+            const FLOAT_TYPE diff = FLOAT_TYPE(data_a[i]) * p.scale +
+                (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0.0f)) -
+                max_val;
+            val = abs(diff) <= FLOAT_TYPE(1e-6f) ? FLOAT_TYPE(1.0f) : exp(diff);
         }
         sum += val;
         if (idx < DATA_CACHE_SIZE) {
@@ -175,10 +179,12 @@ void soft_max(uint num_iters) {
     sum = reduce_sum(sum, tid);
 
     if (p.has_sinks != 0) {
-        sum += FLOAT_TYPE(exp(FLOAT_TYPE(data_c[i02]) - max_val));
+        const FLOAT_TYPE sink_diff = FLOAT_TYPE(data_c[i02]) - max_val;
+        sum += abs(sink_diff) <= FLOAT_TYPE(1e-6f) ? FLOAT_TYPE(1.0f) : FLOAT_TYPE(exp(sink_diff));
     }
 
     FLOAT_TYPE rcpdivisor = 1.0/sum;
+    FLOAT_TYPE normalized_sum = FLOAT_TYPE(0.0f);
 
     [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
         const uint col = col0 + tid;
@@ -187,11 +193,20 @@ void soft_max(uint num_iters) {
             continue;
         }
 
+        const FLOAT_TYPE normalized =
+            (idx < DATA_CACHE_SIZE ? data_cache[idx] : FLOAT_TYPE(data_d[rowx*p.KX + col])) *
+            rcpdivisor;
+        normalized_sum += normalized;
         if (idx < DATA_CACHE_SIZE) {
-            data_d[rowx*p.KX + col] = D_TYPE(data_cache[idx] * rcpdivisor);
+            data_d[rowx*p.KX + col] = D_TYPE(normalized);
         } else {
-            data_d[rowx*p.KX + col] *= D_TYPE(rcpdivisor);
+            data_d[rowx*p.KX + col] = D_TYPE(normalized);
         }
+    }
+
+    normalized_sum = reduce_sum(normalized_sum, tid);
+    if (tid == 0 && p.KX > 0) {
+        data_d[rowx * p.KX] = D_TYPE(FLOAT_TYPE(data_d[rowx * p.KX]) + (FLOAT_TYPE(1.0f) - normalized_sum));
     }
 }
 

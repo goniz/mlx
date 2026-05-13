@@ -141,6 +141,7 @@ if(Vulkan_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/primitives_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp

@@ -8,9 +8,6 @@ add_executable(tests ${PROJECT_SOURCE_DIR}/tests/tests.cpp)
 
 if(MLX_BUILD_METAL OR MLX_BUILD_CUDA OR MLX_BUILD_VULKAN)
   set(GPU_TEST_SOURCES gpu_tests.cpp)
-  if(MLX_BUILD_VULKAN)
-    list(APPEND GPU_TEST_SOURCES vulkan_multi_queue_tests.cpp)
-  endif()
 endif()
 
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
@@ -27,17 +24,18 @@ target_sources(
           creations_tests.cpp
           device_tests.cpp
           einsum_tests.cpp
-          export_import_tests.cpp
-          eval_tests.cpp
-          fft_tests.cpp
-          load_tests.cpp
-          ops_tests.cpp
-          random_tests.cpp
-          scheduler_tests.cpp
-          utils_tests.cpp
-          vmap_tests.cpp
-          linalg_tests.cpp
-          ${GPU_TEST_SOURCES})
+           export_import_tests.cpp
+           eval_tests.cpp
+           fft_tests.cpp
+           load_tests.cpp
+           ops_tests.cpp
+           random_tests.cpp
+           scheduler_tests.cpp
+           utils_tests.cpp
+           vmap_tests.cpp
+           linalg_tests.cpp
+           vulkan_regression_tests.cpp
+           ${GPU_TEST_SOURCES})
 
 target_link_libraries(tests PRIVATE mlx doctest)
 target_compile_options(tests PRIVATE ${SANITIZER_COMPILE_FLAGS})

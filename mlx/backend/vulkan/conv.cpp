@@ -226,6 +226,7 @@ bool try_eval_conv2d_vulkan(
     array& out,
     const std::vector<int>& kernel_strides,
     const std::vector<int>& padding_lo,
+    const std::vector<int>& padding_hi,
     const std::vector<int>& kernel_dilation,
     const std::vector<int>& input_dilation,
     int groups,
@@ -236,10 +237,11 @@ bool try_eval_conv2d_vulkan(
     return false;
   }
   if (kernel_strides.size() != 2 || padding_lo.size() != 2 ||
+      padding_hi.size() != 2 ||
       kernel_dilation.size() != 2 || input_dilation.size() != 2) {
     return false;
   }
-  if (groups != 1 || flip || input_dilation[0] != 1 || input_dilation[1] != 1) {
+  if (groups <= 0) {
     return false;
   }
 
@@ -248,6 +250,164 @@ bool try_eval_conv2d_vulkan(
   if (in.dtype() != float32 || out.dtype() != float32 ||
       (wt.dtype() != float32 && wt.dtype() != float16)) {
     return false;
+  }
+
+  const int batch_size = in.shape(0);
+  const int in_height = in.shape(1);
+  const int in_width = in.shape(2);
+  const int in_channels = in.shape(3);
+  const int out_channels = wt.shape(0);
+  const int kernel_h = wt.shape(1);
+  const int kernel_w = wt.shape(2);
+  const int channels_per_group = wt.shape(3);
+  const int out_height = out.shape(1);
+  const int out_width = out.shape(2);
+
+  if (in_channels != channels_per_group * groups || out_channels % groups != 0) {
+    return false;
+  }
+
+  const bool supports_direct_kernel =
+      groups == 1 && !flip && input_dilation[0] == 1 && input_dilation[1] == 1 &&
+      padding_lo == padding_hi;
+
+  if (!supports_direct_kernel) {
+    auto in_work = in;
+    if (input_dilation[0] != 1) {
+      auto expanded = expand_dims(in_work, 2, s);
+      auto padded =
+          pad(expanded,
+              std::vector<std::pair<int, int>>{
+                  {0, 0}, {0, 0}, {0, input_dilation[0] - 1}, {0, 0}, {0, 0}},
+              array(0, in.dtype()),
+              "constant",
+              s);
+      auto reshaped = reshape(
+          padded,
+          {
+              in_work.shape(0),
+              in_work.shape(1) * input_dilation[0],
+              in_work.shape(2),
+              in_work.shape(3),
+          },
+          s);
+      in_work = slice(
+          reshaped,
+          {0, 0, 0, 0},
+          {in_work.shape(0),
+           (in_work.shape(1) - 1) * input_dilation[0] + 1,
+           in_work.shape(2),
+           in_work.shape(3)},
+          s);
+    }
+    if (input_dilation[1] != 1) {
+      auto expanded = expand_dims(in_work, 3, s);
+      auto padded =
+          pad(expanded,
+              std::vector<std::pair<int, int>>{
+                  {0, 0}, {0, 0}, {0, 0}, {0, input_dilation[1] - 1}, {0, 0}},
+              array(0, in.dtype()),
+              "constant",
+              s);
+      auto reshaped = reshape(
+          padded,
+          {
+              in_work.shape(0),
+              in_work.shape(1),
+              in_work.shape(2) * input_dilation[1],
+              in_work.shape(3),
+          },
+          s);
+      in_work = slice(
+          reshaped,
+          {0, 0, 0, 0},
+          {in_work.shape(0),
+           in_work.shape(1),
+           (in_work.shape(2) - 1) * input_dilation[1] + 1,
+           in_work.shape(3)},
+          s);
+    }
+
+    auto wt_work = wt;
+    if (flip) {
+      const auto& wt_shape = wt.shape();
+      const auto& wt_strides = wt.strides();
+      wt_work = as_strided(
+          wt,
+          wt_shape,
+          {wt_strides[0], -wt_strides[1], -wt_strides[2], wt_strides[3]},
+          static_cast<size_t>(
+              (wt_shape[1] - 1) * wt_strides[1] + (wt_shape[2] - 1) * wt_strides[2]),
+          s);
+    }
+
+    auto padded =
+        pad(in_work,
+            std::vector<std::pair<int, int>>{
+                {0, 0},
+                {padding_lo[0], padding_hi[0]},
+                {padding_lo[1], padding_hi[1]},
+                {0, 0}},
+            array(0, in.dtype()),
+            "constant",
+            s);
+
+    const auto& padded_strides = padded.strides();
+    auto patches = as_strided(
+        padded,
+        {batch_size, out_height, out_width, kernel_h, kernel_w, in_channels},
+        {
+            padded_strides[0],
+            padded_strides[1] * kernel_strides[0],
+            padded_strides[2] * kernel_strides[1],
+            padded_strides[1] * kernel_dilation[0],
+            padded_strides[2] * kernel_dilation[1],
+            padded_strides[3],
+        },
+        0,
+        s);
+
+    const int out_channels_per_group = out_channels / groups;
+    std::vector<array> group_outputs;
+    group_outputs.reserve(groups);
+
+    for (int g = 0; g < groups; ++g) {
+      auto patches_g = slice(
+          patches,
+          {0, 0, 0, 0, 0, g * channels_per_group},
+          {batch_size,
+           out_height,
+           out_width,
+           kernel_h,
+           kernel_w,
+           (g + 1) * channels_per_group},
+          s);
+      patches_g = reshape(
+          patches_g,
+          {batch_size * out_height * out_width,
+           kernel_h * kernel_w * channels_per_group},
+          s);
+
+      auto wt_g = slice(
+          wt_work,
+          {g * out_channels_per_group, 0, 0, 0},
+          {(g + 1) * out_channels_per_group, kernel_h, kernel_w, channels_per_group},
+          s);
+      wt_g = reshape(
+          wt_g, {out_channels_per_group, kernel_h * kernel_w * channels_per_group}, s);
+      wt_g = transpose(wt_g, {1, 0}, s);
+
+      auto out_g = matmul(patches_g, wt_g, s);
+      group_outputs.push_back(
+          reshape(
+              out_g, {batch_size, out_height, out_width, out_channels_per_group}, s));
+    }
+
+    auto result = group_outputs.size() == 1
+        ? group_outputs[0]
+        : concatenate(std::move(group_outputs), 3, s);
+    copy_gpu(result, out, CopyType::General, s);
+    return true;
   }
 
   const uint32_t batch = checked_u32_size(in.shape(0), "batch");
@@ -584,6 +744,282 @@ bool try_eval_conv1d_vulkan(
   return true;
 }
 
+bool try_eval_conv3d_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    const std::vector<int>& kernel_strides,
+    const std::vector<int>& padding_lo,
+    const std::vector<int>& padding_hi,
+    const std::vector<int>& kernel_dilation,
+    const std::vector<int>& input_dilation,
+    int groups,
+    bool flip,
+    Stream s) {
+  if (inputs.size() != 2 || inputs[0].ndim() != 5 || inputs[1].ndim() != 5 ||
+      out.ndim() != 5) {
+    return false;
+  }
+  if (kernel_strides.size() != 3 || padding_lo.size() != 3 ||
+      padding_hi.size() != 3 || kernel_dilation.size() != 3 ||
+      input_dilation.size() != 3 || groups <= 0) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  const auto& wt = inputs[1];
+  if (in.dtype() != float32 || out.dtype() != float32 ||
+      (wt.dtype() != float32 && wt.dtype() != float16)) {
+    return false;
+  }
+
+  const int batch_size = in.shape(0);
+  const int in_depth = in.shape(1);
+  const int in_height = in.shape(2);
+  const int in_width = in.shape(3);
+  const int in_channels = in.shape(4);
+  const int out_channels = wt.shape(0);
+  const int kernel_d = wt.shape(1);
+  const int kernel_h = wt.shape(2);
+  const int kernel_w = wt.shape(3);
+  const int channels_per_group = wt.shape(4);
+  const int out_depth = out.shape(1);
+  const int out_height = out.shape(2);
+  const int out_width = out.shape(3);
+
+  if (in_channels != channels_per_group * groups || out_channels % groups != 0) {
+    return false;
+  }
+
+  auto in_work = in;
+  if (input_dilation[0] != 1) {
+    auto expanded = expand_dims(in_work, 2, s);
+    auto padded =
+        pad(expanded,
+            std::vector<std::pair<int, int>>{
+                {0, 0},
+                {0, 0},
+                {0, input_dilation[0] - 1},
+                {0, 0},
+                {0, 0},
+                {0, 0}},
+            array(0, in.dtype()),
+            "constant",
+            s);
+    auto reshaped = reshape(
+        padded,
+        {
+            in_work.shape(0),
+            in_work.shape(1) * input_dilation[0],
+            in_work.shape(2),
+            in_work.shape(3),
+            in_work.shape(4),
+        },
+        s);
+    in_work = slice(
+        reshaped,
+        {0, 0, 0, 0, 0},
+        {
+            in_work.shape(0),
+            (in_work.shape(1) - 1) * input_dilation[0] + 1,
+            in_work.shape(2),
+            in_work.shape(3),
+            in_work.shape(4),
+        },
+        s);
+  }
+  if (input_dilation[1] != 1) {
+    auto expanded = expand_dims(in_work, 3, s);
+    auto padded =
+        pad(expanded,
+            std::vector<std::pair<int, int>>{
+                {0, 0},
+                {0, 0},
+                {0, 0},
+                {0, input_dilation[1] - 1},
+                {0, 0},
+                {0, 0}},
+            array(0, in.dtype()),
+            "constant",
+            s);
+    auto reshaped = reshape(
+        padded,
+        {
+            in_work.shape(0),
+            in_work.shape(1),
+            in_work.shape(2) * input_dilation[1],
+            in_work.shape(3),
+            in_work.shape(4),
+        },
+        s);
+    in_work = slice(
+        reshaped,
+        {0, 0, 0, 0, 0},
+        {
+            in_work.shape(0),
+            in_work.shape(1),
+            (in_work.shape(2) - 1) * input_dilation[1] + 1,
+            in_work.shape(3),
+            in_work.shape(4),
+        },
+        s);
+  }
+  if (input_dilation[2] != 1) {
+    auto expanded = expand_dims(in_work, 4, s);
+    auto padded =
+        pad(expanded,
+            std::vector<std::pair<int, int>>{
+                {0, 0},
+                {0, 0},
+                {0, 0},
+                {0, 0},
+                {0, input_dilation[2] - 1},
+                {0, 0}},
+            array(0, in.dtype()),
+            "constant",
+            s);
+    auto reshaped = reshape(
+        padded,
+        {
+            in_work.shape(0),
+            in_work.shape(1),
+            in_work.shape(2),
+            in_work.shape(3) * input_dilation[2],
+            in_work.shape(4),
+        },
+        s);
+    in_work = slice(
+        reshaped,
+        {0, 0, 0, 0, 0},
+        {
+            in_work.shape(0),
+            in_work.shape(1),
+            in_work.shape(2),
+            (in_work.shape(3) - 1) * input_dilation[2] + 1,
+            in_work.shape(4),
+        },
+        s);
+  }
+
+  auto wt_work = wt;
+  if (flip) {
+    const auto& wt_shape = wt.shape();
+    const auto& wt_strides = wt.strides();
+    wt_work = as_strided(
+        wt,
+        wt_shape,
+        {
+            wt_strides[0],
+            -wt_strides[1],
+            -wt_strides[2],
+            -wt_strides[3],
+            wt_strides[4],
+        },
+        static_cast<size_t>(
+            (wt_shape[1] - 1) * wt_strides[1] +
+            (wt_shape[2] - 1) * wt_strides[2] +
+            (wt_shape[3] - 1) * wt_strides[3]),
+        s);
+  }
+
+  auto padded =
+      pad(in_work,
+          std::vector<std::pair<int, int>>{
+              {0, 0},
+              {padding_lo[0], padding_hi[0]},
+              {padding_lo[1], padding_hi[1]},
+              {padding_lo[2], padding_hi[2]},
+              {0, 0}},
+          array(0, in.dtype()),
+          "constant",
+          s);
+
+  const auto& padded_strides = padded.strides();
+  auto patches = as_strided(
+      padded,
+      {
+          batch_size,
+          out_depth,
+          out_height,
+          out_width,
+          kernel_d,
+          kernel_h,
+          kernel_w,
+          in_channels,
+      },
+      {
+          padded_strides[0],
+          padded_strides[1] * kernel_strides[0],
+          padded_strides[2] * kernel_strides[1],
+          padded_strides[3] * kernel_strides[2],
+          padded_strides[1] * kernel_dilation[0],
+          padded_strides[2] * kernel_dilation[1],
+          padded_strides[3] * kernel_dilation[2],
+          padded_strides[4],
+      },
+      0,
+      s);
+
+  const int out_channels_per_group = out_channels / groups;
+  std::vector<array> group_outputs;
+  group_outputs.reserve(groups);
+
+  for (int g = 0; g < groups; ++g) {
+    auto patches_g = slice(
+        patches,
+        {0, 0, 0, 0, 0, 0, 0, g * channels_per_group},
+        {
+            batch_size,
+            out_depth,
+            out_height,
+            out_width,
+            kernel_d,
+            kernel_h,
+            kernel_w,
+            (g + 1) * channels_per_group,
+        },
+        s);
+    patches_g = reshape(
+        patches_g,
+        {
+            batch_size * out_depth * out_height * out_width,
+            kernel_d * kernel_h * kernel_w * channels_per_group,
+        },
+        s);
+
+    auto wt_g = slice(
+        wt_work,
+        {g * out_channels_per_group, 0, 0, 0, 0},
+        {
+            (g + 1) * out_channels_per_group,
+            kernel_d,
+            kernel_h,
+            kernel_w,
+            channels_per_group,
+        },
+        s);
+    wt_g = reshape(
+        wt_g,
+        {
+            out_channels_per_group,
+            kernel_d * kernel_h * kernel_w * channels_per_group,
+        },
+        s);
+    wt_g = transpose(wt_g, {1, 0}, s);
+
+    auto out_g = matmul(patches_g, wt_g, s);
+    group_outputs.push_back(reshape(
+        out_g,
+        {batch_size, out_depth, out_height, out_width, out_channels_per_group},
+        s));
+  }
+
+  auto result = group_outputs.size() == 1
+      ? group_outputs[0]
+      : concatenate(std::move(group_outputs), 4, s);
+  copy_gpu(result, out, CopyType::General, s);
+  return true;
+}
+
 } // namespace
 
 void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -592,6 +1028,21 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
           out,
           kernel_strides_,
           padding_lo_,
+          padding_hi_,
+          kernel_dilation_,
+          input_dilation_,
+          groups_,
+          flip_,
+          stream())) {
+    return;
+  }
+
+  if (try_eval_conv3d_vulkan(
+          inputs,
+          out,
+          kernel_strides_,
+          padding_lo_,
+          padding_hi_,
           kernel_dilation_,
           input_dilation_,
           groups_,

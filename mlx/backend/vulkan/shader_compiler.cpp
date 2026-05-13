@@ -54,9 +54,8 @@ std::vector<uint32_t> compile_glsl_to_spirv(
 
   if (trace) {
     const auto t1 = std::chrono::steady_clock::now();
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        t1 - t0)
-                        .count();
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     std::cerr << "[vulkan-shader-compile] done: " << shader_name
               << " spirv_words=" << (result.cend() - result.cbegin())
               << " ms=" << ms;
@@ -211,6 +210,12 @@ std::string cast_expr_for_dtype(const std::string& expr, Dtype in, Dtype out) {
   if (out == mlx::core::bool_) {
     return "((" + expr + ") != " + zero_literal_for_dtype(in) +
         " ? uint8_t(1) : uint8_t(0))";
+  }
+  if (out == mlx::core::complex64) {
+    if (in == mlx::core::complex64) {
+      return expr;
+    }
+    return "vec2(float(" + expr + "), 0.0)";
   }
   return dtype_to_glsl_storage_type(out) + "(" + expr + ")";
 }

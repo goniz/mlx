@@ -22,6 +22,7 @@
 #include "mlx/dtype_utils.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
+#include "mlx/transforms.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
@@ -222,10 +223,11 @@ std::string glsl_cast_expr(Dtype dst, Dtype src, const std::string& expr) {
 bool supports_primitive_name(const std::string& prim_name) {
   static const std::unordered_set<std::string> supported = {
       "Abs",       "Add",     "AsType",  "Broadcast", "Ceil",     "Conjugate",
-      "Cos",       "Divide",  "Exp",     "Floor",     "Imag",     "Log",
+      "Cos",       "Divide",  "Erf",     "Exp",       "Floor",    "Imag",
+      "Log",
       "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Power",
       "Real",      "Round",   "Sigmoid", "Sin",       "Sqrt",     "Subtract",
-      "Tan",       "Tanh"};
+      "Square",    "Tan",    "Tanh"};
   return supported.contains(prim_name);
 }
 
@@ -250,6 +252,7 @@ std::string emit_glsl_preamble(
     bool uses_float16_types,
     bool uses_int16_types,
     bool uses_int8_types,
+    bool uses_erf,
     bool uses_power) {
   std::ostringstream os;
   os << "#version 450\n";
@@ -287,14 +290,20 @@ float bf16_to_fp32(uint u) {
   if (uses_complex64) {
     os << R"(
 vec2 complex_mul(vec2 a, vec2 b) {
-  return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+  precise float real = a.x * b.x - a.y * b.y;
+  precise float imag = a.x * b.y + a.y * b.x;
+  return vec2(real, imag);
 }
 
 vec2 complex_div(vec2 a, vec2 b) {
-  float denom = dot(b, b);
-  return vec2(
-      (a.x * b.x + a.y * b.y) / denom,
-      (a.y * b.x - a.x * b.y) / denom);
+  precise float denom = b.x * b.x + b.y * b.y;
+  precise float real_num = a.x * b.x + a.y * b.y;
+  precise float imag_num = a.y * b.x - a.x * b.y;
+  precise float real = real_num / denom;
+  precise float imag = imag_num / denom;
+  real += (real_num - real * denom) / denom;
+  imag += (imag_num - imag * denom) / denom;
+  return vec2(real, imag);
 }
 
 vec2 complex_exp(vec2 z) {
@@ -333,31 +342,48 @@ vec2 complex_conjugate(vec2 z) {
 )";
   }
 
+  if (uses_erf) {
+    os << R"(
+float erf(float x) {
+  const float a1 = 0.254829592;
+  const float a2 = -0.284496736;
+  const float a3 = 1.421413741;
+  const float a4 = -1.453152027;
+  const float a5 = 1.061405429;
+  const float p = 0.3275911;
+  float s = sign(x);
+  x = abs(x);
+  float t = 1.0 / (1.0 + p * x);
+  float y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-x * x);
+  return s * y;
+}
+
+)";
+  }
+
   if (uses_power) {
     os << R"(
 float safe_real_pow(float x, float y) {
-  if (x < 0.0) {
-    float yi = round(y);
-    if (abs(y - yi) <= 0.00001 && abs(yi) <= 64.0) {
-      int n = int(yi);
-      float base = abs(x);
-      float result = 1.0;
-      int exp = abs(n);
-      while (exp > 0) {
-        if ((exp & 1) != 0) {
-          result *= base;
-        }
-        base *= base;
-        exp >>= 1;
+  float yi = round(y);
+  if (abs(y - yi) <= 0.00001 && abs(yi) <= 64.0) {
+    int n = int(yi);
+    float base = abs(x);
+    float result = 1.0;
+    int exp = abs(n);
+    while (exp > 0) {
+      if ((exp & 1) != 0) {
+        result *= base;
       }
-      if (n < 0) {
-        result = 1.0 / result;
-      }
-      if ((abs(n) & 1) != 0) {
-        result = -result;
-      }
-      return result;
+      base *= base;
+      exp >>= 1;
     }
+    if (n < 0) {
+      result = 1.0 / result;
+    }
+    if (x < 0.0 && (abs(n) & 1) != 0) {
+      result = -result;
+    }
+    return result;
   }
   return pow(x, y);
 }
@@ -380,6 +406,7 @@ std::string get_glsl_operator(const std::string& primitive_name) {
       {"Minimum", "min"},
       // GLSL built-in functions (lowercase)
       {"Exp", "exp"},
+      {"Erf", "erf"},
       {"Log", "log"},
       {"Sin", "sin"},
       {"Cos", "cos"},
@@ -457,6 +484,10 @@ inline void build_glsl_kernel(
       std::any_of(tape.begin(), tape.end(), [](const array& x) {
         return x.primitive().name() == "Power";
       });
+  const bool uses_erf = std::any_of(
+      tape.begin(), tape.end(), [](const array& x) {
+        return x.primitive().name() == "Erf";
+      });
 
   // GLSL header
   os = emit_glsl_preamble(
@@ -465,6 +496,7 @@ inline void build_glsl_kernel(
       uses_float16_types,
       uses_int16_types,
       uses_int8_types,
+      uses_erf,
       uses_power);
 
   // Determine max work per thread based on output dtype size
@@ -717,6 +749,9 @@ layout(push_constant) uniform PushConstants {
 
       if (prim_name == "Negative" && x.inputs().size() == 1) {
         os += fmt::format("(-{});\n", get_input_expr(x.inputs()[0]));
+      } else if (prim_name == "Square" && x.inputs().size() == 1) {
+        const auto input = get_input_expr(x.inputs()[0]);
+        os += fmt::format("({} * {});\n", input, input);
       } else if (
           prim_name == "Power" && x.inputs().size() == 2 && !is_complex) {
         const auto lhs = get_input_expr(x.inputs()[0]);
@@ -918,6 +953,16 @@ void Compiled::eval_gpu(
   auto [contiguous, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
   auto dispatch_inputs = inputs;
+  std::vector<array> pending_inputs;
+  pending_inputs.reserve(dispatch_inputs.size());
+  for (const auto& in : dispatch_inputs) {
+    if (in.status() == array::Status::unscheduled) {
+      pending_inputs.push_back(in);
+    }
+  }
+  if (!pending_inputs.empty()) {
+    async_eval(std::move(pending_inputs));
+  }
   std::vector<uint32_t> input_offsets(inputs.size(), 0u);
   for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
     input_offsets[i] = checked_elem_offset(dispatch_inputs[i], "input");

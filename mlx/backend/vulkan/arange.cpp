@@ -24,6 +24,8 @@ std::optional<vulkan::StaticShaderId> arange_shader_id(Dtype dtype) {
       return vulkan::StaticShaderId::arange_i16;
     case int32:
       return vulkan::StaticShaderId::arange_i32;
+    case int64:
+      return vulkan::StaticShaderId::arange_i64;
     case float16:
       return vulkan::StaticShaderId::arange_f16;
     case bfloat16:

@@ -3,9 +3,12 @@
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
+#include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/utils.h"
 
 #include <algorithm>
+#include <sstream>
 
 namespace mlx::core {
 
@@ -67,7 +70,19 @@ bool is_vulkan_compare_dtype(Dtype dtype) {
 
 bool has_vulkan_buffer(const array& arr) {
   auto data = arr.data_shared_ptr();
-  return data != nullptr && data->buffer.ptr() != nullptr;
+  return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
+}
+
+void ensure_materialized_scalar_input(array& arr) {
+  if (arr.data_size() != 1 || !arr.has_primitive()) {
+    return;
+  }
+  auto data = arr.data_shared_ptr();
+  if (arr.status() != array::Status::unscheduled &&
+      (data == nullptr || data->buffer.ptr() == nullptr)) {
+    arr.set_status(array::Status::unscheduled);
+  }
+  arr.eval();
 }
 
 bool ensure_vulkan_buffer(array& arr, Stream s) {
@@ -76,6 +91,11 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   }
 
   if (arr.has_primitive()) {
+    if (auto& p = arr.primitive();
+        typeid(p) == typeid(Broadcast) || typeid(p) == typeid(BroadcastAxes)) {
+      arr.eval();
+      return has_vulkan_buffer(arr);
+    }
     arr = contiguous_copy_gpu(arr, s);
     return has_vulkan_buffer(arr);
   }
@@ -95,6 +115,701 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
 
   arr = contiguous_copy_gpu(arr, s);
   return has_vulkan_buffer(arr);
+}
+
+bool is_same_complex_add(const array& a, const array& b, const array& out) {
+  return a.dtype() == complex64 && b.dtype() == complex64 &&
+      out.dtype() == complex64;
+}
+
+bool is_same_complex_sub(const array& a, const array& b, const array& out) {
+  return a.dtype() == complex64 && b.dtype() == complex64 &&
+      out.dtype() == complex64;
+}
+
+bool is_complex_float_mul(const array& a, const array& b, const array& out) {
+  return out.dtype() == complex64 &&
+      ((a.dtype() == complex64 && b.dtype() == float32) ||
+       (a.dtype() == float32 && b.dtype() == complex64));
+}
+
+bool is_same_complex_mul(const array& a, const array& b, const array& out) {
+  return a.dtype() == complex64 && b.dtype() == complex64 &&
+      out.dtype() == complex64;
+}
+
+bool is_complex_scalar_mul(const array& a, const array& b, const array& out) {
+  return is_same_complex_mul(a, b, out) &&
+      ((a.data_size() == 1) != (b.data_size() == 1));
+}
+
+bool is_same_complex_div(const array& a, const array& b, const array& out) {
+  return a.dtype() == complex64 && b.dtype() == complex64 &&
+      out.dtype() == complex64;
+}
+
+bool is_same_complex_max(const array& a, const array& b, const array& out) {
+  return a.dtype() == complex64 && b.dtype() == complex64 &&
+      out.dtype() == complex64;
+}
+
+bool is_same_complex_min(const array& a, const array& b, const array& out) {
+  return a.dtype() == complex64 && b.dtype() == complex64 &&
+      out.dtype() == complex64;
+}
+
+std::string build_complex_add_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {vec2 data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {vec2 data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = "
+        "a_buf.data[idx + pc.a_offset] + b_buf.data[idx + pc.b_offset];\n";
+  os << "}\n";
+  return os.str();
+}
+
+struct ComplexBinaryPushConstants {
+  uint32_t a_offset;
+  uint32_t b_offset;
+  uint32_t out_offset;
+  uint32_t total_elements;
+};
+
+struct ComplexScalarMulPushConstants {
+  uint32_t in_offset;
+  uint32_t scalar_offset;
+  uint32_t out_offset;
+  uint32_t total_elements;
+};
+
+bool materialize_complex_binary_input(array& in, const array& out, Stream s) {
+  if (in.shape() == out.shape()) {
+    if (in.data_size() == 1 && in.size() != 1) {
+      array materialized(out.shape(), in.dtype(), nullptr, {});
+      copy_gpu(in, materialized, CopyType::General, s);
+      in = materialized;
+      return true;
+    }
+    return ensure_vulkan_buffer(in, s);
+  }
+  if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
+    return false;
+  }
+  if (!ensure_vulkan_buffer(in, s)) {
+    return false;
+  }
+  if (in.data_size() == 1) {
+    array materialized(out.shape(), in.dtype(), nullptr, {});
+    copy_gpu(in, materialized, CopyType::Scalar, s);
+    in = materialized;
+    return true;
+  }
+  array view(out.shape(), in.dtype(), nullptr, {});
+  broadcast(in, view);
+  in = view;
+  return true;
+}
+
+bool prepare_complex_binary_dispatch(
+    array& a,
+    array& b,
+    array& out,
+    array& out_work,
+    bool& staged_output,
+    Stream s) {
+  if (!materialize_complex_binary_input(a, out, s) ||
+      !materialize_complex_binary_input(b, out, s)) {
+    return false;
+  }
+
+  if (!is_supported_elementwise_layout(a)) {
+    a = contiguous_copy_gpu(a, s);
+  }
+  if (!is_supported_elementwise_layout(b)) {
+    b = contiguous_copy_gpu(b, s);
+  }
+  staged_output = !is_supported_elementwise_layout(out);
+  out_work = staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  if (!is_supported_elementwise_layout(out_work)) {
+    return false;
+  }
+
+  auto bopt = get_binary_op_type(a, b);
+  set_binary_op_output_data(a, b, out_work, bopt);
+  return true;
+}
+
+bool make_complex_binary_push_constants(
+    const array& a,
+    const array& b,
+    const array& out,
+    ComplexBinaryPushConstants& pc) {
+  const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
+  const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
+  const auto total = static_cast<uint64_t>(out.data_size());
+  if (a_offset > std::numeric_limits<uint32_t>::max() ||
+      b_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  pc = {
+      static_cast<uint32_t>(a_offset),
+      static_cast<uint32_t>(b_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+  return true;
+}
+
+bool dispatch_complex_binary_shader(
+    array& a,
+    array& b,
+    array& out,
+    Stream s,
+    const char* name,
+    const std::string& source) {
+  array out_work(out.shape(), out.dtype(), nullptr, {});
+  bool staged_output = false;
+  if (!prepare_complex_binary_dispatch(a, b, out, out_work, staged_output, s)) {
+    return false;
+  }
+
+  ComplexBinaryPushConstants pc{};
+  if (!make_complex_binary_push_constants(a, b, out_work, pc)) {
+    return false;
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
+  constexpr uint32_t kPushConstantSize = sizeof(ComplexBinaryPushConstants);
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      name, source, 3, arrays, kPushConstantSize, s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
+  vulkan::end_command_recording(s.index);
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::General, s);
+  }
+  return true;
+}
+
+bool materialize_complex_vector_input(array& in, const array& out, Stream s) {
+  if (in.dtype() != complex64 || in.data_size() == 1) {
+    return false;
+  }
+  if (!materialize_complex_binary_input(in, out, s)) {
+    return false;
+  }
+  if (!is_supported_elementwise_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
+  }
+  return is_supported_elementwise_layout(in);
+}
+
+bool try_eval_complex_add_vulkan(array& a, array& b, array& out, Stream s) {
+  return dispatch_complex_binary_shader(
+      a, b, out, s, "dynamic_add_c64_c64_c64", build_complex_add_shader());
+}
+
+bool try_eval_complex_mul_vulkan(array& a, array& b, array& out, Stream s);
+
+std::string build_complex_sub_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {vec2 data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {vec2 data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = "
+        "a_buf.data[idx + pc.a_offset] - b_buf.data[idx + pc.b_offset];\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_complex_sub_vulkan(array& a, array& b, array& out, Stream s) {
+  return dispatch_complex_binary_shader(
+      a, b, out, s, "dynamic_sub_c64_c64_c64", build_complex_sub_shader());
+}
+
+std::string build_complex_max_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {vec2 data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {vec2 data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  vec2 x = a_buf.data[idx + pc.a_offset];\n";
+  os << "  vec2 y = b_buf.data[idx + pc.b_offset];\n";
+  os << "  bool x_nan = isnan(x.x) || isnan(x.y);\n";
+  os << "  bool x_gt = (x.x > y.x) || (x.x == y.x && x.y > y.y);\n";
+  os << "  out_buf.data[idx + pc.out_offset] = (x_nan || x_gt) ? x : y;\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_complex_max_vulkan(array& a, array& b, array& out, Stream s) {
+  return dispatch_complex_binary_shader(
+      a, b, out, s, "dynamic_max_c64_c64_c64", build_complex_max_shader());
+}
+
+std::string build_complex_min_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {vec2 data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {vec2 data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  vec2 x = a_buf.data[idx + pc.a_offset];\n";
+  os << "  vec2 y = b_buf.data[idx + pc.b_offset];\n";
+  os << "  bool x_nan = isnan(x.x) || isnan(x.y);\n";
+  os << "  bool x_lt = (x.x < y.x) || (x.x == y.x && x.y < y.y);\n";
+  os << "  out_buf.data[idx + pc.out_offset] = (x_nan || x_lt) ? x : y;\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_complex_min_vulkan(array& a, array& b, array& out, Stream s) {
+  return dispatch_complex_binary_shader(
+      a, b, out, s, "dynamic_min_c64_c64_c64", build_complex_min_shader());
+}
+
+std::string build_complex_scalar_mul_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint in_offset; uint scalar_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer Input {vec2 data[];} in_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer ScalarInput {vec2 data[];} scalar_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  vec2 x = in_buf.data[idx + pc.in_offset];\n";
+  os << "  vec2 y = scalar_buf.data[pc.scalar_offset];\n";
+  os << "  precise float real = x.x * y.x - x.y * y.y;\n";
+  os << "  precise float imag = x.x * y.y + x.y * y.x;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = vec2(real, imag);\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_complex_scalar_mul_vulkan(
+    array& a,
+    array& b,
+    array& out,
+    Stream s) {
+  array* vector_in = nullptr;
+  array* scalar_in = nullptr;
+  if (a.data_size() == 1 && b.data_size() != 1) {
+    scalar_in = &a;
+    vector_in = &b;
+  } else if (b.data_size() == 1 && a.data_size() != 1) {
+    scalar_in = &b;
+    vector_in = &a;
+  } else {
+    return false;
+  }
+
+  if (!materialize_complex_vector_input(*vector_in, out, s)) {
+    return false;
+  }
+
+  array scalar_value = *scalar_in;
+  if (scalar_value.shape() != Shape{} && scalar_value.data_size() == 1) {
+    array scalar_base(Shape{}, scalar_value.dtype(), nullptr, {});
+    scalar_base.copy_shared_buffer(
+        scalar_value, Strides{}, {true, true, true}, 1);
+    scalar_value = scalar_base;
+  }
+  if (!ensure_vulkan_buffer(scalar_value, s)) {
+    return false;
+  }
+  if (!materialize_complex_vector_input(scalar_value, scalar_value, s) &&
+      !is_supported_elementwise_layout(scalar_value)) {
+    scalar_value = contiguous_copy_gpu(scalar_value, s);
+  }
+
+  const bool staged_output = !is_supported_elementwise_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  if (!is_supported_elementwise_layout(out_work)) {
+    return false;
+  }
+  if (!staged_output) {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  } else {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  }
+
+  const auto in_offset =
+      static_cast<uint64_t>(vector_in->offset() / size_of(vector_in->dtype()));
+  const auto scalar_offset = static_cast<uint64_t>(
+      scalar_value.offset() / size_of(scalar_value.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
+  const auto total = static_cast<uint64_t>(out_work.data_size());
+  if (in_offset > std::numeric_limits<uint32_t>::max() ||
+      scalar_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  ComplexScalarMulPushConstants pc{};
+  pc.in_offset = static_cast<uint32_t>(in_offset);
+  pc.scalar_offset = static_cast<uint32_t>(scalar_offset);
+  pc.out_offset = static_cast<uint32_t>(out_offset);
+  pc.total_elements = static_cast<uint32_t>(total);
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {vector_in, 0}, {&scalar_value, 1}, {&out_work, 2}};
+  constexpr uint32_t kPushConstantSize = sizeof(ComplexScalarMulPushConstants);
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_mul_c64_scalar_c64",
+      build_complex_scalar_mul_shader(),
+      3,
+      arrays,
+      kPushConstantSize,
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
+  vulkan::end_command_recording(s.index);
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::General, s);
+  }
+  return true;
+}
+
+std::string build_complex_float_mul_shader(bool complex_lhs) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {";
+  os << (complex_lhs ? "vec2" : "float") << " data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {";
+  os << (complex_lhs ? "float" : "vec2") << " data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = "
+        "a_buf.data[idx + pc.a_offset] * b_buf.data[idx + pc.b_offset];\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_complex_float_mul_vulkan(
+    array& a,
+    array& b,
+    array& out,
+    Stream s) {
+  auto materialize_float_operand = [&](array& in) -> bool {
+    if (in.dtype() != float32) {
+      return true;
+    }
+
+    if (in.shape() == out.shape() && in.data_size() != 1) {
+      return true;
+    }
+
+    if (in.shape() != out.shape() &&
+        broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
+      return false;
+    }
+
+    array materialized(out.shape(), float32, nullptr, {});
+    if (in.data_size() == 1) {
+      copy_gpu(in, materialized, CopyType::Scalar, s);
+    } else {
+      array view(out.shape(), float32, nullptr, {});
+      broadcast(in, view);
+      copy_gpu(view, materialized, CopyType::General, s);
+    }
+    in = materialized;
+    return true;
+  };
+
+  if (!materialize_float_operand(a) || !materialize_float_operand(b)) {
+    return false;
+  }
+
+  const bool complex_lhs = a.dtype() == complex64;
+  return dispatch_complex_binary_shader(
+      a,
+      b,
+      out,
+      s,
+      complex_lhs ? "dynamic_mul_c64_f32_c64" : "dynamic_mul_f32_c64_c64",
+      build_complex_float_mul_shader(complex_lhs));
+}
+
+std::string build_complex_mul_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {vec2 data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {vec2 data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  vec2 x = a_buf.data[idx + pc.a_offset];\n";
+  os << "  vec2 y = b_buf.data[idx + pc.b_offset];\n";
+  os << "  precise float real = x.x * y.x - x.y * y.y;\n";
+  os << "  precise float imag = x.x * y.y + x.y * y.x;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = vec2(real, imag);\n";
+  os << "}\n";
+  return os.str();
+}
+
+std::string build_complex_div_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {vec2 data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {vec2 data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {vec2 data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  vec2 x = a_buf.data[idx + pc.a_offset];\n";
+  os << "  vec2 y = b_buf.data[idx + pc.b_offset];\n";
+  os << "  precise float denom = y.x * y.x + y.y * y.y;\n";
+  os << "  precise float real_num = x.x * y.x + x.y * y.y;\n";
+  os << "  precise float imag_num = x.y * y.x - x.x * y.y;\n";
+  os << "  precise float real = real_num / denom;\n";
+  os << "  precise float imag = imag_num / denom;\n";
+  os << "  real += (real_num - real * denom) / denom;\n";
+  os << "  imag += (imag_num - imag * denom) / denom;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = vec2(real, imag);\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_complex_mul_vulkan(array& a, array& b, array& out, Stream s) {
+  return dispatch_complex_binary_shader(
+      a, b, out, s, "dynamic_mul_c64_c64_c64", build_complex_mul_shader());
+}
+
+bool try_eval_complex_div_vulkan(array& a, array& b, array& out, Stream s) {
+  return dispatch_complex_binary_shader(
+      a, b, out, s, "dynamic_div_c64_c64_c64", build_complex_div_shader());
+}
+
+std::string build_divmod_shader(Dtype dtype) {
+  std::ostringstream os;
+  const auto type_name = vulkan::dtype_to_glsl_storage_type(dtype);
+  os << vulkan::emit_dynamic_shader_preamble(
+      dtype, dtype, dtype == int64 || dtype == uint64);
+  os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint q_offset; uint r_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {"
+     << type_name << " data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {"
+     << type_name << " data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Quotient {"
+     << type_name << " data[];} q_buf;\n";
+  os << "layout(set = 0, binding = 3) buffer Remainder {"
+     << type_name << " data[];} r_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  " << type_name << " x = a_buf.data[idx + pc.a_offset];\n";
+  os << "  " << type_name << " y = b_buf.data[idx + pc.b_offset];\n";
+  if (dtype == float32) {
+    os << "  " << type_name << " q = trunc(x / y);\n";
+    os << "  q_buf.data[idx + pc.q_offset] = q;\n";
+    os << "  r_buf.data[idx + pc.r_offset] = x - y * q;\n";
+  } else {
+    os << "  " << type_name << " q = x / y;\n";
+    os << "  q_buf.data[idx + pc.q_offset] = q;\n";
+    os << "  r_buf.data[idx + pc.r_offset] = x % y;\n";
+  }
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_divmod_vulkan(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs,
+    Stream s) {
+  if (inputs.size() != 2 || outputs.size() != 2) {
+    return false;
+  }
+
+  array a = inputs[0];
+  array b = inputs[1];
+  auto& quotient = outputs[0];
+  auto& remainder = outputs[1];
+  const bool float_case =
+      a.dtype() == float32 && b.dtype() == float32 &&
+      quotient.dtype() == float32 && remainder.dtype() == float32;
+  const bool int_case = a.dtype() == b.dtype() && a.dtype() == quotient.dtype() &&
+      a.dtype() == remainder.dtype() &&
+      (a.dtype() == int32 || a.dtype() == uint32 || a.dtype() == int64 ||
+       a.dtype() == uint64);
+  if ((!float_case && !int_case) ||
+      quotient.shape() != remainder.shape()) {
+    return false;
+  }
+
+  auto ensure_binary_input = [&](array& in) {
+    if (in.data_size() == 1) {
+      if (in.has_primitive()) {
+        ensure_materialized_scalar_input(in);
+      }
+      return true;
+    }
+    return ensure_vulkan_buffer(in, s);
+  };
+
+  if (!ensure_binary_input(a) || !ensure_binary_input(b)) {
+    return false;
+  }
+
+  auto materialize_broadcast_input = [&](array& in) {
+    if (in.shape() == quotient.shape()) {
+      return true;
+    }
+    if (broadcast_shapes(in.shape(), quotient.shape()) != quotient.shape()) {
+      return false;
+    }
+    array view(quotient.shape(), in.dtype(), nullptr, {});
+    broadcast(in, view);
+    in = view;
+    return true;
+  };
+
+  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+    return false;
+  }
+  if (!is_supported_elementwise_layout(a)) {
+    a = contiguous_copy_gpu(a, s);
+  }
+  if (!is_supported_elementwise_layout(b)) {
+    b = contiguous_copy_gpu(b, s);
+  }
+
+  const bool staged_quotient = !is_supported_elementwise_layout(quotient);
+  const bool staged_remainder = !is_supported_elementwise_layout(remainder);
+  array quotient_work = staged_quotient
+      ? array(quotient.shape(), quotient.dtype(), nullptr, {})
+      : quotient;
+  array remainder_work = staged_remainder
+      ? array(remainder.shape(), remainder.dtype(), nullptr, {})
+      : remainder;
+  auto bopt = get_binary_op_type(a, b);
+  set_binary_op_output_data(a, b, quotient_work, bopt);
+  set_binary_op_output_data(a, b, remainder_work, bopt);
+  if (!is_supported_elementwise_layout(quotient_work) ||
+      !is_supported_elementwise_layout(remainder_work)) {
+    return false;
+  }
+
+  if (quotient_work.size() == 0) {
+    if (staged_quotient) {
+      copy_gpu(quotient_work, quotient, CopyType::General, s);
+    }
+    if (staged_remainder) {
+      copy_gpu(remainder_work, remainder, CopyType::General, s);
+    }
+    return true;
+  }
+
+  const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
+  const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
+  const auto q_offset = static_cast<uint64_t>(
+      quotient_work.offset() / size_of(quotient_work.dtype()));
+  const auto r_offset = static_cast<uint64_t>(
+      remainder_work.offset() / size_of(remainder_work.dtype()));
+  const auto total = static_cast<uint64_t>(quotient_work.data_size());
+  if (a_offset > std::numeric_limits<uint32_t>::max() ||
+      b_offset > std::numeric_limits<uint32_t>::max() ||
+      q_offset > std::numeric_limits<uint32_t>::max() ||
+      r_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&a, 0}, {&b, 1}, {&quotient_work, 2}, {&remainder_work, 3}};
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 5;
+  const std::string shader_name = "dynamic_divmod_" +
+      std::to_string(static_cast<int>(a.dtype().val()));
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      shader_name,
+      build_divmod_shader(a.dtype()),
+      4,
+      arrays,
+      kPushConstantSize,
+      s);
+  struct PushConstants {
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t q_offset;
+    uint32_t r_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(a_offset),
+      static_cast<uint32_t>(b_offset),
+      static_cast<uint32_t>(q_offset),
+      static_cast<uint32_t>(r_offset),
+      static_cast<uint32_t>(total),
+  };
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255) / 256, 1, 1);
+  vulkan::end_command_recording(s.index);
+
+  if (staged_quotient) {
+    copy_gpu(quotient_work, quotient, CopyType::General, s);
+  }
+  if (staged_remainder) {
+    copy_gpu(remainder_work, remainder, CopyType::General, s);
+  }
+  return true;
+}
+
+bool try_eval_remainder_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  array quotient(out.shape(), out.dtype(), nullptr, {});
+  std::vector<array> outputs = {quotient, out};
+  return try_eval_divmod_vulkan(inputs, outputs, s);
 }
 
 template <typename Primitive>
@@ -162,13 +877,78 @@ bool try_eval_binary_op_vulkan(
       is_vulkan_float_dtype(b.dtype()) && is_vulkan_float_dtype(out.dtype());
   const bool integer_case = a.dtype() == b.dtype() &&
       a.dtype() == out.dtype() && is_vulkan_integer_dtype(a.dtype());
-  if (!float_case && !integer_case && !bool_add && !mixed_numeric_div) {
+  const bool complex_add =
+      std::is_same_v<Primitive, Add> && is_same_complex_add(a, b, out);
+  const bool complex_sub =
+      std::is_same_v<Primitive, Subtract> && is_same_complex_sub(a, b, out);
+  const bool complex_scalar_mul =
+      std::is_same_v<Primitive, Multiply> && is_complex_scalar_mul(a, b, out);
+  const bool complex_float_mul =
+      std::is_same_v<Primitive, Multiply> && is_complex_float_mul(a, b, out);
+  const bool complex_mul =
+      std::is_same_v<Primitive, Multiply> && is_same_complex_mul(a, b, out);
+  const bool complex_div =
+      std::is_same_v<Primitive, Divide> && is_same_complex_div(a, b, out);
+  const bool complex_max =
+      std::is_same_v<Primitive, Maximum> && is_same_complex_max(a, b, out);
+  const bool complex_min =
+      std::is_same_v<Primitive, Minimum> && is_same_complex_min(a, b, out);
+  if (!float_case && !integer_case && !bool_add && !mixed_numeric_div &&
+      !complex_add && !complex_sub && !complex_scalar_mul &&
+      !complex_float_mul && !complex_mul && !complex_div && !complex_max &&
+      !complex_min) {
     trace_binary_unsupported("unsupported_dtype_combo", a, b);
     return false;
   }
 
+  if ((a.data_size() == 1 && a.has_primitive()) ||
+      (b.data_size() == 1 && b.has_primitive())) {
+    if (a.data_size() == 1 && a.has_primitive()) {
+      ensure_materialized_scalar_input(a);
+    }
+    if (b.data_size() == 1 && b.has_primitive()) {
+      ensure_materialized_scalar_input(b);
+    }
+  }
+
+  if (out.size() == 0) {
+    return true;
+  }
+
   if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s)) {
     return false;
+  }
+
+  if (complex_add) {
+    return try_eval_complex_add_vulkan(a, b, out, s);
+  }
+
+  if (complex_sub) {
+    return try_eval_complex_sub_vulkan(a, b, out, s);
+  }
+
+  if (complex_scalar_mul) {
+    return try_eval_complex_scalar_mul_vulkan(a, b, out, s);
+  }
+
+  if (complex_float_mul) {
+    return try_eval_complex_float_mul_vulkan(a, b, out, s);
+  }
+
+  if (complex_mul) {
+    return try_eval_complex_mul_vulkan(a, b, out, s);
+  }
+
+  if (complex_div) {
+    return try_eval_complex_div_vulkan(a, b, out, s);
+  }
+
+  if (complex_max) {
+    return try_eval_complex_max_vulkan(a, b, out, s);
+  }
+
+  if (complex_min) {
+    return try_eval_complex_min_vulkan(a, b, out, s);
   }
 
   if (bool_add) {
@@ -223,12 +1003,69 @@ bool try_eval_binary_op_vulkan(
     b = b_f32;
   }
 
-  auto materialize_broadcast_input = [&](array& in) {
+  const bool scalar_vector_case =
+      (a.data_size() == 1 && b.size() > 1) || (b.data_size() == 1 && a.size() > 1);
+  if (scalar_vector_case) {
+    bool scalar_is_a = a.data_size() == 1;
+    array scalar = scalar_is_a ? a : b;
+    array vec = scalar_is_a ? b : a;
+
+    if (scalar.has_primitive()) {
+      ensure_materialized_scalar_input(scalar);
+    }
+    if (vec.has_primitive() || !has_vulkan_buffer(vec) ||
+        !is_supported_elementwise_layout(vec)) {
+      vec = contiguous_copy_gpu(vec, s);
+    }
+
+    array scalar_broadcast(
+        out.shape(),
+        scalar.dtype(),
+        std::make_shared<Broadcast>(s, out.shape()),
+        {scalar});
+    ensure_materialized_scalar_input(scalar_broadcast);
+    array scalar_full(out.shape(), scalar.dtype(), nullptr, {});
+    copy_gpu(scalar_broadcast, scalar_full, CopyType::Scalar, s);
+
+    if (scalar_is_a) {
+      a = scalar_full;
+      b = vec;
+    } else {
+      a = vec;
+      b = scalar_full;
+    }
+  }
+
+  bool a_materialized = false;
+  bool b_materialized = false;
+  auto materialize_broadcast_input = [&](array& in, bool& was_materialized) {
     if (in.shape() == out.shape()) {
+      if (in.data_size() == 1 && in.size() != 1) {
+        if (in.has_primitive()) {
+          ensure_materialized_scalar_input(in);
+        }
+        array materialized_arr(out.shape(), in.dtype(), nullptr, {});
+        copy_gpu(in, materialized_arr, CopyType::Scalar, s);
+        in = materialized_arr;
+        was_materialized = true;
+      }
       return true;
     }
     if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
       return false;
+    }
+    if (in.data_size() == 1) {
+      array broadcast_arr(
+          out.shape(),
+          in.dtype(),
+          std::make_shared<Broadcast>(s, out.shape()),
+          {in});
+      ensure_materialized_scalar_input(broadcast_arr);
+      array materialized_arr(out.shape(), in.dtype(), nullptr, {});
+      copy_gpu(broadcast_arr, materialized_arr, CopyType::Scalar, s);
+      in = materialized_arr;
+      was_materialized = true;
+      return true;
     }
     if (!ensure_vulkan_buffer(in, s)) {
       return false;
@@ -236,10 +1073,12 @@ bool try_eval_binary_op_vulkan(
     array view(out.shape(), in.dtype(), nullptr, {});
     broadcast(in, view);
     in = view;
+    was_materialized = true;
     return true;
   };
 
-  if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+  if (!materialize_broadcast_input(a, a_materialized) ||
+      !materialize_broadcast_input(b, b_materialized)) {
     trace_binary_unsupported("broadcast_materialization_failed", a, b);
     return false;
   }
@@ -269,6 +1108,10 @@ bool try_eval_binary_op_vulkan(
 
   auto bopt = get_binary_op_type(a, b);
   if (small_signed_integer_case || small_unsigned_integer_case) {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  } else if constexpr (std::is_same_v<Primitive, Multiply>) {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  } else if (a_materialized || b_materialized) {
     out_work.set_data(allocator::malloc(out_work.nbytes()));
   } else {
     set_binary_op_output_data(a, b, out_work, bopt);
@@ -308,11 +1151,19 @@ bool try_eval_binary_op_vulkan(
     if constexpr (std::is_same_v<Primitive, Add>) {
       if (use_f32_staging_io || bool_add || integer_case) {
         dispatch_variant = vulkan::BinaryDispatchVariant::Standard;
+      } else if (a.data_size() == 1 || b.data_size() == 1) {
+        dispatch_variant = vulkan::BinaryDispatchVariant::Standard;
       }
     }
     vulkan::dispatch_binary_op(
         a, b, out_kernel, *shader_id, command_buffer, s, dispatch_variant);
     vulkan::end_command_recording(s.index);
+    vulkan::retain_array_for_stream(s, a);
+    vulkan::retain_array_for_stream(s, b);
+    vulkan::retain_array_for_stream(s, out_kernel);
+    if (out_work.data_shared_ptr() != out_kernel.data_shared_ptr()) {
+      vulkan::retain_array_for_stream(s, out_work);
+    }
     if (staged_output || use_f32_staging_io) {
       copy_gpu(out_work, out, CopyType::General, s);
     }
@@ -437,10 +1288,26 @@ VULKAN_BINARY_GPU(Divide, "div")
 VULKAN_BINARY_GPU(Subtract, "sub")
 VULKAN_BINARY_GPU(Multiply, "mul")
 
+void Remainder::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!try_eval_remainder_vulkan(inputs, out, stream())) {
+    throw std::runtime_error(
+        "Remainder has no Vulkan implementation.");
+  }
+}
+
 void GreaterEqual::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_greater_equal_vulkan(inputs, out, stream())) {
     throw std::runtime_error(
         "GreaterEqual operation failed on Vulkan (unsupported dtype or layout).");
+  }
+}
+
+void DivMod::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  if (!try_eval_divmod_vulkan(inputs, outputs, stream())) {
+    throw std::runtime_error(
+        "DivMod operation failed on Vulkan (unsupported dtype or layout).");
   }
 }
 

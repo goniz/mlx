@@ -20,8 +20,8 @@ layout (constant_id = 4) const bool INCLUSIVE = true;
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
-shared FLOAT_TYPE partial[BLOCK_SIZE / SUBGROUP_SIZE];
-shared FLOAT_TYPE last_sum;
+shared float partial[BLOCK_SIZE / SUBGROUP_SIZE];
+shared float last_prod;
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -38,55 +38,57 @@ void main() {
     uint subgroup_id = tid / SUBGROUP_SIZE;
 
     if (tid == 0) {
-        last_sum = 0;
+        last_prod = 1;
     }
 
     uint col = tid * ELEM_PER_THREAD;
     uint num_iter = CEIL_DIV(p.n_cols, BLOCK_SIZE * ELEM_PER_THREAD);
     for (int i = 0; i < num_iter; ++i) {
-        FLOAT_TYPE v[ELEM_PER_THREAD];
-        FLOAT_TYPE exclusive_v[ELEM_PER_THREAD];
-        FLOAT_TYPE thread_sum = 0;
+        float v[ELEM_PER_THREAD];
+        float exclusive_v[ELEM_PER_THREAD];
+        float thread_prod = 1;
         [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
-            exclusive_v[j] = thread_sum;
+            exclusive_v[j] = thread_prod;
             const uint logical_col = col + j;
             if (logical_col < p.n_cols) {
                 const uint read_col = REVERSE ? (p.n_cols - 1 - logical_col) : logical_col;
-                thread_sum += FLOAT_TYPE(data_a[src_idx + read_col]);
+                thread_prod *= float(data_a[src_idx + read_col]);
             }
-            v[j] = thread_sum;
+            v[j] = thread_prod;
         }
 
-        thread_sum = subgroupExclusiveAdd(thread_sum);
+        thread_prod = subgroupExclusiveMul(thread_prod);
         [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
-            exclusive_v[j] += thread_sum;
-            v[j] += thread_sum;
+            exclusive_v[j] *= thread_prod;
+            v[j] *= thread_prod;
         }
-        // Store the largest partial sum for each subgroup, then add the partials for all
-        // lower subgroups and the final partial sum from the previous iteration.
         if (gl_SubgroupInvocationID == SUBGROUP_SIZE - 1) {
             partial[subgroup_id] = v[ELEM_PER_THREAD - 1];
         }
         barrier();
         for (int s = 0; s < subgroup_id; ++s) {
             [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
-                exclusive_v[j] += partial[s];
-                v[j] += partial[s];
+                exclusive_v[j] *= partial[s];
+                v[j] *= partial[s];
             }
         }
         [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
-            exclusive_v[j] += last_sum;
-            v[j] += last_sum;
+            exclusive_v[j] *= last_prod;
+            v[j] *= last_prod;
         }
         barrier();
         if (tid == BLOCK_SIZE - 1) {
-            last_sum = v[ELEM_PER_THREAD - 1];
+            last_prod = v[ELEM_PER_THREAD - 1];
         }
         [[unroll]] for (uint j = 0; j < ELEM_PER_THREAD; ++j) {
             const uint logical_col = col + j;
             if (logical_col < p.n_cols) {
                 const uint write_col = REVERSE ? (p.n_cols - 1 - logical_col) : logical_col;
-                data_d[dst_idx + write_col] = D_TYPE(INCLUSIVE ? v[j] : exclusive_v[j]);
+                if (INCLUSIVE) {
+                    data_d[dst_idx + write_col] = D_TYPE(v[j]);
+                } else {
+                    data_d[dst_idx + write_col] = D_TYPE(exclusive_v[j]);
+                }
             }
         }
         col += BLOCK_SIZE * ELEM_PER_THREAD;

@@ -7,8 +7,8 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
-layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+layout(binding = 0) readonly buffer X { A_TYPE data_a[]; };
+layout(binding = 1) writeonly buffer D { D_TYPE data_d[]; };
 
 void main() {
     const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
@@ -17,9 +17,9 @@ void main() {
         return;
     }
 
-#ifdef INT_ABS
-    data_d[i] = D_TYPE(abs(data_a[i]));
+#if defined(UNSIGNED_NEGATE)
+    data_d[i] = D_TYPE(0) - data_a[i];
 #else
-    data_d[i] = D_TYPE(abs(float(data_a[i])));
+    data_d[i] = -data_a[i];
 #endif
 }

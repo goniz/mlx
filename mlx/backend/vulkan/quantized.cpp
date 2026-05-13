@@ -887,24 +887,43 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
   }
 
-  array xhat = nvfp4_quantize_dequantize(inputs[0], s, global_scale_x);
-  array w_hat = dequantize(
-      inputs[1],
-      inputs[2],
-      std::nullopt,
-      group_size_,
-      bits_,
-      mode,
-      global_scale_w,
-      inputs[0].dtype(),
-      s);
+  array x_f32 = ensure_float32_row_contiguous(inputs[0], s);
+  Shape xq_shape = x_f32.shape();
+  xq_shape.back() = xq_shape.back() * bits_ / 32;
+  Shape x_scales_shape = x_f32.shape();
+  x_scales_shape.back() = x_scales_shape.back() / group_size_;
 
-  array result = matmul(xhat, swapaxes(w_hat, -1, -2, s), s);
-  if (out.dtype() != result.dtype()) {
-    result = astype(result, out.dtype(), s);
+  array x_q(xq_shape, uint32, nullptr, {});
+  array x_scales(x_scales_shape, uint8, nullptr, {});
+  if (!vulkan::nvfp4_quantize_from_float32(
+          x_f32, x_q, x_scales, global_scale_x, s)) {
+    throw std::runtime_error(
+        "[QQMatmul::eval_gpu] Failed to quantize lhs on Vulkan.");
   }
-  eval(result);
-  out.copy_shared_buffer(result);
+
+  array xhat(x_f32.shape(), float32, nullptr, {});
+  if (!vulkan::nvfp4_dequantize_to_float32(
+          x_q, x_scales, global_scale_x, xhat, s)) {
+    throw std::runtime_error(
+        "[QQMatmul::eval_gpu] Failed to dequantize lhs on Vulkan.");
+  }
+
+  array what(expanded_quantized_shape(inputs[1], bits_), float32, nullptr, {});
+  if (!vulkan::nvfp4_dequantize_to_float32(
+          inputs[1], inputs[2], global_scale_w, what, s)) {
+    throw std::runtime_error(
+        "[QQMatmul::eval_gpu] Failed to dequantize rhs on Vulkan.");
+  }
+
+  array rhs = ensure_row_contiguous_zero_offset(swapaxes_in_eval(what, -1, -2), s);
+  array result(out.shape(), float32, nullptr, {});
+  if (!try_eval_matmul_vulkan({xhat, rhs}, result, s)) {
+    throw std::runtime_error(
+        "[QQMatmul::eval_gpu] Failed to dispatch Vulkan fallback matmul.");
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  copy_gpu(result, out, CopyType::General, s);
 }
 
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {

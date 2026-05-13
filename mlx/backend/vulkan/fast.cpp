@@ -985,28 +985,8 @@ bool try_eval_flash_attention_vulkan(
     array out_transposed = swapaxes_in_eval(out_storage, 1, 2);
     trace_flash_attention_array("out_storage", out_storage);
     trace_flash_attention_array("out_transposed", out_transposed);
-    if (out.dtype() == float32) {
-      copy_gpu(out_transposed, out, CopyType::General, s);
-      out.set_status(array::Status::evaluated);
-      return true;
-    }
-
-    array out_final = astype(out_transposed, out.dtype(), s);
-    trace_flash_attention_array("out_final", out_final);
-    eval(out_final);
-    if (out.shape() == out_final.shape()) {
-      auto data = out_final.data_shared_ptr();
-      if (data != nullptr && data->buffer.ptr() != nullptr) {
-        out.copy_shared_buffer(out_final);
-        out.set_status(array::Status::evaluated);
-      } else {
-        copy_gpu(out_final, out, CopyType::General, s);
-        out.set_status(array::Status::evaluated);
-      }
-    } else {
-      copy_gpu(out_final, out, CopyType::General, s);
-      out.set_status(array::Status::evaluated);
-    }
+    copy_gpu(out_transposed, out, CopyType::General, s);
+    out.set_status(array::Status::evaluated);
     return true;
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {
@@ -2194,14 +2174,22 @@ void ScaledDotProductAttention::eval_gpu(
     }
   }
 
-  auto result = matmul(scores_work, v_work, s);
-  if (result.dtype() != outputs[0].dtype()) {
-    result = astype(result, outputs[0].dtype(), s);
-  }
-
-  eval(result);
-
-  copy_gpu(result, outputs[0], CopyType::General, s);
+  array result_f32(
+      Shape{
+          scores_work.shape(0),
+          scores_work.shape(1),
+          scores_work.shape(2),
+          v_work.shape(-1),
+      },
+      float32,
+      nullptr,
+      {});
+  eval_sdpa_matmul_vulkan(scores_work, v_work, result_f32, s);
+  copy_gpu(
+      reshape_sdpa_contiguous_view(result_f32, outputs[0].shape()),
+      outputs[0],
+      CopyType::General,
+      s);
 
   if (output_logsumexp_) {
     throw std::runtime_error(
@@ -2434,12 +2422,9 @@ void LayerNormVJP::eval_gpu(
   array gb = (b.ndim() == 0) ? zeros_like(b, s)
                              : sum(g, axes, /* keepdims= */ false, s);
 
-  eval(gx);
-  eval(gw);
-  eval(gb);
-  outputs[0].copy_shared_buffer(gx);
-  outputs[1].copy_shared_buffer(gw);
-  outputs[2].copy_shared_buffer(gb);
+  copy_gpu(gx, outputs[0], CopyType::General, stream());
+  copy_gpu(gw, outputs[1], CopyType::General, stream());
+  copy_gpu(gb, outputs[2], CopyType::General, stream());
   outputs[0].set_status(array::Status::evaluated);
   outputs[1].set_status(array::Status::evaluated);
   outputs[2].set_status(array::Status::evaluated);

@@ -25,7 +25,8 @@ layout(push_constant) uniform parameter {
 } p;
 
 shared float partial[256];
-shared float x_group_scale;
+shared float x_group_encoded_scale;
+shared float x_group_scale_encode;
 
 float fp8_e4m3_to_fp32(uint8_t x) {
     uint v = (uint(x) & 127u) << 7;
@@ -34,20 +35,22 @@ float fp8_e4m3_to_fp32(uint8_t x) {
 }
 
 uint8_t fp32_to_fp8_e4m3_positive(float x) {
-    if (x <= 0.0) {
-        return uint8_t(0u);
-    }
-    uint best = 0u;
-    float best_err = abs(x - fp8_e4m3_to_fp32(uint8_t(0u)));
-    for (uint code = 1u; code < 128u; ++code) {
-        float v = fp8_e4m3_to_fp32(uint8_t(code));
-        float err = abs(x - v);
-        if (err < best_err) {
-            best_err = err;
-            best = code;
-        }
-    }
-    return uint8_t(best);
+    const uint fp8_max = 543u << 21;
+    const uint denorm_mask = 141u << 23;
+    uint f_bits = floatBitsToUint(x);
+    uint sign = f_bits & 0x80000000u;
+    f_bits = f_bits ^ sign;
+
+    uint f_bits_low = floatBitsToUint(uintBitsToFloat(f_bits) + uintBitsToFloat(denorm_mask));
+    uint result_low = f_bits_low - denorm_mask;
+
+    uint mant_odd = (f_bits >> 20) & 1u;
+    uint f_bits_high = f_bits + 0xC407FFFFu + mant_odd;
+    uint result_high = f_bits_high >> 20;
+
+    uint result = f_bits < (121u << 23) ? result_low : result_high;
+    result = f_bits >= fp8_max ? 0x7Eu : result;
+    return uint8_t(result | (sign >> 24));
 }
 
 float nvfp4_lut(uint q) {
@@ -62,7 +65,7 @@ uint quant_nvfp4(float x) {
     float best_err = abs(x - nvfp4_lut(0u));
     for (uint q = 1u; q < 16u; ++q) {
         float err = abs(x - nvfp4_lut(q));
-        if (err <= best_err) {
+        if (err < best_err) {
             best_err = err;
             best = q;
         }
@@ -105,14 +108,21 @@ void main() {
             float scale_encode = p.has_global_scale_x != 0u
                 ? (448.0 * 6.0) / data_global_scale_x[0]
                 : 1.0;
-            uint8_t scale_enc = fp32_to_fp8_e4m3_positive(raw_scale * scale_encode);
-            x_group_scale = fp8_e4m3_to_fp32(scale_enc) / scale_encode;
+            float encoded_scale_value = p.has_global_scale_x != 0u
+                ? amax * (448.0 / data_global_scale_x[0])
+                : raw_scale;
+            uint8_t scale_enc = fp32_to_fp8_e4m3_positive(encoded_scale_value);
+            x_group_encoded_scale = fp8_e4m3_to_fp32(scale_enc);
+            x_group_scale_encode = scale_encode;
         }
         barrier();
 
-        const float inv_x_scale = x_group_scale != 0.0 ? 1.0 / x_group_scale : 0.0;
         for (uint k = group_start + tid; k < group_end; k += gl_WorkGroupSize.x) {
-            const float xq = nvfp4_lut(quant_nvfp4(data_x[x_row_base + k] * inv_x_scale)) * x_group_scale;
+            const float normalized = x_group_encoded_scale != 0.0
+                ? (data_x[x_row_base + k] / x_group_encoded_scale) * x_group_scale_encode
+                : 0.0;
+            const float x_group_scale = x_group_encoded_scale / x_group_scale_encode;
+            const float xq = nvfp4_lut(quant_nvfp4(normalized)) * x_group_scale;
             acc = fma(xq, decode_w(w_row_base, scale_row_base, k), acc);
         }
         barrier();

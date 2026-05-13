@@ -2036,7 +2036,8 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
       ? CopyType::Vector
       : CopyType::General;
   if (reduce_type_ == SliceUpdate::None && in.is_donatable() &&
-      in.itemsize() == out.itemsize()) {
+      in.itemsize() == out.itemsize() && in.flags().contiguous &&
+      in.size() == in.data_size()) {
     out.copy_shared_buffer(in);
   } else {
     copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());

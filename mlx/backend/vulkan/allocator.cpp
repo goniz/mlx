@@ -64,6 +64,17 @@ namespace vulkan {
 
 namespace {
 
+void reset_buffer_sync_state(VulkanBuffer* buf) {
+  if (buf == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(buf->queue_affinity_mutex);
+  buf->last_semaphore = vk::Semaphore();
+  buf->last_timeline_value = 0;
+  buf->queue_affinity = VulkanBuffer::QueueAffinity::None;
+}
+
 constexpr size_t min_cache_pool_size = 4096 * 4;
 constexpr size_t default_cache_pool_size = 1 << 20;
 constexpr size_t opportunistic_decode_pool_size = 4 << 20;
@@ -330,6 +341,7 @@ Buffer VulkanAllocator::malloc(size_t size) {
         buffer_cache_.recycle_to_cache(cached);
       } else {
         cached->size = size;
+        reset_buffer_sync_state(cached);
         active_memory_ += cached->size;
         peak_memory_ = std::max(peak_memory_, active_memory_);
         live_buffers_.insert(cached);
@@ -484,6 +496,7 @@ void VulkanAllocator::free(Buffer buffer) {
     const auto pool_limit = cache_pool_limit(active_memory_, max_pool_size_);
     if (buf->allocation_size <= cacheable_limit &&
         get_cache_memory() + buf->allocation_size <= pool_limit) {
+      reset_buffer_sync_state(buf);
       buffer_cache_.recycle_to_cache(buf);
       trace_free(buf->size, true);
       return;

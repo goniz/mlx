@@ -23,51 +23,6 @@ class MLXTestRunner(unittest.TestProgram):
         kwargs["exit"] = False
         super().__init__(*args, **kwargs)
 
-    def createTests(self, *args, **kwargs):
-        super().createTests(*args, **kwargs)
-
-        # Asume CUDA backend in this case
-        device = os.getenv("DEVICE", None)
-        if device is not None:
-            device = getattr(mx, device)
-        else:
-            device = mx.default_device()
-
-        is_cuda = device == mx.gpu and not mx.metal.is_available()
-        is_vulkan = (
-            device == mx.gpu
-            and mx.metal.is_available()
-            and mx.device_info().get("architecture") == "Vulkan"
-        )
-
-        if not (is_cuda or is_vulkan):
-            return
-
-        if is_cuda:
-            from cuda_skip import cuda_skip
-
-            skip_list = cuda_skip
-        elif is_vulkan:
-            from vulkan_skip import vulkan_skip
-
-            skip_list = vulkan_skip
-
-        filtered_suite = unittest.TestSuite()
-
-        def filter_and_add(t):
-            if isinstance(t, unittest.TestSuite):
-                for sub_t in t:
-                    filter_and_add(sub_t)
-            else:
-                t_id = ".".join(t.id().split(".")[-2:])
-                if t_id in skip_list:
-                    print(f"Skipping {t_id}")
-                else:
-                    filtered_suite.addTest(t)
-
-        filter_and_add(self.test)
-        self.test = filtered_suite
-
     def runTests(self):
         super().runTests()
         mx.clear_streams()

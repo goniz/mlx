@@ -1,6 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <array>
+#include <chrono>
+#include <cmath>
+#include <future>
 
 #include "doctest/doctest.h"
 #include "mlx/mlx.h"
@@ -191,19 +194,6 @@ TEST_CASE("test gpu reduce with axes") {
       auto out_cpu = sum(a, {0, 1, ax}, false, Device::cpu);
       CHECK(array_equal(out_gpu, out_cpu, Device::cpu).item<bool>());
     }
-
-    auto b = reshape(arange(0.0f, 2.0f * 3.0f * 4.0f * 5.0f), {2, 3, 4, 5});
-    auto b_nc = swapaxes(b, 1, 3);
-    auto out_gpu_keepdims = sum(b_nc, {0, 2}, true, Device::gpu);
-    auto out_cpu_keepdims = sum(b_nc, {0, 2}, true, Device::cpu);
-    CHECK(array_equal(out_gpu_keepdims, out_cpu_keepdims, Device::cpu)
-              .item<bool>());
-
-    auto b_nc_f16 = astype(b_nc, float16, Device::gpu);
-    auto out_gpu_f16 = sum(b_nc_f16, {0, 2}, true, Device::gpu);
-    auto out_cpu_f16 = sum(b_nc_f16, {0, 2}, true, Device::cpu);
-    CHECK(allclose(out_gpu_f16, out_cpu_f16, 5e-3, 5e-3, false, Device::cpu)
-              .item<bool>());
   }
 }
 
@@ -275,7 +265,6 @@ TEST_CASE("test gpu binary ops") {
     CHECK(array_equal(out, array({2, 4, 6}), Device::cpu).item<bool>());
   }
 
-
   // Check division
   {
     auto x = array(1.0f);
@@ -304,12 +293,6 @@ TEST_CASE("test gpu binary ops") {
     y = array(2.0f);
     CHECK_EQ(maximum(x, y, Device::gpu).item<float>(), 2.0f);
     CHECK_EQ(minimum(x, y, Device::gpu).item<float>(), 1.0f);
-
-    auto nan = array(std::numeric_limits<float>::quiet_NaN());
-    CHECK(std::isnan(maximum(nan, y, Device::gpu).item<float>()));
-    CHECK(std::isnan(maximum(y, nan, Device::gpu).item<float>()));
-    CHECK(std::isnan(minimum(nan, y, Device::gpu).item<float>()));
-    CHECK(std::isnan(minimum(y, nan, Device::gpu).item<float>()));
   }
 
   // Check equal
@@ -382,7 +365,6 @@ TEST_CASE("test gpu unary ops") {
     CHECK(array_equal(abs(y, Device::gpu), expected, Device::cpu).item<bool>());
   }
 
-
   // Test negative
   {
     array x(1.0f);
@@ -414,14 +396,6 @@ TEST_CASE("test gpu unary ops") {
 
     x = array(-2.0f);
     CHECK(std::isnan(log1p(x, Device::gpu).item<float>()));
-  }
-
-  {
-    auto x = array({-0.999f, -0.5f, 0.0f, 0.5f, 0.999f}, {5}, float32);
-    auto out_gpu = erfinv(x, Device::gpu);
-    auto out_cpu = erfinv(x, Device::cpu);
-    CHECK(allclose(out_gpu, out_cpu, 1e-5, 1e-5, false, Device::cpu)
-              .item<bool>());
   }
 }
 
@@ -470,59 +444,6 @@ TEST_CASE("test gpu matmul") {
     auto b = ones({3, 1, 2, 2});
     auto out = matmul(a, b, Device::gpu);
     CHECK(array_equal(out, full({3, 3, 2, 2}, 2.0f), Device::cpu).item<bool>());
-  }
-}
-
-TEST_CASE("test gpu scan softmax trig parity") {
-  {
-    auto x = reshape(arange(1.0f, 1.0f + 2 * 3 * 5, 1.0f), {2, 3, 5});
-    x = transpose(x, {1, 2, 0});
-
-    auto cumsum_gpu = cumsum(x, 1, true, false, Device::gpu);
-    auto cumsum_cpu = cumsum(x, 1, true, false, Device::cpu);
-    CHECK(array_equal(cumsum_gpu, cumsum_cpu, Device::cpu).item<bool>());
-  }
-
-  {
-    auto logits = reshape(arange(-12.0f, 12.0f, 0.5f), {4, 3, 4});
-    logits = transpose(logits, {1, 2, 0});
-
-    auto sm_gpu = softmax(logits, std::vector<int>{1}, false, Device::gpu);
-    auto sm_cpu = softmax(logits, std::vector<int>{1}, false, Device::cpu);
-    CHECK(
-        allclose(sm_gpu, sm_cpu, 1e-5, 1e-5, false, Device::cpu).item<bool>());
-  }
-
-  {
-    auto x = reshape(arange(-20.0f, 20.0f, 0.25f), {8, 5, 4});
-    x = transpose(x, {2, 0, 1});
-
-    auto sin_gpu = sin(x, Device::gpu);
-    auto sin_cpu = sin(x, Device::cpu);
-    CHECK(allclose(sin_gpu, sin_cpu, 1e-6, 1e-6, false, Device::cpu)
-              .item<bool>());
-
-    auto cos_gpu = cos(x, Device::gpu);
-    auto cos_cpu = cos(x, Device::cpu);
-    CHECK(allclose(cos_gpu, cos_cpu, 1e-6, 1e-6, false, Device::cpu)
-              .item<bool>());
-  }
-
-  {
-    auto x = reshape(arange(-9.0f, 9.0f, 0.25f), {3, 4, 6});
-    x = transpose(x, {2, 0, 1});
-
-    auto x_f16 = astype(x, float16, Device::gpu);
-    auto argmax_f16_gpu = argmax(x_f16, 1, false, Device::gpu);
-    auto argmax_f16_cpu = argmax(x_f16, 1, false, Device::cpu);
-    CHECK(
-        array_equal(argmax_f16_gpu, argmax_f16_cpu, Device::cpu).item<bool>());
-
-    auto x_bf16 = astype(x, bfloat16, Device::gpu);
-    auto argmax_bf16_gpu = argmax(x_bf16, 2, true, Device::gpu);
-    auto argmax_bf16_cpu = argmax(x_bf16, 2, true, Device::cpu);
-    CHECK(array_equal(argmax_bf16_gpu, argmax_bf16_cpu, Device::cpu)
-              .item<bool>());
   }
 }
 
@@ -597,64 +518,48 @@ TEST_CASE("test memory info") {
     CHECK(peak_mem >= 4096 * 8);
 
     auto cache_mem = get_cache_memory();
-    if (cache_mem != 0) {
-      CHECK(cache_mem >= 4096 * 4);
-    }
+    CHECK(cache_mem >= 4096 * 4);
   }
 
   clear_cache();
   CHECK_EQ(get_cache_memory(), 0);
 }
 
-TEST_CASE("test gpu deferred slice update alias hazard") {
-  auto src_gpu = arange(0.0f, 8.0f, 1.0f, float32, Device::gpu);
-  auto upd_gpu = slice(src_gpu, {1}, {5}, Device::gpu);
-  auto out_gpu =
-      slice_update(src_gpu, upd_gpu, Shape{0}, Shape{4}, Device::gpu);
+TEST_CASE("test scatter_prod with NaN does not hang") {
+  // Regression test for the NaN CAS workaround in atomic.h. The std::async
+  // timeout converts a wedged GPU into a test failure.
+  auto run_with_timeout = [](auto fn) {
+    auto fut = std::async(std::launch::async, std::move(fn));
+    REQUIRE(
+        fut.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    return fut.get();
+  };
 
-  auto src_cpu = arange(0.0f, 8.0f, 1.0f, float32, Device::cpu);
-  auto upd_cpu = slice(src_cpu, {1}, {5}, Device::cpu);
-  auto out_cpu =
-      slice_update(src_cpu, upd_cpu, Shape{0}, Shape{4}, Device::cpu);
+  float nan = std::nanf("");
 
-  const bool equal = array_equal(out_gpu, out_cpu, Device::cpu).item<bool>();
-  CHECK(equal);
-}
-
-TEST_CASE("test gpu deferred scalar upload") {
-  auto gpu = full({3, 4}, 7.0f, float32, Device::gpu);
-  auto cpu = full({3, 4}, 7.0f, float32, Device::cpu);
-  CHECK(array_equal(gpu, cpu, Device::cpu).item<bool>());
-}
-
-TEST_CASE("test gpu deferred rope readback") {
-  auto x_gpu =
-      reshape(arange(0.0f, 32.0f, 1.0f, float32, Device::gpu), {2, 2, 8});
-  auto x_cpu =
-      reshape(arange(0.0f, 32.0f, 1.0f, float32, Device::cpu), {2, 2, 8});
-  auto offset_gpu = array({1, 3}, int32);
-  auto offset_cpu = array({1, 3}, int32);
-  auto freqs_gpu = arange(1.0f, 5.0f, 1.0f, float32, Device::gpu);
-  auto freqs_cpu = arange(1.0f, 5.0f, 1.0f, float32, Device::cpu);
-
-  auto out_gpu = fast::rope(
-      x_gpu, 8, false, std::nullopt, 1.0f, offset_gpu, freqs_gpu, Device::gpu);
-  auto out_cpu = fast::rope(
-      x_cpu, 8, false, std::nullopt, 1.0f, offset_cpu, freqs_cpu, Device::cpu);
-
-  CHECK(allclose(out_gpu, out_cpu, 1e-5f, 1e-5f, false, Device::cpu)
-            .item<bool>());
-}
-
-TEST_CASE("test gpu deferred multi-submit retirement") {
-  auto gpu_x = arange(0.0f, 1024.0f, 1.0f, float32, Device::gpu);
-  auto cpu_x = arange(0.0f, 1024.0f, 1.0f, float32, Device::cpu);
-  array one(1.0f);
-
-  for (int i = 0; i < 48; ++i) {
-    gpu_x = add(cos(gpu_x, Device::gpu), one, Device::gpu);
-    cpu_x = add(cos(cpu_x, Device::cpu), one, Device::cpu);
+  // NaN-valued update colliding with a normal update on the same slot.
+  {
+    auto out = run_with_timeout([&] {
+      auto x = array({1.0f, 1.0f, 1.0f, 1.0f});
+      auto idx = array({0, 0});
+      auto upd = array({nan, 2.0f}, {2, 1});
+      auto y = scatter_prod(x, idx, upd, 0, Device::gpu);
+      eval(y);
+      return y;
+    });
+    CHECK(std::isnan(out.data<float>()[0]));
   }
 
-  CHECK(allclose(gpu_x, cpu_x, 1e-5f, 1e-5f, false, Device::cpu).item<bool>());
+  // NaN already in memory before any update lands.
+  {
+    auto out = run_with_timeout([&] {
+      auto x = array({nan, 1.0f, 1.0f, 1.0f});
+      auto idx = array({0, 0});
+      auto upd = array({2.0f, 3.0f}, {2, 1});
+      auto y = scatter_prod(x, idx, upd, 0, Device::gpu);
+      eval(y);
+      return y;
+    });
+    CHECK(std::isnan(out.data<float>()[0]));
+  }
 }

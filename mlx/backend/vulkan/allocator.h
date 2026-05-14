@@ -10,6 +10,7 @@
 #include <vulkan/vulkan.hpp>
 
 #include "mlx/allocator.h"
+#include "mlx/backend/common/buffer_cache.h"
 
 namespace mlx::core::vulkan {
 
@@ -62,7 +63,7 @@ class VulkanAllocator : public allocator::Allocator {
     peak_memory_ = 0;
   }
   size_t get_cache_memory() const {
-    return 0;
+    return buffer_cache_.cache_size();
   }
   size_t set_cache_limit(size_t limit);
   size_t set_memory_limit(size_t limit);
@@ -76,6 +77,8 @@ class VulkanAllocator : public allocator::Allocator {
   ~VulkanAllocator() = default;
   friend VulkanAllocator& allocator();
 
+  void free_vulkan_buffer(VulkanBuffer* buf);
+
   size_t block_limit_{0};
   size_t gc_limit_{0};
   size_t active_memory_{0};
@@ -85,6 +88,8 @@ class VulkanAllocator : public allocator::Allocator {
   size_t num_resources_{0};
   size_t resource_limit_{0};
   std::unordered_set<VulkanBuffer*> live_buffers_;
+
+  BufferCache<VulkanBuffer> buffer_cache_;
 
   mutable std::mutex mutex_;
 };

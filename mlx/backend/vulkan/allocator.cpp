@@ -63,6 +63,14 @@ namespace vulkan {
 
 namespace {
 
+size_t query_page_size() {
+  auto props =
+      VulkanContext::get().physical_device().getProperties();
+  return std::max<size_t>(
+      props.limits.nonCoherentAtomSize,
+      16384u);
+}
+
 uint32_t find_memory_type_index(
     const VulkanContext& ctx,
     uint32_t type_filter,
@@ -82,7 +90,11 @@ uint32_t find_memory_type_index(
 
 } // namespace
 
-VulkanAllocator::VulkanAllocator() {
+VulkanAllocator::VulkanAllocator()
+    : buffer_cache_(
+          query_page_size(),
+          [](VulkanBuffer* buf) { return buf->allocation_size; },
+          [this](VulkanBuffer* buf) { free_vulkan_buffer(buf); }) {
   const auto& info = gpu::device_info(0);
   auto memory_size = std::get<size_t>(info.at("memory_size"));
   auto max_rec_size =
@@ -132,7 +144,8 @@ size_t VulkanAllocator::set_wired_limit(size_t limit) {
 }
 
 void VulkanAllocator::clear_cache() {
-  // No cache in Vulkan allocator yet.
+  std::unique_lock lk(mutex_);
+  buffer_cache_.clear();
 }
 
 bool VulkanAllocator::owns(Buffer buffer) const {
@@ -157,6 +170,26 @@ Buffer VulkanAllocator::malloc(size_t size) {
       msg << "[vulkan::malloc] Resource limit (" << resource_limit_
           << ") exceeded.";
       throw std::runtime_error(msg.str());
+    }
+  }
+
+  // Try to reuse a buffer from the cache.
+  {
+    std::unique_lock lk(mutex_);
+    auto* cached = buffer_cache_.reuse_from_cache(size);
+    if (cached) {
+      active_memory_ += cached->allocation_size;
+      peak_memory_ = std::max(peak_memory_, active_memory_);
+      num_resources_++;
+      live_buffers_.insert(cached);
+      return Buffer{static_cast<void*>(cached)};
+    }
+
+    // If we have memory pressure, try to reclaim from the cache.
+    int64_t mem_to_free =
+        get_active_memory() + get_cache_memory() + size - block_limit_;
+    if (mem_to_free > 0) {
+      buffer_cache_.release_cached_buffers(mem_to_free);
     }
   }
 
@@ -255,15 +288,18 @@ Buffer VulkanAllocator::malloc(size_t size) {
     peak_memory_ = std::max(peak_memory_, active_memory_);
     num_resources_++;
     live_buffers_.insert(buf);
+
+    // Maintain the cache below the requested limit.
+    if (get_cache_memory() > max_pool_size_) {
+      buffer_cache_.release_cached_buffers(
+          get_cache_memory() - max_pool_size_);
+    }
   }
 
   return Buffer{static_cast<void*>(buf)};
 }
 
 void VulkanAllocator::free(Buffer buffer) {
-  // Use C-style function to get raw device handle
-  auto vk_device = VulkanContext::get().device();
-
   auto* buf = static_cast<VulkanBuffer*>(buffer.ptr());
   if (buf == nullptr) {
     return;
@@ -271,19 +307,26 @@ void VulkanAllocator::free(Buffer buffer) {
 
   {
     std::unique_lock lk(mutex_);
-    // Convert to unordered_set::find or use contains if C++17
     if (live_buffers_.find(buf) == live_buffers_.end()) {
       return;
     }
     live_buffers_.erase(buf);
     active_memory_ -= std::min(active_memory_, buf->allocation_size);
     num_resources_ -= std::min<size_t>(1, num_resources_);
+
+    if (get_cache_memory() < max_pool_size_) {
+      buffer_cache_.recycle_to_cache(buf);
+      return;
+    }
   }
 
-  // Use C++ Vulkan API for cleanup
+  free_vulkan_buffer(buf);
+}
+
+void VulkanAllocator::free_vulkan_buffer(VulkanBuffer* buf) {
+  auto vk_device = VulkanContext::get().device();
   vk_device.destroyBuffer(buf->buffer);
   vk_device.freeMemory(buf->memory);
-
   delete buf;
 }
 

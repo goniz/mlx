@@ -314,17 +314,11 @@ bool try_eval_arg_reduce_vulkan(
 
   array in = inputs[0];
   const bool f32_input = in.dtype() == float32;
-  const bool f16_input = in.dtype() == float16;
-  const bool bf16_input = in.dtype() == bfloat16;
-  if (in.ndim() == 0 || (!f32_input && !f16_input && !bf16_input) ||
-      out.dtype() != uint32) {
+  if (in.ndim() == 0 || in.dtype() == float64 || out.dtype() != uint32) {
     return false;
   }
 
-  if (f16_input || bf16_input) {
-    if (in.offset() > 0xFFFF && in.flags().row_contiguous) {
-      in = stage_zero_offset_row_contiguous(in, s);
-    }
+  if (!f32_input) {
     array in_f32(in.shape(), float32, nullptr, {});
     copy_gpu(in, in_f32, CopyType::General, s);
     in = in_f32;
@@ -355,26 +349,28 @@ bool try_eval_arg_reduce_vulkan(
     in_kernel = contiguous_copy_gpu(in_kernel, s);
   }
 
+  const bool direct_to_out = (axis == in.ndim() - 1) && out_is_keepdims &&
+      out.flags().row_contiguous && out.offset() == 0;
+
   array kernel_out(
       keepdims_shape_for_axis(in_kernel, in_kernel.ndim() - 1),
       out.dtype(),
       nullptr,
       {});
-
-  const bool staged_output = !kernel_out.flags().row_contiguous ||
-      kernel_out.offset() != 0 || !is_supported_unary_layout(kernel_out);
-  array out_work = staged_output
-      ? array(kernel_out.shape(), kernel_out.dtype(), nullptr, {})
-      : kernel_out;
+  array out_work = kernel_out;
+  if (direct_to_out) {
+    out_work = out;
+  }
 
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (out_work.size() == 0) {
-    if (staged_output) {
-      copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);
-    }
-    if (out_is_squeezed) {
-      auto squeezed = reshape_in_eval(kernel_out, out.shape(), s);
-      copy_gpu(squeezed, out, CopyType::GeneralGeneral, s);
+    if (!direct_to_out) {
+      if (out_is_squeezed) {
+        auto squeezed = reshape_in_eval(kernel_out, out.shape(), s);
+        copy_gpu(squeezed, out, CopyType::GeneralGeneral, s);
+      } else {
+        copy_gpu(kernel_out, out, CopyType::GeneralGeneral, s);
+      }
     }
     return true;
   }
@@ -387,8 +383,9 @@ bool try_eval_arg_reduce_vulkan(
     vulkan::dispatch_argmax_op(
         in_kernel, out_work, shader_id, command_buffer, s);
     vulkan::end_command_recording(s.index);
-    if (staged_output) {
-      copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);
+
+    if (direct_to_out) {
+      return true;
     }
 
     array restored_keepdims = kernel_out;

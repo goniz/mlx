@@ -6,9 +6,14 @@
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/allocator.h"
+#include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/shader_compiler.h"
+
+#include <algorithm>
+#include <memory>
+#include <utility>
 
 namespace mlx::core {
 
@@ -57,6 +62,21 @@ namespace mlx::core {
   }
 
 namespace {
+
+template <const uint8_t scalar_size>
+void swap_endianness(uint8_t* data_bytes, size_t N) {
+  struct Elem {
+    uint8_t bytes[scalar_size];
+  };
+
+  Elem* data = reinterpret_cast<Elem*>(data_bytes);
+
+  for (size_t i = 0; i < N; i++) {
+    for (size_t j = 0; j < (scalar_size / 2); j++) {
+      std::swap(data[i].bytes[j], data[i].bytes[scalar_size - j - 1]);
+    }
+  }
+}
 
 array collapse_power_leading_dims(const array& arr, Stream s) {
   if (arr.ndim() <= 4) {
@@ -602,8 +622,8 @@ bool try_eval_equal_vulkan(
 
   const bool flatten_rank = a.ndim() > 4 || b.ndim() > 4 || out.ndim() > 4;
   if (flatten_rank) {
-    a = flatten_compare_array(a, s);
-    b = flatten_compare_array(b, s);
+    a = reshape_in_eval(a, {static_cast<ShapeElem>(a.size())}, s);
+    b = reshape_in_eval(b, {static_cast<ShapeElem>(b.size())}, s);
   } else {
     a = collapse_compare_leading_dims(a, s);
     b = collapse_compare_leading_dims(b, s);
@@ -1805,9 +1825,54 @@ void LogicalOr::eval_gpu(const std::vector<array>& inputs, array& out) {
 // - fast.cpp: LayerNorm, RMSNorm, Quantize, ConvertFP8, CustomKernel, SDPA
 // - random.cpp: RandomBits
 
-// Load primitive - throw NYI like Metal backend
 void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
-  throw std::runtime_error("[Load::eval_gpu] Not implemented.");
+  if (out.flags().col_contiguous && !out.flags().row_contiguous) {
+    array loaded(out.shape(), out.dtype(), nullptr, {});
+    eval_gpu(inputs, loaded);
+    copy_gpu(loaded, out, CopyType::Vector, stream());
+    return;
+  }
+  if (!out.flags().row_contiguous || out.offset() != 0 ||
+      out.data_size() != out.size()) {
+    array loaded(out.shape(), out.dtype(), nullptr, {});
+    eval_gpu(inputs, loaded);
+    copy_gpu(loaded, out, CopyType::GeneralGeneral, stream());
+    return;
+  }
+
+  auto s = stream();
+  auto nbytes = out.nbytes();
+  out.set_data(allocator::malloc(nbytes));
+
+  auto host_data = std::make_shared<std::vector<char>>(nbytes);
+  reader_->read(host_data->data(), nbytes, offset_);
+  if (swap_endianness_) {
+    switch (out.itemsize()) {
+      case 2:
+        swap_endianness<2>(reinterpret_cast<uint8_t*>(host_data->data()),
+                           out.size());
+        break;
+      case 4:
+        swap_endianness<4>(reinterpret_cast<uint8_t*>(host_data->data()),
+                           out.size());
+        break;
+      case 8:
+        swap_endianness<8>(reinterpret_cast<uint8_t*>(host_data->data()),
+                           out.size());
+        break;
+    }
+  }
+
+  auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+  vulkan::enqueue_owned_staging_upload(
+      s,
+      host_data->data(),
+      host_data->size(),
+      out_buf->buffer,
+      out.offset(),
+      out.data_shared_ptr());
+  vulkan::retain_shared_for_stream(s, std::move(host_data));
+  vulkan::retain_array_for_stream(s, out);
 }
 
 // ArgPartition / ArgSort - implemented using bitonic argsort shader

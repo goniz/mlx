@@ -915,7 +915,8 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         "[QQMatmul::eval_gpu] Failed to dequantize rhs on Vulkan.");
   }
 
-  array rhs = ensure_row_contiguous_zero_offset(swapaxes_in_eval(what, -1, -2), s);
+  array rhs =
+      ensure_row_contiguous_zero_offset(swapaxes_in_eval(what, -1, -2), s);
   array result(out.shape(), float32, nullptr, {});
   if (!try_eval_matmul_vulkan({xhat, rhs}, result, s)) {
     throw std::runtime_error(

@@ -9,6 +9,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "mlx/backend/gpu/device_info.h"
@@ -63,12 +64,149 @@ namespace vulkan {
 
 namespace {
 
+constexpr size_t min_cache_pool_size = 4096 * 4;
+constexpr size_t default_cache_pool_size = 1 << 20;
+constexpr size_t opportunistic_decode_pool_size = 4 << 20;
+constexpr size_t opportunistic_decode_cache_size = 256 * 1024;
+constexpr size_t opportunistic_decode_active_limit = 1152ULL << 20;
+
+struct AllocTraceStats {
+  std::string primitive;
+  size_t size{0};
+  uint64_t mallocs{0};
+  uint64_t cache_hits{0};
+  uint64_t new_allocs{0};
+  uint64_t cached_frees{0};
+  uint64_t destroyed_frees{0};
+  uint64_t requested_bytes{0};
+  uint64_t allocation_bytes{0};
+  size_t max_allocation_size{0};
+};
+
+bool alloc_summary_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_ALLOC_SUMMARY");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
+std::mutex& alloc_trace_mutex() {
+  static auto* mutex = new std::mutex();
+  return *mutex;
+}
+
+std::unordered_map<std::string, AllocTraceStats>& alloc_trace_stats() {
+  static auto* stats = new std::unordered_map<std::string, AllocTraceStats>();
+  return *stats;
+}
+
+thread_local const char* current_alloc_trace_primitive = nullptr;
+
+std::string alloc_trace_key(size_t requested_size) {
+  std::string primitive = current_alloc_trace_primitive != nullptr
+      ? current_alloc_trace_primitive
+      : "(none)";
+  return primitive + ":" + std::to_string(requested_size);
+}
+
+void trace_alloc(
+    size_t requested_size,
+    size_t allocation_size,
+    bool cache_hit) {
+  if (!alloc_summary_enabled()) {
+    return;
+  }
+  std::lock_guard lk(alloc_trace_mutex());
+  auto primitive = current_alloc_trace_primitive != nullptr
+      ? current_alloc_trace_primitive
+      : "(none)";
+  auto& stats = alloc_trace_stats()[alloc_trace_key(requested_size)];
+  stats.primitive = primitive;
+  stats.size = requested_size;
+  stats.mallocs++;
+  stats.cache_hits += cache_hit ? 1 : 0;
+  stats.new_allocs += cache_hit ? 0 : 1;
+  stats.requested_bytes += requested_size;
+  stats.allocation_bytes += allocation_size;
+  stats.max_allocation_size =
+      std::max(stats.max_allocation_size, allocation_size);
+}
+
+void trace_free(size_t requested_size, bool cached) {
+  if (!alloc_summary_enabled()) {
+    return;
+  }
+  std::lock_guard lk(alloc_trace_mutex());
+  auto primitive = current_alloc_trace_primitive != nullptr
+      ? current_alloc_trace_primitive
+      : "(none)";
+  auto& stats = alloc_trace_stats()[alloc_trace_key(requested_size)];
+  stats.primitive = primitive;
+  stats.size = requested_size;
+  stats.cached_frees += cached ? 1 : 0;
+  stats.destroyed_frees += cached ? 0 : 1;
+}
+
+struct AllocTracePrinter {
+  ~AllocTracePrinter() {
+    if (!alloc_summary_enabled()) {
+      return;
+    }
+    std::vector<AllocTraceStats> rows;
+    {
+      std::lock_guard lk(alloc_trace_mutex());
+      rows.reserve(alloc_trace_stats().size());
+      for (const auto& [_, stats] : alloc_trace_stats()) {
+        rows.push_back(stats);
+      }
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+      return a.requested_bytes > b.requested_bytes;
+    });
+
+    std::cerr
+        << "[vulkan-alloc-summary] primitive size mallocs hits new cached_free "
+        << "destroyed_free total_requested total_allocation max_allocation\n";
+    const size_t limit = std::min<size_t>(rows.size(), 64);
+    for (size_t i = 0; i < limit; ++i) {
+      const auto& stats = rows[i];
+      std::cerr << "[vulkan-alloc-summary] " << stats.primitive << " "
+                << stats.size << " " << stats.mallocs << " " << stats.cache_hits
+                << " " << stats.new_allocs << " " << stats.cached_frees << " "
+                << stats.destroyed_frees << " " << stats.requested_bytes << " "
+                << stats.allocation_bytes << " " << stats.max_allocation_size
+                << "\n";
+    }
+  }
+};
+
+AllocTracePrinter alloc_trace_printer;
+
 size_t query_page_size() {
-  auto props =
-      VulkanContext::get().physical_device().getProperties();
-  return std::max<size_t>(
-      props.limits.nonCoherentAtomSize,
-      16384u);
+  auto props = VulkanContext::get().physical_device().getProperties();
+  return std::max<size_t>(props.limits.nonCoherentAtomSize, 1);
+}
+
+size_t default_max_cacheable_size(size_t max_pool_size) {
+  return std::max(min_cache_pool_size, max_pool_size / 8);
+}
+
+size_t cacheable_size_limit(size_t active_memory, size_t max_cacheable_size) {
+  if (active_memory <= opportunistic_decode_active_limit) {
+    return std::max(max_cacheable_size, opportunistic_decode_cache_size);
+  }
+  return max_cacheable_size;
+}
+
+size_t cache_pool_limit(size_t active_memory, size_t max_pool_size) {
+  if (max_pool_size == 0) {
+    return 0;
+  }
+  if (active_memory <= opportunistic_decode_active_limit) {
+    return std::max(max_pool_size, opportunistic_decode_pool_size);
+  }
+  return max_pool_size;
 }
 
 uint32_t find_memory_type_index(
@@ -89,6 +227,14 @@ uint32_t find_memory_type_index(
 }
 
 } // namespace
+
+void set_alloc_trace_primitive(const char* name) {
+  current_alloc_trace_primitive = name;
+}
+
+void clear_alloc_trace_primitive() {
+  current_alloc_trace_primitive = nullptr;
+}
 
 VulkanAllocator::VulkanAllocator()
     : buffer_cache_(
@@ -115,13 +261,23 @@ VulkanAllocator::VulkanAllocator()
   block_limit_ = std::min(
       static_cast<size_t>(1.5 * static_cast<double>(max_rec_size)),
       static_cast<size_t>(0.95 * static_cast<double>(memory_size)));
-  gc_limit_ = block_limit_;
-  max_pool_size_ = block_limit_;
+  gc_limit_ = std::min(
+      static_cast<size_t>(0.95 * static_cast<double>(max_rec_size)),
+      block_limit_);
+  max_pool_size_ = std::max(
+      min_cache_pool_size,
+      std::min({default_cache_pool_size, gc_limit_ / 4, block_limit_}));
+  max_cacheable_size_ = default_max_cacheable_size(max_pool_size_);
 }
 
 size_t VulkanAllocator::set_cache_limit(size_t limit) {
   std::unique_lock lk(mutex_);
   std::swap(limit, max_pool_size_);
+  max_cacheable_size_ = default_max_cacheable_size(max_pool_size_);
+  if (get_cache_memory() > max_pool_size_) {
+    num_resources_ -= buffer_cache_.release_cached_buffers(
+        get_cache_memory() - max_pool_size_);
+  }
   return limit;
 }
 
@@ -129,7 +285,9 @@ size_t VulkanAllocator::set_memory_limit(size_t limit) {
   std::unique_lock lk(mutex_);
   std::swap(limit, block_limit_);
   gc_limit_ = std::min(gc_limit_, block_limit_);
-  max_pool_size_ = std::min(max_pool_size_, block_limit_);
+  max_pool_size_ =
+      std::max(min_cache_pool_size, std::min(max_pool_size_, block_limit_));
+  max_cacheable_size_ = default_max_cacheable_size(max_pool_size_);
   return limit;
 }
 
@@ -145,7 +303,7 @@ size_t VulkanAllocator::set_wired_limit(size_t limit) {
 
 void VulkanAllocator::clear_cache() {
   std::unique_lock lk(mutex_);
-  buffer_cache_.clear();
+  num_resources_ -= buffer_cache_.clear();
 }
 
 bool VulkanAllocator::owns(Buffer buffer) const {
@@ -163,33 +321,39 @@ Buffer VulkanAllocator::malloc(size_t size) {
     return Buffer{nullptr};
   }
 
-  {
-    std::unique_lock lk(mutex_);
-    if (num_resources_ >= resource_limit_) {
-      std::ostringstream msg;
-      msg << "[vulkan::malloc] Resource limit (" << resource_limit_
-          << ") exceeded.";
-      throw std::runtime_error(msg.str());
-    }
-  }
-
   // Try to reuse a buffer from the cache.
   {
     std::unique_lock lk(mutex_);
     auto* cached = buffer_cache_.reuse_from_cache(size);
     if (cached) {
-      active_memory_ += cached->allocation_size;
-      peak_memory_ = std::max(peak_memory_, active_memory_);
-      num_resources_++;
-      live_buffers_.insert(cached);
-      return Buffer{static_cast<void*>(cached)};
+      if (cached->allocation_size > size + buffer_cache_.page_size()) {
+        buffer_cache_.recycle_to_cache(cached);
+      } else {
+        cached->size = size;
+        active_memory_ += cached->size;
+        peak_memory_ = std::max(peak_memory_, active_memory_);
+        live_buffers_.insert(cached);
+        trace_alloc(size, cached->allocation_size, true);
+        return Buffer{static_cast<void*>(cached)};
+      }
     }
 
     // If we have memory pressure, try to reclaim from the cache.
     int64_t mem_to_free =
-        get_active_memory() + get_cache_memory() + size - block_limit_;
+        get_active_memory() + get_cache_memory() + size - gc_limit_;
     if (mem_to_free > 0) {
-      buffer_cache_.release_cached_buffers(mem_to_free);
+      num_resources_ -= buffer_cache_.release_cached_buffers(mem_to_free);
+    }
+
+    if (num_resources_ >= resource_limit_) {
+      num_resources_ -=
+          buffer_cache_.release_cached_buffers(get_cache_memory());
+      if (num_resources_ >= resource_limit_) {
+        std::ostringstream msg;
+        msg << "[vulkan::malloc] Resource limit (" << resource_limit_
+            << ") exceeded.";
+        throw std::runtime_error(msg.str());
+      }
     }
   }
 
@@ -284,15 +448,17 @@ Buffer VulkanAllocator::malloc(size_t size) {
 
   {
     std::unique_lock lk(mutex_);
-    active_memory_ += buf->allocation_size;
+    active_memory_ += buf->size;
     peak_memory_ = std::max(peak_memory_, active_memory_);
     num_resources_++;
     live_buffers_.insert(buf);
+    trace_alloc(size, buf->allocation_size, false);
 
     // Maintain the cache below the requested limit.
-    if (get_cache_memory() > max_pool_size_) {
-      buffer_cache_.release_cached_buffers(
-          get_cache_memory() - max_pool_size_);
+    const auto pool_limit = cache_pool_limit(active_memory_, max_pool_size_);
+    if (get_cache_memory() > pool_limit) {
+      num_resources_ -= buffer_cache_.release_cached_buffers(
+          get_cache_memory() - pool_limit);
     }
   }
 
@@ -311,13 +477,20 @@ void VulkanAllocator::free(Buffer buffer) {
       return;
     }
     live_buffers_.erase(buf);
-    active_memory_ -= std::min(active_memory_, buf->allocation_size);
-    num_resources_ -= std::min<size_t>(1, num_resources_);
+    active_memory_ -= std::min(active_memory_, buf->size);
 
-    if (get_cache_memory() < max_pool_size_) {
+    const auto cacheable_limit =
+        cacheable_size_limit(active_memory_, max_cacheable_size_);
+    const auto pool_limit = cache_pool_limit(active_memory_, max_pool_size_);
+    if (buf->allocation_size <= cacheable_limit &&
+        get_cache_memory() + buf->allocation_size <= pool_limit) {
       buffer_cache_.recycle_to_cache(buf);
+      trace_free(buf->size, true);
       return;
     }
+
+    num_resources_ -= std::min<size_t>(1, num_resources_);
+    trace_free(buf->size, false);
   }
 
   free_vulkan_buffer(buf);

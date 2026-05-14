@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/gpu/eval.h"
+#include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/primitives.h"
 
@@ -20,7 +21,14 @@ void eval(array& arr) {
     if (arr.is_tracer()) {
       inputs = arr.inputs();
     }
-    arr.primitive().eval_gpu(arr.inputs(), outputs);
+    vulkan::set_alloc_trace_primitive(arr.primitive().name());
+    try {
+      arr.primitive().eval_gpu(arr.inputs(), outputs);
+    } catch (...) {
+      vulkan::clear_alloc_trace_primitive();
+      throw;
+    }
+    vulkan::clear_alloc_trace_primitive();
   }
 
   vulkan::end_primitive_tracking(s, arr.inputs(), outputs);

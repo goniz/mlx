@@ -87,6 +87,7 @@ class VulkanAllocator : public allocator::Allocator {
   size_t wired_limit_{0};
   size_t num_resources_{0};
   size_t resource_limit_{0};
+  size_t max_cacheable_size_{0};
   std::unordered_set<VulkanBuffer*> live_buffers_;
 
   BufferCache<VulkanBuffer> buffer_cache_;
@@ -96,5 +97,7 @@ class VulkanAllocator : public allocator::Allocator {
 
 VulkanAllocator& allocator();
 bool is_vulkan_buffer(Buffer buffer);
+void set_alloc_trace_primitive(const char* name);
+void clear_alloc_trace_primitive();
 
 } // namespace mlx::core::vulkan

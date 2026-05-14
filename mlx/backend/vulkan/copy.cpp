@@ -1371,6 +1371,9 @@ void copy_gpu_inplace(
   if (source != &in && source->shape() == in.shape()) {
     dispatch_shape = source->shape();
     dispatch_i_strides = source->strides();
+    // Re-collapse against the original output view, not the previously
+    // collapsed strides from the pre-materialized source.
+    dispatch_o_strides = o_strides;
     if (dispatch_shape.size() > 4) {
       std::tie(dispatch_shape, dispatch_i_strides, dispatch_o_strides) =
           collapse_copy_dims(

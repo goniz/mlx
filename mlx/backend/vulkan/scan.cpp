@@ -11,6 +11,99 @@ bool has_vulkan_buffer(const array& arr) {
   return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
 }
 
+std::string build_complex_prod_scan_shader(bool reverse, bool inclusive) {
+  std::ostringstream os;
+  os << "#version 450\n\n";
+  os << "layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  os << "layout(push_constant) uniform Params {\n";
+  os << "    uint n_cols;\n";
+  os << "    uint row_count;\n";
+  os << "} p;\n\n";
+  os << "layout(binding = 0) readonly buffer A { vec2 data_a[]; };\n";
+  os << "layout(binding = 1) writeonly buffer D { vec2 data_d[]; };\n\n";
+  os << "vec2 cmul(vec2 a, vec2 b) {\n";
+  os << "    return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);\n";
+  os << "}\n\n";
+  os << "void main() {\n";
+  os << "    uint row = gl_GlobalInvocationID.x;\n";
+  os << "    if (row >= p.row_count) return;\n";
+  os << "    uint base = row * p.n_cols;\n";
+  os << "    vec2 acc = vec2(1.0, 0.0);\n";
+  os << "    for (uint logical_col = 0; logical_col < p.n_cols; ++logical_col) {\n";
+  if (reverse) {
+    os << "        uint col = p.n_cols - 1 - logical_col;\n";
+  } else {
+    os << "        uint col = logical_col;\n";
+  }
+  os << "        vec2 value = data_a[base + col];\n";
+  if (inclusive) {
+    os << "        acc = cmul(acc, value);\n";
+    os << "        data_d[base + col] = acc;\n";
+  } else {
+    os << "        data_d[base + col] = acc;\n";
+    os << "        acc = cmul(acc, value);\n";
+  }
+  os << "    }\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_dispatch_complex_prod_scan(
+    const array& in,
+    array& out,
+    Stream s,
+    bool reverse,
+    bool inclusive) {
+  if (in.dtype() != complex64 || out.dtype() != complex64 || in.ndim() == 0 ||
+      in.shape(in.ndim() - 1) == 0 || in.size() != out.size()) {
+    return false;
+  }
+
+  const uint32_t n_cols =
+      checked_u32_size(in.shape(in.ndim() - 1), "complex_prod_scan n_cols");
+  const uint32_t total = checked_u32_size(out.size(), "complex_prod_scan size");
+  if (total % n_cols != 0) {
+    return false;
+  }
+  const uint32_t row_count = total / n_cols;
+  if (row_count == 0) {
+    return true;
+  }
+
+  const std::string shader_name = std::string("dynamic_cumprod_c64_") +
+      (reverse ? "rev_" : "fwd_") + (inclusive ? "inc" : "exc");
+  const std::string glsl = build_complex_prod_scan_shader(reverse, inclusive);
+  const std::array<uint32_t, 2> pc = {n_cols, row_count};
+  const std::array<vulkan::DynamicArrayRef, 2> refs = {{{&in, 0}, {&out, 1}}};
+
+  try {
+    auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+        shader_name,
+        glsl,
+        static_cast<uint32_t>(refs.size()),
+        refs.data(),
+        static_cast<uint32_t>(pc.size() * sizeof(uint32_t)),
+        s);
+    vkCmdPushConstants(
+        dispatch.command_buffer,
+        dispatch.pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        static_cast<uint32_t>(pc.size() * sizeof(uint32_t)),
+        pc.data());
+    vkCmdDispatch(dispatch.command_buffer, (row_count + 255u) / 256u, 1, 1);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "complex_prod_scan_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+}
+
 bool try_eval_scan_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -31,8 +124,11 @@ bool try_eval_scan_vulkan(
       reduce_type == Scan::Sum && in.dtype() == int32 && out.dtype() == int32;
   const bool cumprod_i32 =
       reduce_type == Scan::Prod && in.dtype() == int32 && out.dtype() == int32;
+  const bool cumprod_c64 = reduce_type == Scan::Prod &&
+      in.dtype() == complex64 && out.dtype() == complex64;
   const bool scan_f32 = in.dtype() == float32 && out.dtype() == float32;
-  if (in.ndim() == 0 || (!scan_f32 && !cumsum_i32 && !cumprod_i32)) {
+  if (in.ndim() == 0 ||
+      (!scan_f32 && !cumsum_i32 && !cumprod_i32 && !cumprod_c64)) {
     return false;
   }
 
@@ -105,15 +201,24 @@ bool try_eval_scan_vulkan(
             inclusive);
         break;
       case Scan::Prod:
-        vulkan::dispatch_scan_op(
-            scan_input,
-            inclusive_out,
-            cumprod_i32 ? vulkan::StaticShaderId::cumprod_i32
-                        : vulkan::StaticShaderId::cumprod_f32,
-            command_buffer,
-            s,
-            reverse,
-            inclusive);
+        if (cumprod_c64) {
+          vulkan::end_command_recording(s.index);
+          if (!try_dispatch_complex_prod_scan(
+                  scan_input, inclusive_out, s, reverse, inclusive)) {
+            return false;
+          }
+          command_buffer = vulkan::begin_command_recording(s.index);
+        } else {
+          vulkan::dispatch_scan_op(
+              scan_input,
+              inclusive_out,
+              cumprod_i32 ? vulkan::StaticShaderId::cumprod_i32
+                          : vulkan::StaticShaderId::cumprod_f32,
+              command_buffer,
+              s,
+              reverse,
+              inclusive);
+        }
         break;
       case Scan::Min:
         vulkan::dispatch_scan_op(

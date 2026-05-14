@@ -1,7 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
-#include <utility>
 #include <limits>
+#include <utility>
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
@@ -13,14 +13,12 @@ namespace mlx::core {
 
 namespace {
 
-uint32_t checked_shape_product(
-    const array& arr,
-    int begin,
-    int end,
-    const char* label);
+uint32_t
+checked_shape_product(const array& arr, int begin, int end, const char* label);
 
 bool needs_row_contiguous(const array& arr) {
-  return !arr.flags().row_contiguous || arr.offset() != 0;
+  return !arr.flags().row_contiguous || arr.offset() != 0 ||
+      arr.data_size() != arr.size();
 }
 
 array ensure_row_contiguous(array arr, Stream s) {
@@ -149,7 +147,10 @@ int64_t read_contiguous_index(const array& idx, int i) {
   }
 }
 
-bool is_full_range_index_for_axis(const array& idx, int64_t axis_size, Stream s) {
+bool is_full_range_index_for_axis(
+    const array& idx,
+    int64_t axis_size,
+    Stream s) {
   if (axis_size <= 0 || idx.size() == 0 || (idx.size() % axis_size) != 0) {
     return false;
   }
@@ -177,8 +178,9 @@ std::string build_generic_gather_shader(
   os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
   os << "#extension GL_EXT_scalar_block_layout : require\n";
 
-  bool needs_int64 = (index_dtype == int64 || index_dtype == uint64 ||
-                      value_dtype == int64 || value_dtype == uint64);
+  bool needs_int64 =
+      (index_dtype == int64 || index_dtype == uint64 || value_dtype == int64 ||
+       value_dtype == uint64);
   if (needs_int64) {
     os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
   }
@@ -212,8 +214,8 @@ std::string build_generic_gather_shader(
     os << "#define INDEX_TYPE int\n";
   }
 
-  os << "#define VALUE_TYPE "
-     << vulkan::dtype_to_glsl_storage_type(value_dtype) << "\n";
+  os << "#define VALUE_TYPE " << vulkan::dtype_to_glsl_storage_type(value_dtype)
+     << "\n";
 
   os << "\nlayout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;\n\n";
 
@@ -228,8 +230,8 @@ std::string build_generic_gather_shader(
 
   os << "layout(scalar, binding = 0) readonly buffer Src { VALUE_TYPE src_data[]; };\n";
   for (int j = 0; j < nidx; ++j) {
-    os << "layout(scalar, binding = " << (1 + j)
-       << ") readonly buffer Idx" << j << " { INDEX_TYPE idx" << j << "_data[]; };\n";
+    os << "layout(scalar, binding = " << (1 + j) << ") readonly buffer Idx" << j
+       << " { INDEX_TYPE idx" << j << "_data[]; };\n";
   }
   os << "layout(scalar, binding = " << (1 + nidx)
      << ") writeonly buffer Out { VALUE_TYPE out_data[]; };\n\n";
@@ -287,9 +289,7 @@ bool try_dispatch_generic_gather(
   flat_indices.reserve(nidx);
   for (int i = 0; i < nidx; ++i) {
     auto flat_idx = ensure_row_contiguous(
-        reshape(
-            inputs[1 + i], {static_cast<ShapeElem>(index_count)}, s),
-        s);
+        reshape(inputs[1 + i], {static_cast<ShapeElem>(index_count)}, s), s);
     if (!ensure_vulkan_storage(flat_idx, s)) {
       return false;
     }
@@ -332,8 +332,8 @@ bool try_dispatch_generic_gather(
     px_axes[a] = static_cast<uint32_t>(norm_axes[a]);
   }
 
-  const uint32_t slice_size = std::accumulate(
-      ss.begin(), ss.end(), 1u, std::multiplies<uint32_t>());
+  const uint32_t slice_size =
+      std::accumulate(ss.begin(), ss.end(), 1u, std::multiplies<uint32_t>());
   const uint32_t ne = index_count * slice_size;
 
   std::vector<uint32_t> pc;
@@ -344,38 +344,31 @@ bool try_dispatch_generic_gather(
   pc.insert(pc.end(), ss.begin(), ss.end());
   pc.insert(pc.end(), px_axes.begin(), px_axes.end());
 
-  const uint32_t pc_size =
-      static_cast<uint32_t>(pc.size() * sizeof(uint32_t));
+  const uint32_t pc_size = static_cast<uint32_t>(pc.size() * sizeof(uint32_t));
   if (pc_size > kMaxGatherPushConstants) {
     return false;
   }
 
   std::string shader_name = "dynamic_gather_generic_" +
-      dtype_suffix(value_dtype) + "_" + gather_index_suffix(index_dtype) +
-      "_" + std::to_string(ndim) + "d_" + std::to_string(nidx) + "a";
+      dtype_suffix(value_dtype) + "_" + gather_index_suffix(index_dtype) + "_" +
+      std::to_string(ndim) + "d_" + std::to_string(nidx) + "a_" +
+      std::to_string(index_count) + "i";
 
   std::string glsl =
       build_generic_gather_shader(value_dtype, index_dtype, ndim, nidx);
 
-  const uint32_t num_bindings =
-      static_cast<uint32_t>(2 + nidx);
+  const uint32_t num_bindings = static_cast<uint32_t>(2 + nidx);
   std::vector<vulkan::DynamicArrayRef> refs;
   refs.reserve(num_bindings);
   refs.push_back({&src, 0});
   for (int j = 0; j < nidx; ++j) {
-    refs.push_back(
-        {&flat_indices[j], static_cast<uint32_t>(1 + j)});
+    refs.push_back({&flat_indices[j], static_cast<uint32_t>(1 + j)});
   }
   refs.push_back({&out_work, static_cast<uint32_t>(1 + nidx)});
 
   try {
     auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-        shader_name,
-        glsl,
-        num_bindings,
-        refs.data(),
-        pc_size,
-        s);
+        shader_name, glsl, num_bindings, refs.data(), pc_size, s);
 
     vkCmdPushConstants(
         dispatch.command_buffer,
@@ -385,11 +378,7 @@ bool try_dispatch_generic_gather(
         pc_size,
         pc.data());
 
-    vkCmdDispatch(
-        dispatch.command_buffer,
-        (ne + 511u) / 512u,
-        1,
-        1);
+    vkCmdDispatch(dispatch.command_buffer, (ne + 511u) / 512u, 1, 1);
 
     vulkan::end_command_recording(s.index);
 
@@ -399,7 +388,8 @@ bool try_dispatch_generic_gather(
     return true;
   } catch (const std::runtime_error&) {
     if (trace_fallback_enabled()) {
-      trace_fallback("generic_gather_dispatch_failed reason=dynamic_shader_error");
+      trace_fallback(
+          "generic_gather_dispatch_failed reason=dynamic_shader_error");
     }
     return false;
   }
@@ -428,7 +418,12 @@ bool try_eval_gather_vulkan(
     Shape stop = slice_sizes;
     Shape strides(src_input.ndim(), 1);
     copy_gpu(
-        slice(src_input, std::move(start), std::move(stop), std::move(strides), s),
+        slice(
+            src_input,
+            std::move(start),
+            std::move(stop),
+            std::move(strides),
+            s),
         out,
         CopyType::GeneralGeneral,
         s);
@@ -600,12 +595,25 @@ bool try_eval_gather_vulkan(
         return false;
       }
 
+      std::vector<array> generic_inputs = {src_input, idx0, idx1};
+      std::vector<int> norm_axes = {axis0, axis1};
+      const auto index_count =
+          checked_u32_size(idx0.size(), "gather_pair fallback index_count");
+      if (try_dispatch_generic_gather(
+              generic_inputs,
+              norm_axes,
+              slice_sizes,
+              idx_ndim,
+              index_count,
+              out,
+              s)) {
+        return true;
+      }
+
       idx0 = ensure_host_readable_row_contiguous(
           reshape(idx0, {static_cast<ShapeElem>(idx0.size())}, s), s);
       idx1 = ensure_host_readable_row_contiguous(
           reshape(idx1, {static_cast<ShapeElem>(idx1.size())}, s), s);
-      const auto index_count =
-          checked_u32_size(idx0.size(), "gather_pair fallback index_count");
 
       auto [out_work, staged_output] = make_output_work(out);
       if (out_work.size() == 0) {
@@ -758,14 +766,25 @@ bool try_eval_gather_vulkan(
     start[axis] = normalized_index;
     stop[axis] += normalized_index;
     copy_gpu(
-        slice(src_input, std::move(start), std::move(stop), std::move(strides), s),
+        slice(
+            src_input,
+            std::move(start),
+            std::move(stop),
+            std::move(strides),
+            s),
         out,
         CopyType::GeneralGeneral,
         s);
     return true;
   }
   if (auto singleton_index = singleton_index_value(idx);
-      singleton_index.has_value()) {
+      singleton_index.has_value() &&
+      out.size() ==
+          static_cast<size_t>(std::accumulate(
+              slice_sizes.begin(),
+              slice_sizes.end(),
+              int64_t{1},
+              std::multiplies<int64_t>()))) {
     Shape start(src_input.ndim(), 0);
     Shape stop = slice_sizes;
     Shape strides(src_input.ndim(), 1);

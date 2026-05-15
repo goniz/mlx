@@ -222,12 +222,11 @@ std::string glsl_cast_expr(Dtype dst, Dtype src, const std::string& expr) {
 
 bool supports_primitive_name(const std::string& prim_name) {
   static const std::unordered_set<std::string> supported = {
-      "Abs",       "Add",     "AsType",  "Broadcast", "Ceil",     "Conjugate",
-      "Cos",       "Divide",  "Erf",     "Exp",       "Floor",    "Imag",
-      "Log",
-      "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Power",
-      "Real",      "Round",   "Sigmoid", "Sin",       "Sqrt",     "Subtract",
-      "Square",    "Tan",    "Tanh"};
+       "Abs",       "Add",     "AsType",  "Broadcast", "Ceil",     "Conjugate",
+       "Cos",       "Divide",  "Equal",   "Erf",       "Exp",      "Floor",
+       "Imag",      "Log",     "LogAddExp", "LogicalOr", "Maximum",  "Minimum",
+       "Multiply",  "Negative", "Power",  "Real",      "Round",    "Sigmoid",
+       "Sin",       "Sqrt",    "Subtract", "Square",    "Tan",      "Tanh"};
   return supported.contains(prim_name);
 }
 
@@ -236,13 +235,11 @@ bool has_unsupported_bool_tape_op(const std::vector<array>& tape) {
     if (is_static_cast(x.primitive())) {
       return false;
     }
-    if (x.dtype() == bool_) {
-      return true;
-    }
-    return std::any_of(
+    const bool uses_bool = x.dtype() == bool_ || std::any_of(
         x.inputs().begin(), x.inputs().end(), [](const array& input) {
           return input.dtype() == bool_;
         });
+    return uses_bool && !supports_primitive_name(x.primitive().name());
   });
 }
 
@@ -402,6 +399,8 @@ std::string get_glsl_operator(const std::string& primitive_name) {
       {"Subtract", "-"},
       {"Multiply", "*"},
       {"Divide", "/"},
+      {"Equal", "=="},
+      {"LogicalOr", "||"},
       {"Maximum", "max"},
       {"Minimum", "min"},
       // GLSL built-in functions (lowercase)

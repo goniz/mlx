@@ -259,6 +259,14 @@ struct MatmulDispatchTuning {
 
 constexpr std::array<uint32_t, 11> kSafeMatmulSpec =
     {32, 32, 32, 16, 32, 32, 2, 2, 2, 1, 32};
+constexpr std::array<uint32_t, 11> kLane64MatmulSpec =
+    {64, 32, 32, 16, 32, 32, 2, 2, 2, 1, 64};
+
+bool supports_64_lane_matmul(const vulkan::VulkanContext& ctx) {
+  return ctx.subgroup_size() >= 64u ||
+      (ctx.subgroup_size_control_supported() &&
+       ctx.subgroup_min_size() <= 64u && ctx.subgroup_max_size() >= 64u);
+}
 
 std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(
     Dtype dtype,
@@ -381,32 +389,28 @@ const char* matmul_family_name(MatmulFamily family) {
 }
 
 MatmulProfile default_matmul_profile(uint32_t subgroup_size) {
-  (void)subgroup_size;
+  const bool use_64_lane = subgroup_size >= 64u;
+  const auto spec = use_64_lane ? kLane64MatmulSpec : kSafeMatmulSpec;
   return {
-      32,
-      {{{kSafeMatmulSpec, 512},
-        {kSafeMatmulSpec, 1024},
-        {kSafeMatmulSpec, 2048}}},
-      {{{kSafeMatmulSpec, 512},
-        {kSafeMatmulSpec, 768},
-        {kSafeMatmulSpec, 1536}}},
+      use_64_lane ? 64u : 32u,
+      {{{spec, 512}, {spec, 1024}, {spec, 2048}}},
+      {{{spec, 512}, {spec, 768}, {spec, 1536}}},
   };
 }
 
 MatmulProfile matmul_profile_for_device() {
   const auto& ctx = vulkan::VulkanContext::get();
   const uint32_t device_subgroup = std::max(ctx.subgroup_size(), 32u);
+  const bool use_64_lane = supports_64_lane_matmul(ctx);
+  const auto amd_spec = use_64_lane ? kLane64MatmulSpec : kSafeMatmulSpec;
+  const uint32_t amd_subgroup = use_64_lane ? 64u : 32u;
 
   switch (ctx.architecture()) {
     case vulkan::GpuArchitecture::AmdRdna:
       return {
-          std::max(device_subgroup, 64u),
-          {{{kSafeMatmulSpec, 768},
-            {kSafeMatmulSpec, 1536},
-            {kSafeMatmulSpec, 3072}}},
-          {{{kSafeMatmulSpec, 512},
-            {kSafeMatmulSpec, 1024},
-            {kSafeMatmulSpec, 2048}}},
+          amd_subgroup,
+          {{{amd_spec, 768}, {amd_spec, 1536}, {amd_spec, 3072}}},
+          {{{amd_spec, 512}, {amd_spec, 1024}, {amd_spec, 2048}}},
       };
     case vulkan::GpuArchitecture::Nvidia:
       return {
@@ -506,15 +510,19 @@ select_matmul_dispatch_tuning(Dtype dtype, uint32_t m, uint32_t n, uint32_t k) {
 
   if (tuning.specialization_constants.size() > 10 &&
       ctx.subgroup_size_control_supported()) {
-    const uint32_t preferred = std::clamp(
+    uint32_t preferred = std::clamp(
         profile.preferred_subgroup_size,
         std::max(ctx.subgroup_min_size(), 1u),
         std::max(ctx.subgroup_max_size(), 1u));
+    // The scalar matmul shader also uses WARP for lane tiling, so it cannot
+    // exceed the selected workgroup size.
+    preferred = std::min(preferred, tuning.specialization_constants[0]);
     tuning.specialization_constants[10] = preferred;
   }
 
   if (ctx.shader_core_count() > 0) {
-    const uint32_t core_scale = std::clamp(ctx.shader_core_count() / 8u, 1u, 4u);
+    const uint32_t core_scale =
+        std::clamp(ctx.shader_core_count() / 8u, 1u, 4u);
     tuning.split_k_threshold =
         std::max<uint32_t>(tuning.split_k_threshold, 512u * core_scale);
     if (dtype != float32) {
@@ -523,7 +531,8 @@ select_matmul_dispatch_tuning(Dtype dtype, uint32_t m, uint32_t n, uint32_t k) {
     }
   }
 
-  if (ctx.architecture() == vulkan::GpuArchitecture::AmdRdna && dtype == bfloat16) {
+  if (ctx.architecture() == vulkan::GpuArchitecture::AmdRdna &&
+      dtype == bfloat16) {
     tuning.prefer_fp32_accum = true;
   }
 
@@ -769,7 +778,8 @@ void zero_initialize_output(array& out, Stream s) {
     if (target.nbytes() == 0) {
       return;
     }
-    auto* target_buf = static_cast<vulkan::VulkanBuffer*>(target.buffer().ptr());
+    auto* target_buf =
+        static_cast<vulkan::VulkanBuffer*>(target.buffer().ptr());
     auto cmd_buffer = vulkan::begin_command_recording(s.index);
     cmd_buffer.fillBuffer(target_buf->buffer, 0, target.nbytes(), 0);
     vulkan::end_command_recording(s.index);
@@ -780,8 +790,8 @@ void zero_initialize_output(array& out, Stream s) {
     return;
   }
 
-  array scratch =
-      vulkan::acquire_scratch_array(s, kMatmulZeroScratchLane, out.shape(), out.dtype());
+  array scratch = vulkan::acquire_scratch_array(
+      s, kMatmulZeroScratchLane, out.shape(), out.dtype());
   zero_contiguous(scratch);
   vulkan::mark_scratch_array_written(s, kMatmulZeroScratchLane);
   copy_gpu(scratch, out, CopyType::General, s);
@@ -1050,7 +1060,8 @@ bool try_eval_mul_mm_vulkan(
   const uint32_t blocks_m = (m + tile_m - 1) / tile_m;
   const uint32_t blocks_n = (n + tile_n - 1) / tile_n;
 
-  auto try_dispatch = [&](const std::vector<vulkan::StaticShaderId>& shader_candidates,
+  auto try_dispatch = [&](const std::vector<vulkan::StaticShaderId>&
+                              shader_candidates,
                           array& out_work,
                           bool needs_out_copy) {
     if (shader_candidates.empty()) {
@@ -1090,14 +1101,14 @@ bool try_eval_mul_mm_vulkan(
       }
     }
 
-    const uint32_t a_heads = static_cast<uint32_t>(
-        a.ndim() >= 3 ? a.shape(-3) : 1);
-    const uint32_t out_heads = static_cast<uint32_t>(
-        out_work.ndim() >= 3 ? out_work.shape(-3) : 1);
-    const uint32_t a_batches_outer = static_cast<uint32_t>(
-        a.ndim() >= 4 ? a.shape(-4) : 1);
-    const uint32_t out_batches_outer = static_cast<uint32_t>(
-        out_work.ndim() >= 4 ? out_work.shape(-4) : 1);
+    const uint32_t a_heads =
+        static_cast<uint32_t>(a.ndim() >= 3 ? a.shape(-3) : 1);
+    const uint32_t out_heads =
+        static_cast<uint32_t>(out_work.ndim() >= 3 ? out_work.shape(-3) : 1);
+    const uint32_t a_batches_outer =
+        static_cast<uint32_t>(a.ndim() >= 4 ? a.shape(-4) : 1);
+    const uint32_t out_batches_outer =
+        static_cast<uint32_t>(out_work.ndim() >= 4 ? out_work.shape(-4) : 1);
     if (a_heads == 0 || out_heads == 0 || a_batches_outer == 0 ||
         out_batches_outer == 0 || (out_heads % a_heads) != 0 ||
         (out_batches_outer % a_batches_outer) != 0) {
@@ -1238,7 +1249,8 @@ bool try_eval_mul_mm_vulkan(
     return false;
   };
 
-  const bool can_direct_write = split_k == 1u && is_row_contiguous_zero_offset(out);
+  const bool can_direct_write =
+      split_k == 1u && is_row_contiguous_zero_offset(out);
   if (can_direct_write) {
     auto direct_candidates = mul_mm_direct_shader_candidates(
         a.dtype(), out.dtype(), tuning.prefer_fp32_accum);
@@ -1255,8 +1267,7 @@ bool try_eval_mul_mm_vulkan(
   array out_work = out;
   const bool can_direct_split_k_reduce =
       split_k > 1u && is_row_contiguous_zero_offset(out_work);
-  const bool needs_out_copy =
-      !is_row_contiguous_zero_offset(out_work) ||
+  const bool needs_out_copy = !is_row_contiguous_zero_offset(out_work) ||
       (split_k == 1u && out.dtype() != float32);
   if (needs_out_copy) {
     out_work = vulkan::acquire_scratch_array(
@@ -1357,7 +1368,8 @@ bool try_eval_addmm_epilogue_vulkan(
   }
 
   const auto total = static_cast<uint64_t>(out.size());
-  const auto mm_offset = static_cast<uint64_t>(mm.offset() / size_of(mm.dtype()));
+  const auto mm_offset =
+      static_cast<uint64_t>(mm.offset() / size_of(mm.dtype()));
   const auto c_offset = static_cast<uint64_t>(c.offset() / size_of(c.dtype()));
   if (total > std::numeric_limits<uint32_t>::max() ||
       mm_offset > std::numeric_limits<uint32_t>::max() ||

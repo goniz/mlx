@@ -1302,11 +1302,68 @@ bool try_eval_matmul_vulkan_impl(
   return try_eval_mul_mm_vulkan(inputs, out, s);
 }
 
-std::string build_addmm_epilogue_shader(int ndim) {
+bool is_supported_addmm_epilogue_dtype(Dtype dtype) {
+  return dtype == float32 || dtype == float16 || dtype == bfloat16;
+}
+
+const char* addmm_epilogue_dtype_name(Dtype dtype) {
+  switch (dtype) {
+    case float32:
+      return "f32";
+    case float16:
+      return "f16";
+    case bfloat16:
+      return "bf16";
+    default:
+      return "unsupported";
+  }
+}
+
+std::string emit_addmm_bf16_helpers() {
+  return R"(
+uint fp32_to_bf16(float f) {
+  uint u = floatBitsToUint(f);
+  u = (u + (0x7fffu + ((u >> 16) & 1u))) >> 16;
+  return u;
+}
+
+float bf16_to_fp32(uint u) {
+  return uintBitsToFloat(u << 16);
+}
+
+)";
+}
+
+std::string addmm_load_expr(
+    const std::string& buffer,
+    const std::string& index,
+    Dtype dtype) {
+  if (dtype == bfloat16) {
+    return "bf16_to_fp32(uint(" + buffer + ".data[" + index + "]))";
+  }
+  if (dtype == float16) {
+    return "float(" + buffer + ".data[" + index + "])";
+  }
+  return buffer + ".data[" + index + "]";
+}
+
+std::string addmm_store_expr(const std::string& value, Dtype dtype) {
+  if (dtype == bfloat16) {
+    return "uint16_t(fp32_to_bf16(" + value + "))";
+  }
+  if (dtype == float16) {
+    return "float16_t(" + value + ")";
+  }
+  return value;
+}
+
+std::string build_addmm_epilogue_shader(Dtype dtype, int ndim) {
   std::ostringstream os;
-  os << vulkan::emit_dynamic_shader_preamble(float32, false);
+  os << vulkan::emit_dynamic_shader_preamble(dtype, false);
+  if (dtype == bfloat16) {
+    os << emit_addmm_bf16_helpers();
+  }
   os << "#define NDIM " << ndim << "\n";
-  os << "layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n";
   os << "layout(push_constant) uniform Params {\n";
   os << "  uint total;\n";
   os << "  uint mm_offset;\n";
@@ -1317,9 +1374,13 @@ std::string build_addmm_epilogue_shader(int ndim) {
   os << "  uint shape[4];\n";
   os << "  uint c_strides[4];\n";
   os << "} p;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer MM { float data[]; } mm;\n";
-  os << "layout(set = 0, binding = 1) readonly buffer C { float data[]; } c;\n";
-  os << "layout(set = 0, binding = 2) buffer Out { float data[]; } out_buf;\n";
+  const auto storage_type = vulkan::dtype_to_glsl_storage_type(dtype);
+  os << "layout(set = 0, binding = 0) readonly buffer MM { " << storage_type
+     << " data[]; } mm;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer C { " << storage_type
+     << " data[]; } c;\n";
+  os << "layout(set = 0, binding = 2) buffer Out { " << storage_type
+     << " data[]; } out_buf;\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= p.total) return;\n";
@@ -1330,7 +1391,11 @@ std::string build_addmm_epilogue_shader(int ndim) {
   os << "    rem /= p.shape[d];\n";
   os << "    c_idx += coord * p.c_strides[d];\n";
   os << "  }\n";
-  os << "  out_buf.data[idx + p.out_offset] = p.alpha * mm.data[idx + p.mm_offset] + p.beta * c.data[c_idx];\n";
+  os << "  float value = p.alpha * "
+     << addmm_load_expr("mm", "idx + p.mm_offset", dtype) << " + p.beta * "
+     << addmm_load_expr("c", "c_idx", dtype) << ";\n";
+  os << "  out_buf.data[idx + p.out_offset] = "
+     << addmm_store_expr("value", dtype) << ";\n";
   os << "}\n";
   return os.str();
 }
@@ -1342,8 +1407,9 @@ bool try_eval_addmm_epilogue_vulkan(
     float alpha,
     float beta,
     Stream s) {
-  if (mm.dtype() != float32 || c.dtype() != float32 || out.dtype() != float32 ||
-      out.ndim() > 4 || mm.shape() != out.shape()) {
+  const Dtype dtype = out.dtype();
+  if (!is_supported_addmm_epilogue_dtype(dtype) || mm.dtype() != dtype ||
+      c.dtype() != dtype || out.ndim() > 4 || mm.shape() != out.shape()) {
     return false;
   }
 
@@ -1371,9 +1437,12 @@ bool try_eval_addmm_epilogue_vulkan(
   const auto mm_offset =
       static_cast<uint64_t>(mm.offset() / size_of(mm.dtype()));
   const auto c_offset = static_cast<uint64_t>(c.offset() / size_of(c.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
   if (total > std::numeric_limits<uint32_t>::max() ||
       mm_offset > std::numeric_limits<uint32_t>::max() ||
-      c_offset > std::numeric_limits<uint32_t>::max()) {
+      c_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
 
@@ -1395,6 +1464,7 @@ bool try_eval_addmm_epilogue_vulkan(
   pc.total = static_cast<uint32_t>(total);
   pc.mm_offset = static_cast<uint32_t>(mm_offset);
   pc.c_offset = static_cast<uint32_t>(c_offset);
+  pc.out_offset = static_cast<uint32_t>(out_offset);
   pc.alpha = alpha;
   pc.beta = beta;
   for (int i = 0; i < out.ndim(); ++i) {
@@ -1404,8 +1474,10 @@ bool try_eval_addmm_epilogue_vulkan(
 
   vulkan::DynamicArrayRef arrays[] = {{&mm, 0}, {&c, 1}, {&out, 2}};
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      "dynamic_addmm_epilogue_f32_" + std::to_string(out.ndim()) + "d",
-      build_addmm_epilogue_shader(static_cast<int>(out.ndim())),
+      std::string("dynamic_addmm_epilogue_") +
+          addmm_epilogue_dtype_name(dtype) + "_" + std::to_string(out.ndim()) +
+          "d",
+      build_addmm_epilogue_shader(dtype, static_cast<int>(out.ndim())),
       3,
       arrays,
       sizeof(PushConstants),

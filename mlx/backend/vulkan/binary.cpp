@@ -73,6 +73,12 @@ bool has_vulkan_buffer(const array& arr) {
   return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
 }
 
+bool shares_storage(const array& a, const array& b) {
+  auto a_data = a.data_shared_ptr();
+  auto b_data = b.data_shared_ptr();
+  return a_data != nullptr && a_data == b_data;
+}
+
 void ensure_materialized_scalar_input(array& arr) {
   if (arr.data_size() != 1 || !arr.has_primitive()) {
     return;
@@ -1149,6 +1155,9 @@ bool try_eval_binary_op_vulkan(
       if (use_f32_staging_io || bool_add || integer_case) {
         dispatch_variant = vulkan::BinaryDispatchVariant::Standard;
       } else if (a.data_size() == 1 || b.data_size() == 1) {
+        dispatch_variant = vulkan::BinaryDispatchVariant::Standard;
+      } else if (
+          shares_storage(out_kernel, a) || shares_storage(out_kernel, b)) {
         dispatch_variant = vulkan::BinaryDispatchVariant::Standard;
       }
     }

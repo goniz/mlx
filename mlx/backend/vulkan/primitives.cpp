@@ -633,35 +633,30 @@ bool try_eval_equal_vulkan(
       flatten_rank || !is_supported_elementwise_layout(out);
   array out_work = staged_output
       ? array(
-            flatten_rank ? Shape{static_cast<ShapeElem>(out.size())}
-                         : out.shape(),
+            out.shape(),
             bool_,
             nullptr,
             {})
       : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  if (!flatten_rank) {
-    out_work = collapse_compare_leading_dims(out_work, s);
-  }
+  array out_kernel =
+      flatten_rank
+      ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
+      : collapse_compare_leading_dims(out_work, s);
 
   if (!is_supported_elementwise_layout(a) ||
       !is_supported_elementwise_layout(b) ||
-      !is_supported_elementwise_layout(out_work)) {
+      !is_supported_elementwise_layout(out_kernel)) {
     return false;
   }
   if (!ensure_vulkan_buffer_compare(a, s) ||
       !ensure_vulkan_buffer_compare(b, s) ||
-      !ensure_vulkan_buffer_compare(out_work, s)) {
+      !ensure_vulkan_buffer_compare(out_kernel, s)) {
     return false;
   }
-  if (out_work.size() == 0) {
+  if (out_kernel.size() == 0) {
     if (staged_output) {
-      if (flatten_rank) {
-        out.copy_shared_buffer(
-            out_work, out.strides(), out.flags(), out.size());
-      } else {
-        copy_gpu(out_work, out, CopyType::General, s);
-      }
+      copy_gpu(out_work, out, CopyType::General, s);
     }
     return true;
   }
@@ -669,8 +664,8 @@ bool try_eval_equal_vulkan(
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
   const auto out_offset =
-      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
-  const auto total = static_cast<uint64_t>(out_work.data_size());
+      static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
+  const auto total = static_cast<uint64_t>(out_kernel.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -684,7 +679,7 @@ bool try_eval_equal_vulkan(
       std::to_string(static_cast<int>(b.dtype().val()));
   const std::string glsl_source =
       build_equal_shader(a.dtype(), b.dtype(), equal_nan);
-  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_kernel, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name, glsl_source, 3, arrays, kPushConstantSize, s);
@@ -713,11 +708,7 @@ bool try_eval_equal_vulkan(
   vulkan::end_command_recording(s.index);
 
   if (staged_output) {
-    if (flatten_rank) {
-      out.copy_shared_buffer(out_work, out.strides(), out.flags(), out.size());
-    } else {
-      copy_gpu(out_work, out, CopyType::General, s);
-    }
+    copy_gpu(out_work, out, CopyType::General, s);
   }
   return true;
 }
@@ -781,8 +772,8 @@ bool try_eval_compare_vulkan(
 
   const bool flatten_rank = a.ndim() > 4 || b.ndim() > 4 || out.ndim() > 4;
   if (flatten_rank) {
-    a = flatten_compare_array(a, s);
-    b = flatten_compare_array(b, s);
+    a = reshape_in_eval(a, {static_cast<ShapeElem>(a.size())}, s);
+    b = reshape_in_eval(b, {static_cast<ShapeElem>(b.size())}, s);
   } else {
     a = collapse_compare_leading_dims(a, s);
     b = collapse_compare_leading_dims(b, s);
@@ -792,35 +783,30 @@ bool try_eval_compare_vulkan(
       flatten_rank || !is_supported_elementwise_layout(out);
   array out_work = staged_output
       ? array(
-            flatten_rank ? Shape{static_cast<ShapeElem>(out.size())}
-                         : out.shape(),
+            out.shape(),
             bool_,
             nullptr,
             {})
       : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  if (!flatten_rank) {
-    out_work = collapse_compare_leading_dims(out_work, s);
-  }
+  array out_kernel =
+      flatten_rank
+      ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
+      : collapse_compare_leading_dims(out_work, s);
 
   if (!is_supported_elementwise_layout(a) ||
       !is_supported_elementwise_layout(b) ||
-      !is_supported_elementwise_layout(out_work)) {
+      !is_supported_elementwise_layout(out_kernel)) {
     return false;
   }
   if (!ensure_vulkan_buffer_compare(a, s) ||
       !ensure_vulkan_buffer_compare(b, s) ||
-      !ensure_vulkan_buffer_compare(out_work, s)) {
+      !ensure_vulkan_buffer_compare(out_kernel, s)) {
     return false;
   }
-  if (out_work.size() == 0) {
+  if (out_kernel.size() == 0) {
     if (staged_output) {
-      if (flatten_rank) {
-        out.copy_shared_buffer(
-            out_work, out.strides(), out.flags(), out.size());
-      } else {
-        copy_gpu(out_work, out, CopyType::General, s);
-      }
+      copy_gpu(out_work, out, CopyType::General, s);
     }
     return true;
   }
@@ -828,8 +814,8 @@ bool try_eval_compare_vulkan(
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
   const auto out_offset =
-      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
-  const auto total = static_cast<uint64_t>(out_work.data_size());
+      static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
+  const auto total = static_cast<uint64_t>(out_kernel.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -843,7 +829,7 @@ bool try_eval_compare_vulkan(
       std::to_string(static_cast<int>(b.dtype().val()));
   const std::string glsl_source =
       build_compare_shader(a.dtype(), b.dtype(), op);
-  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_kernel, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name, glsl_source, 3, arrays, kPushConstantSize, s);
@@ -872,11 +858,7 @@ bool try_eval_compare_vulkan(
   vulkan::end_command_recording(s.index);
 
   if (staged_output) {
-    if (flatten_rank) {
-      out.copy_shared_buffer(out_work, out.strides(), out.flags(), out.size());
-    } else {
-      copy_gpu(out_work, out, CopyType::General, s);
-    }
+    copy_gpu(out_work, out, CopyType::General, s);
   }
   return true;
 }
@@ -1126,22 +1108,30 @@ bool try_eval_logical_not_vulkan(
   if (!is_supported_elementwise_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
-  in = collapse_compare_leading_dims(in, s);
+  const bool flatten_rank = in.ndim() > 4 || out.ndim() > 4;
+  if (flatten_rank) {
+    in = reshape_in_eval(in, {static_cast<ShapeElem>(in.size())}, s);
+  } else {
+    in = collapse_compare_leading_dims(in, s);
+  }
 
-  const bool staged_output = !is_supported_elementwise_layout(out);
+  const bool staged_output = flatten_rank || !is_supported_elementwise_layout(out);
   array out_work = staged_output ? array(out.shape(), bool_, nullptr, {}) : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  out_work = collapse_compare_leading_dims(out_work, s);
+  array out_kernel =
+      flatten_rank
+      ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
+      : collapse_compare_leading_dims(out_work, s);
 
   if (!is_supported_elementwise_layout(in) ||
-      !is_supported_elementwise_layout(out_work)) {
+      !is_supported_elementwise_layout(out_kernel)) {
     return false;
   }
   if (!ensure_vulkan_buffer_compare(in, s) ||
-      !ensure_vulkan_buffer_compare(out_work, s)) {
+      !ensure_vulkan_buffer_compare(out_kernel, s)) {
     return false;
   }
-  if (out_work.size() == 0) {
+  if (out_kernel.size() == 0) {
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::General, s);
     }
@@ -1151,15 +1141,15 @@ bool try_eval_logical_not_vulkan(
   const auto in_offset =
       static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
   const auto out_offset =
-      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
-  const auto total = static_cast<uint64_t>(out_work.data_size());
+      static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
+  const auto total = static_cast<uint64_t>(out_kernel.data_size());
   if (in_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
       total > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
 
-  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out_work, 1}};
+  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out_kernel, 1}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 3;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       "dynamic_logical_not",
@@ -1241,25 +1231,34 @@ bool try_eval_logical_binary_vulkan(
   if (!is_supported_elementwise_layout(b)) {
     b = contiguous_copy_gpu(b, s);
   }
-  a = collapse_compare_leading_dims(a, s);
-  b = collapse_compare_leading_dims(b, s);
+  const bool flatten_rank = a.ndim() > 4 || b.ndim() > 4 || out.ndim() > 4;
+  if (flatten_rank) {
+    a = reshape_in_eval(a, {static_cast<ShapeElem>(a.size())}, s);
+    b = reshape_in_eval(b, {static_cast<ShapeElem>(b.size())}, s);
+  } else {
+    a = collapse_compare_leading_dims(a, s);
+    b = collapse_compare_leading_dims(b, s);
+  }
 
-  const bool staged_output = !is_supported_elementwise_layout(out);
+  const bool staged_output = flatten_rank || !is_supported_elementwise_layout(out);
   array out_work = staged_output ? array(out.shape(), bool_, nullptr, {}) : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  out_work = collapse_compare_leading_dims(out_work, s);
+  array out_kernel =
+      flatten_rank
+      ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
+      : collapse_compare_leading_dims(out_work, s);
 
   if (!is_supported_elementwise_layout(a) ||
       !is_supported_elementwise_layout(b) ||
-      !is_supported_elementwise_layout(out_work)) {
+      !is_supported_elementwise_layout(out_kernel)) {
     return false;
   }
   if (!ensure_vulkan_buffer_compare(a, s) ||
       !ensure_vulkan_buffer_compare(b, s) ||
-      !ensure_vulkan_buffer_compare(out_work, s)) {
+      !ensure_vulkan_buffer_compare(out_kernel, s)) {
     return false;
   }
-  if (out_work.size() == 0) {
+  if (out_kernel.size() == 0) {
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::General, s);
     }
@@ -1269,8 +1268,8 @@ bool try_eval_logical_binary_vulkan(
   const auto a_offset = static_cast<uint64_t>(a.offset() / size_of(a.dtype()));
   const auto b_offset = static_cast<uint64_t>(b.offset() / size_of(b.dtype()));
   const auto out_offset =
-      static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
-  const auto total = static_cast<uint64_t>(out_work.data_size());
+      static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
+  const auto total = static_cast<uint64_t>(out_kernel.data_size());
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -1278,7 +1277,7 @@ bool try_eval_logical_binary_vulkan(
     return false;
   }
 
-  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_work, 2}};
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_kernel, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name,

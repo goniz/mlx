@@ -37,6 +37,8 @@ constexpr char kMulMmACastScratchLane[] = "mul_mm.a_f16";
 constexpr char kMulMmBCastScratchLane[] = "mul_mm.b_f16";
 constexpr char kMulMmOutScratchLane[] = "mul_mm.out_work";
 constexpr char kMulMmSplitKScratchLane[] = "mul_mm.split_k";
+constexpr char kBlockMaskedMMLhsScratchLane[] = "block_masked_mm.lhs";
+constexpr char kBlockMaskedMMRhsScratchLane[] = "block_masked_mm.rhs";
 
 bool is_supported_matmul_dtype(Dtype dtype) {
   return dtype == float32 || dtype == float16 || dtype == bfloat16;
@@ -868,6 +870,10 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
+  if (!ensure_vulkan_buffer(vec, s) || !ensure_vulkan_buffer(matrix, s)) {
+    return false;
+  }
+
   if (matrix.dtype() == bfloat16 &&
       !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
     matrix = cast_to_float16_scratch(matrix, s, kMatvecMatrixCastScratchLane);
@@ -885,10 +891,19 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  array out_work = vulkan::acquire_scratch_array(
-      s, kMatvecOutScratchLane, out.shape(), float32);
+  const bool needs_out_copy =
+      out.dtype() != float32 || !is_row_contiguous_zero_offset(out);
+  array out_work = out;
+  if (needs_out_copy) {
+    out_work = vulkan::acquire_scratch_array(
+        s, kMatvecOutScratchLane, out.shape(), float32);
+  } else {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  }
   if (out_work.size() == 0) {
-    copy_gpu(out_work, out, CopyType::General, s);
+    if (needs_out_copy) {
+      copy_gpu(out_work, out, CopyType::General, s);
+    }
     return true;
   }
 
@@ -898,7 +913,11 @@ bool try_eval_matvec_vulkan(
       auto command_buffer = vulkan::begin_command_recording(s.index);
       vulkan::dispatch_mul_mat_vec_op(
           matrix, vec, out_work, shader_id, command_buffer, s);
+      insert_compute_barrier(command_buffer);
       vulkan::end_command_recording(s.index);
+      vulkan::retain_array_for_stream(s, matrix);
+      vulkan::retain_array_for_stream(s, vec);
+      vulkan::retain_array_for_stream(s, out_work);
       dispatched = true;
     } catch (const std::runtime_error& e) {
       if (matmul_debug_enabled()) {
@@ -908,8 +927,10 @@ bool try_eval_matvec_vulkan(
       }
     }
     if (dispatched) {
-      vulkan::mark_scratch_array_written(s, kMatvecOutScratchLane);
-      copy_gpu(out_work, out, CopyType::General, s);
+      if (needs_out_copy) {
+        vulkan::mark_scratch_array_written(s, kMatvecOutScratchLane);
+        copy_gpu(out_work, out, CopyType::General, s);
+      }
       return true;
     }
   }
@@ -1034,6 +1055,10 @@ bool try_eval_mul_mm_vulkan(
   const uint32_t n = static_cast<uint32_t>(out.shape(-1));
   const uint32_t k = static_cast<uint32_t>(a.shape(-1));
   auto tuning = select_matmul_dispatch_tuning(a.dtype(), m, n, k);
+  if (a.dtype() == float16 && out.dtype() == float16 && k >= 128u &&
+      (m <= 32u || n <= 32u)) {
+    tuning.prefer_fp32_accum = true;
+  }
 
   const uint32_t batch_stride_a =
       static_cast<uint32_t>(a.shape(-2) * a.shape(-1));
@@ -1281,6 +1306,533 @@ bool try_eval_mul_mm_vulkan(
   return try_dispatch(shader_candidates, out_work, needs_out_copy);
 }
 
+bool fits_u32_complex_matmul_layout(const array& arr) {
+  if (arr.offset() / size_of(arr.dtype()) >
+      std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  for (auto dim : arr.shape()) {
+    if (dim < 0 || dim > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  for (auto stride : arr.strides()) {
+    if (stride < 0 || stride > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string build_complex_matmul_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, false);
+  os << "layout(push_constant) uniform Params {\n";
+  os << "  uint total;\n";
+  os << "  uint M;\n";
+  os << "  uint N;\n";
+  os << "  uint K;\n";
+  os << "  uint a_offset;\n";
+  os << "  uint b_offset;\n";
+  os << "  uint out_offset;\n";
+  os << "  uint a_stride0;\n";
+  os << "  uint a_stride1;\n";
+  os << "  uint b_stride0;\n";
+  os << "  uint b_stride1;\n";
+  os << "  uint out_stride0;\n";
+  os << "  uint out_stride1;\n";
+  os << "} p;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer A { vec2 data[]; } a;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer B { vec2 data[]; } b;\n";
+  os << "layout(set = 0, binding = 2) buffer Out { vec2 data[]; } out_buf;\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= p.total) return;\n";
+  os << "  uint row = idx / p.N;\n";
+  os << "  uint col = idx - row * p.N;\n";
+  os << "  vec2 acc = vec2(0.0, 0.0);\n";
+  os << "  for (uint kk = 0; kk < p.K; ++kk) {\n";
+  os << "    vec2 av = a.data[p.a_offset + row * p.a_stride0 + kk * p.a_stride1];\n";
+  os << "    vec2 bv = b.data[p.b_offset + kk * p.b_stride0 + col * p.b_stride1];\n";
+  os << "    acc += vec2(av.x * bv.x - av.y * bv.y, av.x * bv.y + av.y * bv.x);\n";
+  os << "  }\n";
+  os << "  out_buf.data[p.out_offset + row * p.out_stride0 + col * p.out_stride1] = acc;\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_complex_matmul_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 2) {
+    return false;
+  }
+
+  array a = inputs[0];
+  array b = inputs[1];
+  if (a.dtype() != complex64 || b.dtype() != complex64 ||
+      out.dtype() != complex64 || a.ndim() != 2 || b.ndim() != 2 ||
+      out.ndim() != 2) {
+    return false;
+  }
+  if (a.shape(-1) != b.shape(-2) || out.shape(-2) != a.shape(-2) ||
+      out.shape(-1) != b.shape(-1)) {
+    return false;
+  }
+  if (out.size() > std::numeric_limits<uint32_t>::max() ||
+      !fits_u32_complex_matmul_layout(a) ||
+      !fits_u32_complex_matmul_layout(b) ||
+      !fits_u32_complex_matmul_layout(out)) {
+    return false;
+  }
+
+  if (a.shape(-1) == 0) {
+    zero_initialize_output(out, s);
+    return true;
+  }
+
+  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (!ensure_vulkan_buffer(out, s)) {
+    return false;
+  }
+
+  struct PushConstants {
+    uint32_t total;
+    uint32_t M;
+    uint32_t N;
+    uint32_t K;
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t out_offset;
+    uint32_t a_stride0;
+    uint32_t a_stride1;
+    uint32_t b_stride0;
+    uint32_t b_stride1;
+    uint32_t out_stride0;
+    uint32_t out_stride1;
+  } pc{};
+  pc.total = static_cast<uint32_t>(out.size());
+  pc.M = static_cast<uint32_t>(out.shape(-2));
+  pc.N = static_cast<uint32_t>(out.shape(-1));
+  pc.K = static_cast<uint32_t>(a.shape(-1));
+  pc.a_offset = static_cast<uint32_t>(a.offset() / size_of(a.dtype()));
+  pc.b_offset = static_cast<uint32_t>(b.offset() / size_of(b.dtype()));
+  pc.out_offset = static_cast<uint32_t>(out.offset() / size_of(out.dtype()));
+  pc.a_stride0 = static_cast<uint32_t>(a.strides(-2));
+  pc.a_stride1 = static_cast<uint32_t>(a.strides(-1));
+  pc.b_stride0 = static_cast<uint32_t>(b.strides(-2));
+  pc.b_stride1 = static_cast<uint32_t>(b.strides(-1));
+  pc.out_stride0 = static_cast<uint32_t>(out.strides(-2));
+  pc.out_stride1 = static_cast<uint32_t>(out.strides(-1));
+
+  vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out, 2}};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_matmul_c64_2d",
+      build_complex_matmul_shader(),
+      3,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
+bool fits_u32_gather_mm_layout(const array& arr) {
+  if (arr.offset() / size_of(arr.dtype()) >
+      std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  for (auto dim : arr.shape()) {
+    if (dim < 0 || dim > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  for (auto stride : arr.strides()) {
+    if (stride < 0 || stride > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string
+build_gather_mm_f32_shader(int index_ndim, int a_batch_ndim, int b_batch_ndim) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(float32, false);
+  os << "#define INDEX_NDIM " << index_ndim << "\n";
+  os << "#define A_BATCH_NDIM " << a_batch_ndim << "\n";
+  os << "#define B_BATCH_NDIM " << b_batch_ndim << "\n";
+  os << "layout(push_constant) uniform Params {\n";
+  os << "  uint total;\n";
+  os << "  uint M;\n";
+  os << "  uint N;\n";
+  os << "  uint K;\n";
+  os << "  uint a_offset;\n";
+  os << "  uint b_offset;\n";
+  os << "  uint lhs_offset;\n";
+  os << "  uint rhs_offset;\n";
+  os << "  uint out_offset;\n";
+  os << "  uint index_shape[4];\n";
+  os << "  uint lhs_strides[4];\n";
+  os << "  uint rhs_strides[4];\n";
+  os << "  uint out_batch_strides[4];\n";
+  os << "  uint a_batch_shape[4];\n";
+  os << "  uint a_batch_strides[4];\n";
+  os << "  uint b_batch_shape[4];\n";
+  os << "  uint b_batch_strides[4];\n";
+  os << "  uint a_row_stride;\n";
+  os << "  uint a_col_stride;\n";
+  os << "  uint b_row_stride;\n";
+  os << "  uint b_col_stride;\n";
+  os << "  uint out_row_stride;\n";
+  os << "  uint out_col_stride;\n";
+  os << "} p;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer A { float data[]; } a;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer B { float data[]; } b;\n";
+  os << "layout(set = 0, binding = 2) readonly buffer LHS { uint data[]; } lhs;\n";
+  os << "layout(set = 0, binding = 3) readonly buffer RHS { uint data[]; } rhs;\n";
+  os << "layout(set = 0, binding = 4) buffer Out { float data[]; } out_buf;\n";
+  os << "uint batch_offset(uint batch, uint shape[4], uint strides[4], int ndim) {\n";
+  os << "  uint offset = 0;\n";
+  os << "  uint rem = batch;\n";
+  os << "  for (int d = ndim - 1; d >= 0; --d) {\n";
+  os << "    uint coord = rem % shape[d];\n";
+  os << "    rem /= shape[d];\n";
+  os << "    offset += coord * strides[d];\n";
+  os << "  }\n";
+  os << "  return offset;\n";
+  os << "}\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= p.total) return;\n";
+  os << "  uint matrix_size = p.M * p.N;\n";
+  os << "  uint batch = idx / matrix_size;\n";
+  os << "  uint within = idx - batch * matrix_size;\n";
+  os << "  uint row = within / p.N;\n";
+  os << "  uint col = within - row * p.N;\n";
+  os << "  uint lhs_pos = p.lhs_offset + batch_offset(batch, p.index_shape, p.lhs_strides, INDEX_NDIM);\n";
+  os << "  uint rhs_pos = p.rhs_offset + batch_offset(batch, p.index_shape, p.rhs_strides, INDEX_NDIM);\n";
+  os << "  uint lhs_batch = lhs.data[lhs_pos];\n";
+  os << "  uint rhs_batch = rhs.data[rhs_pos];\n";
+  os << "  uint a_base = p.a_offset + batch_offset(lhs_batch, p.a_batch_shape, p.a_batch_strides, A_BATCH_NDIM);\n";
+  os << "  uint b_base = p.b_offset + batch_offset(rhs_batch, p.b_batch_shape, p.b_batch_strides, B_BATCH_NDIM);\n";
+  os << "  float acc = 0.0;\n";
+  os << "  for (uint kk = 0; kk < p.K; ++kk) {\n";
+  os << "    float av = a.data[a_base + row * p.a_row_stride + kk * p.a_col_stride];\n";
+  os << "    float bv = b.data[b_base + kk * p.b_row_stride + col * p.b_col_stride];\n";
+  os << "    acc = fma(av, bv, acc);\n";
+  os << "  }\n";
+  os << "  uint out_base = p.out_offset + batch_offset(batch, p.index_shape, p.out_batch_strides, INDEX_NDIM);\n";
+  os << "  out_buf.data[out_base + row * p.out_row_stride + col * p.out_col_stride] = acc;\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_gather_mm_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 4) {
+    return false;
+  }
+
+  array a = inputs[0];
+  array b = inputs[1];
+  array lhs_indices = inputs[2];
+  array rhs_indices = inputs[3];
+  if (a.dtype() != float32 || b.dtype() != float32 || out.dtype() != float32 ||
+      lhs_indices.dtype() != uint32 || rhs_indices.dtype() != uint32 ||
+      a.ndim() < 2 || b.ndim() < 2 || out.ndim() < 2 || a.ndim() > 4 ||
+      b.ndim() > 4 || out.ndim() > 4 || lhs_indices.ndim() > 2 ||
+      rhs_indices.ndim() > 2) {
+    return false;
+  }
+  if (a.shape(-1) != b.shape(-2) || out.shape(-2) != a.shape(-2) ||
+      out.shape(-1) != b.shape(-1) ||
+      lhs_indices.shape() != rhs_indices.shape()) {
+    return false;
+  }
+  if (out.ndim() != lhs_indices.ndim() + 2) {
+    return false;
+  }
+  for (int i = 0; i < lhs_indices.ndim(); ++i) {
+    if (out.shape(i) != lhs_indices.shape(i)) {
+      return false;
+    }
+  }
+  if (out.size() > std::numeric_limits<uint32_t>::max() ||
+      !fits_u32_gather_mm_layout(a) || !fits_u32_gather_mm_layout(b) ||
+      !fits_u32_gather_mm_layout(lhs_indices) ||
+      !fits_u32_gather_mm_layout(rhs_indices) ||
+      !fits_u32_gather_mm_layout(out)) {
+    return false;
+  }
+
+  if (a.size() == 0 || b.size() == 0 || a.shape(-1) == 0) {
+    zero_initialize_output(out, s);
+    return true;
+  }
+
+  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s) ||
+      !ensure_vulkan_buffer(lhs_indices, s) ||
+      !ensure_vulkan_buffer(rhs_indices, s)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (!ensure_vulkan_buffer(out, s)) {
+    return false;
+  }
+
+  struct PushConstants {
+    uint32_t total;
+    uint32_t M;
+    uint32_t N;
+    uint32_t K;
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t lhs_offset;
+    uint32_t rhs_offset;
+    uint32_t out_offset;
+    uint32_t index_shape[4];
+    uint32_t lhs_strides[4];
+    uint32_t rhs_strides[4];
+    uint32_t out_batch_strides[4];
+    uint32_t a_batch_shape[4];
+    uint32_t a_batch_strides[4];
+    uint32_t b_batch_shape[4];
+    uint32_t b_batch_strides[4];
+    uint32_t a_row_stride;
+    uint32_t a_col_stride;
+    uint32_t b_row_stride;
+    uint32_t b_col_stride;
+    uint32_t out_row_stride;
+    uint32_t out_col_stride;
+  } pc{};
+
+  const int index_ndim = lhs_indices.ndim();
+  const int a_batch_ndim = a.ndim() - 2;
+  const int b_batch_ndim = b.ndim() - 2;
+  pc.total = static_cast<uint32_t>(out.size());
+  pc.M = static_cast<uint32_t>(out.shape(-2));
+  pc.N = static_cast<uint32_t>(out.shape(-1));
+  pc.K = static_cast<uint32_t>(a.shape(-1));
+  pc.a_offset = static_cast<uint32_t>(a.offset() / size_of(a.dtype()));
+  pc.b_offset = static_cast<uint32_t>(b.offset() / size_of(b.dtype()));
+  pc.lhs_offset = static_cast<uint32_t>(
+      lhs_indices.offset() / size_of(lhs_indices.dtype()));
+  pc.rhs_offset = static_cast<uint32_t>(
+      rhs_indices.offset() / size_of(rhs_indices.dtype()));
+  pc.out_offset = static_cast<uint32_t>(out.offset() / size_of(out.dtype()));
+  for (int i = 0; i < index_ndim; ++i) {
+    pc.index_shape[i] = static_cast<uint32_t>(lhs_indices.shape(i));
+    pc.lhs_strides[i] = static_cast<uint32_t>(lhs_indices.strides(i));
+    pc.rhs_strides[i] = static_cast<uint32_t>(rhs_indices.strides(i));
+    pc.out_batch_strides[i] = static_cast<uint32_t>(out.strides(i));
+  }
+  for (int i = 0; i < a_batch_ndim; ++i) {
+    pc.a_batch_shape[i] = static_cast<uint32_t>(a.shape(i));
+    pc.a_batch_strides[i] = static_cast<uint32_t>(a.strides(i));
+  }
+  for (int i = 0; i < b_batch_ndim; ++i) {
+    pc.b_batch_shape[i] = static_cast<uint32_t>(b.shape(i));
+    pc.b_batch_strides[i] = static_cast<uint32_t>(b.strides(i));
+  }
+  pc.a_row_stride = static_cast<uint32_t>(a.strides(-2));
+  pc.a_col_stride = static_cast<uint32_t>(a.strides(-1));
+  pc.b_row_stride = static_cast<uint32_t>(b.strides(-2));
+  pc.b_col_stride = static_cast<uint32_t>(b.strides(-1));
+  pc.out_row_stride = static_cast<uint32_t>(out.strides(-2));
+  pc.out_col_stride = static_cast<uint32_t>(out.strides(-1));
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&a, 0}, {&b, 1}, {&lhs_indices, 2}, {&rhs_indices, 3}, {&out, 4}};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_gather_mm_f32_" + std::to_string(index_ndim) + "d_" +
+          std::to_string(a_batch_ndim) + "ad_" + std::to_string(b_batch_ndim) +
+          "bd",
+      build_gather_mm_f32_shader(index_ndim, a_batch_ndim, b_batch_ndim),
+      5,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
+std::string build_segmented_mm_f32_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(float32, false);
+  os << "layout(push_constant) uniform Params {\n";
+  os << "  uint total;\n";
+  os << "  uint M;\n";
+  os << "  uint N;\n";
+  os << "  uint a_offset;\n";
+  os << "  uint b_offset;\n";
+  os << "  uint segments_offset;\n";
+  os << "  uint out_offset;\n";
+  os << "  uint a_row_stride;\n";
+  os << "  uint a_col_stride;\n";
+  os << "  uint b_row_stride;\n";
+  os << "  uint b_col_stride;\n";
+  os << "  uint segments_row_stride;\n";
+  os << "  uint segments_col_stride;\n";
+  os << "  uint out_segment_stride;\n";
+  os << "  uint out_row_stride;\n";
+  os << "  uint out_col_stride;\n";
+  os << "} p;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer A { float data[]; } a;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer B { float data[]; } b;\n";
+  os << "layout(set = 0, binding = 2) readonly buffer Segments { uint data[]; } segments;\n";
+  os << "layout(set = 0, binding = 3) buffer Out { float data[]; } out_buf;\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= p.total) return;\n";
+  os << "  uint matrix_size = p.M * p.N;\n";
+  os << "  uint segment = idx / matrix_size;\n";
+  os << "  uint within = idx - segment * matrix_size;\n";
+  os << "  uint row = within / p.N;\n";
+  os << "  uint col = within - row * p.N;\n";
+  os << "  uint seg_base = p.segments_offset + segment * p.segments_row_stride;\n";
+  os << "  uint k_start = segments.data[seg_base];\n";
+  os << "  uint k_end = segments.data[seg_base + p.segments_col_stride];\n";
+  os << "  float acc = 0.0;\n";
+  os << "  if (k_end > k_start) {\n";
+  os << "    for (uint kk = k_start; kk < k_end; ++kk) {\n";
+  os << "      float av = a.data[p.a_offset + row * p.a_row_stride + kk * p.a_col_stride];\n";
+  os << "      float bv = b.data[p.b_offset + kk * p.b_row_stride + col * p.b_col_stride];\n";
+  os << "      acc = fma(av, bv, acc);\n";
+  os << "    }\n";
+  os << "  }\n";
+  os << "  out_buf.data[p.out_offset + segment * p.out_segment_stride + row * p.out_row_stride + col * p.out_col_stride] = acc;\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool try_eval_segmented_mm_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 3) {
+    return false;
+  }
+
+  array a = inputs[0];
+  array b = inputs[1];
+  array segments = inputs[2];
+  if (a.dtype() != float32 || b.dtype() != float32 || out.dtype() != float32 ||
+      segments.dtype() != uint32 || a.ndim() != 2 || b.ndim() != 2 ||
+      segments.ndim() != 2 || out.ndim() != 3 || segments.shape(-1) != 2) {
+    return false;
+  }
+  if (a.shape(-1) != b.shape(-2) || out.shape(-3) != segments.shape(0) ||
+      out.shape(-2) != a.shape(-2) || out.shape(-1) != b.shape(-1)) {
+    return false;
+  }
+  if (out.size() > std::numeric_limits<uint32_t>::max() ||
+      !fits_u32_gather_mm_layout(a) || !fits_u32_gather_mm_layout(b) ||
+      !fits_u32_gather_mm_layout(segments) || !fits_u32_gather_mm_layout(out)) {
+    return false;
+  }
+
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    return true;
+  }
+  if (a.size() == 0 || b.size() == 0) {
+    zero_initialize_output(out, s);
+    return true;
+  }
+
+  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s) ||
+      !ensure_vulkan_buffer(segments, s)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (!ensure_vulkan_buffer(out, s)) {
+    return false;
+  }
+
+  struct PushConstants {
+    uint32_t total;
+    uint32_t M;
+    uint32_t N;
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t segments_offset;
+    uint32_t out_offset;
+    uint32_t a_row_stride;
+    uint32_t a_col_stride;
+    uint32_t b_row_stride;
+    uint32_t b_col_stride;
+    uint32_t segments_row_stride;
+    uint32_t segments_col_stride;
+    uint32_t out_segment_stride;
+    uint32_t out_row_stride;
+    uint32_t out_col_stride;
+  } pc{};
+
+  pc.total = static_cast<uint32_t>(out.size());
+  pc.M = static_cast<uint32_t>(a.shape(-2));
+  pc.N = static_cast<uint32_t>(b.shape(-1));
+  pc.a_offset = static_cast<uint32_t>(a.offset() / size_of(a.dtype()));
+  pc.b_offset = static_cast<uint32_t>(b.offset() / size_of(b.dtype()));
+  pc.segments_offset =
+      static_cast<uint32_t>(segments.offset() / size_of(segments.dtype()));
+  pc.out_offset = static_cast<uint32_t>(out.offset() / size_of(out.dtype()));
+  pc.a_row_stride = static_cast<uint32_t>(a.strides(-2));
+  pc.a_col_stride = static_cast<uint32_t>(a.strides(-1));
+  pc.b_row_stride = static_cast<uint32_t>(b.strides(-2));
+  pc.b_col_stride = static_cast<uint32_t>(b.strides(-1));
+  pc.segments_row_stride = static_cast<uint32_t>(segments.strides(-2));
+  pc.segments_col_stride = static_cast<uint32_t>(segments.strides(-1));
+  pc.out_segment_stride = static_cast<uint32_t>(out.strides(-3));
+  pc.out_row_stride = static_cast<uint32_t>(out.strides(-2));
+  pc.out_col_stride = static_cast<uint32_t>(out.strides(-1));
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&a, 0}, {&b, 1}, {&segments, 2}, {&out, 3}};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_segmented_mm_f32_2d",
+      build_segmented_mm_f32_shader(),
+      4,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 bool try_eval_matmul_vulkan_impl(
     const std::vector<array>& inputs,
     array& out,
@@ -1293,6 +1845,9 @@ bool try_eval_matmul_vulkan_impl(
     zero_initialize_output(out, s);
     return true;
   }
+  if (try_eval_complex_matmul_vulkan(inputs, out, s)) {
+    return true;
+  }
   if (matvec_enabled() && try_eval_matvec_vulkan(inputs, out, s)) {
     if (used_matvec_fast_path) {
       *used_matvec_fast_path = true;
@@ -1303,7 +1858,8 @@ bool try_eval_matmul_vulkan_impl(
 }
 
 bool is_supported_addmm_epilogue_dtype(Dtype dtype) {
-  return dtype == float32 || dtype == float16 || dtype == bfloat16;
+  return dtype == float32 || dtype == float16 || dtype == bfloat16 ||
+      dtype == complex64;
 }
 
 const char* addmm_epilogue_dtype_name(Dtype dtype) {
@@ -1314,6 +1870,8 @@ const char* addmm_epilogue_dtype_name(Dtype dtype) {
       return "f16";
     case bfloat16:
       return "bf16";
+    case complex64:
+      return "c64";
     default:
       return "unsupported";
   }
@@ -1391,7 +1949,7 @@ std::string build_addmm_epilogue_shader(Dtype dtype, int ndim) {
   os << "    rem /= p.shape[d];\n";
   os << "    c_idx += coord * p.c_strides[d];\n";
   os << "  }\n";
-  os << "  float value = p.alpha * "
+  os << "  " << (dtype == complex64 ? "vec2" : "float") << " value = p.alpha * "
      << addmm_load_expr("mm", "idx + p.mm_offset", dtype) << " + p.beta * "
      << addmm_load_expr("c", "c_idx", dtype) << ";\n";
   os << "  out_buf.data[idx + p.out_offset] = "
@@ -1494,6 +2052,250 @@ bool try_eval_addmm_epilogue_vulkan(
   return true;
 }
 
+bool is_supported_block_mask_dtype(Dtype dtype) {
+  return dtype == float32 || dtype == float16 || dtype == bfloat16;
+}
+
+bool is_supported_block_mask_dtype(Dtype data_dtype, Dtype mask_dtype) {
+  return is_supported_block_mask_dtype(data_dtype) &&
+      (mask_dtype == bool_ || mask_dtype == data_dtype);
+}
+
+const char* block_mask_dtype_name(Dtype dtype) {
+  switch (dtype) {
+    case bool_:
+      return "bool";
+    case float32:
+      return "f32";
+    case float16:
+      return "f16";
+    case bfloat16:
+      return "bf16";
+    default:
+      return "unsupported";
+  }
+}
+
+std::string build_block_mask_copy_shader(
+    Dtype data_dtype,
+    Dtype mask_dtype,
+    int ndim,
+    int mask_ndim) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(data_dtype, mask_dtype, false);
+  if (data_dtype == bfloat16 || mask_dtype == bfloat16) {
+    os << emit_addmm_bf16_helpers();
+  }
+  os << "#define NDIM " << ndim << "\n";
+  os << "#define MASK_NDIM " << mask_ndim << "\n";
+  os << "layout(push_constant) uniform Params {\n";
+  os << "  uint total;\n";
+  os << "  uint block_size;\n";
+  os << "  uint rows;\n";
+  os << "  uint cols;\n";
+  os << "  uint src_offset;\n";
+  os << "  uint dst_offset;\n";
+  os << "  uint mask_offset;\n";
+  os << "  uint shape[4];\n";
+  os << "  uint src_strides[4];\n";
+  os << "  uint mask_shape[4];\n";
+  os << "  uint mask_strides[4];\n";
+  os << "} p;\n";
+  const auto data_storage = vulkan::dtype_to_glsl_storage_type(data_dtype);
+  const auto mask_storage = vulkan::dtype_to_glsl_storage_type(mask_dtype);
+  os << "layout(set = 0, binding = 0) readonly buffer Src { " << data_storage
+     << " data[]; } src;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer Mask { " << mask_storage
+     << " data[]; } mask;\n";
+  os << "layout(set = 0, binding = 2) buffer Dst { " << data_storage
+     << " data[]; } dst;\n";
+  os << "float load_data(uint idx) { return "
+     << addmm_load_expr("src", "idx", data_dtype) << "; }\n";
+  if (mask_dtype != bool_) {
+    os << "float load_mask(uint idx) { return "
+       << addmm_load_expr("mask", "idx", mask_dtype) << "; }\n";
+  }
+  os << "void store_data(uint idx, float value) { dst.data[idx] = "
+     << addmm_store_expr("value", data_dtype) << "; }\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= p.total) return;\n";
+  os << "  uint src_idx = p.src_offset;\n";
+  os << "  uint rem = idx;\n";
+  os << "  for (int d = NDIM - 1; d >= 0; --d) {\n";
+  os << "    uint coord = rem % p.shape[d];\n";
+  os << "    rem /= p.shape[d];\n";
+  os << "    src_idx += coord * p.src_strides[d];\n";
+  os << "  }\n";
+  os << "  uint mat_size = p.rows * p.cols;\n";
+  os << "  uint batch = idx / mat_size;\n";
+  os << "  uint within = idx - batch * mat_size;\n";
+  os << "  uint row = within / p.cols;\n";
+  os << "  uint col = within - row * p.cols;\n";
+  os << "  uint mask_rows = p.mask_shape[MASK_NDIM - 2];\n";
+  os << "  uint mask_cols = p.mask_shape[MASK_NDIM - 1];\n";
+  os << "  uint mask_linear = batch * mask_rows * mask_cols + "
+        "(row / p.block_size) * mask_cols + (col / p.block_size);\n";
+  os << "  uint mask_idx = p.mask_offset;\n";
+  os << "  rem = mask_linear;\n";
+  os << "  for (int d = MASK_NDIM - 1; d >= 0; --d) {\n";
+  os << "    uint coord = rem % p.mask_shape[d];\n";
+  os << "    rem /= p.mask_shape[d];\n";
+  os << "    mask_idx += coord * p.mask_strides[d];\n";
+  os << "  }\n";
+  if (mask_dtype == bool_) {
+    os << "  float value = mask.data[mask_idx] != uint8_t(0) ? load_data(src_idx) : 0.0;\n";
+  } else {
+    os << "  float value = load_data(src_idx) * load_mask(mask_idx);\n";
+  }
+  os << "  store_data(p.dst_offset + idx, value);\n";
+  os << "}\n";
+  return os.str();
+}
+
+bool fits_u32_offset(const array& arr) {
+  return static_cast<uint64_t>(arr.offset() / size_of(arr.dtype())) <=
+      std::numeric_limits<uint32_t>::max();
+}
+
+bool fill_shape_and_strides(
+    const array& arr,
+    uint32_t shape[4],
+    uint32_t strides[4]) {
+  if (arr.ndim() > 4) {
+    return false;
+  }
+  for (int i = 0; i < arr.ndim(); ++i) {
+    if (arr.shape(i) < 0 ||
+        arr.shape(i) > std::numeric_limits<uint32_t>::max() ||
+        arr.strides(i) < 0 ||
+        arr.strides(i) > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+    shape[i] = static_cast<uint32_t>(arr.shape(i));
+    strides[i] = static_cast<uint32_t>(arr.strides(i));
+  }
+  return true;
+}
+
+bool dispatch_block_mask_copy_vulkan(
+    array src,
+    const array& mask,
+    array& dst,
+    int block_size,
+    int64_t rows,
+    int64_t cols,
+    Stream s) {
+  if (src.shape() != dst.shape() || src.dtype() != dst.dtype() ||
+      src.ndim() != mask.ndim() || src.ndim() > 4 || src.size() == 0 ||
+      rows <= 0 || cols <= 0 ||
+      !is_supported_block_mask_dtype(src.dtype(), mask.dtype())) {
+    return false;
+  }
+  if (src.shape(-2) != rows || src.shape(-1) != cols) {
+    return false;
+  }
+  const int64_t mask_rows = (rows + block_size - 1) / block_size;
+  const int64_t mask_cols = (cols + block_size - 1) / block_size;
+  if (mask.shape(-2) != mask_rows || mask.shape(-1) != mask_cols) {
+    return false;
+  }
+  if (src.size() > std::numeric_limits<uint32_t>::max() ||
+      !fits_u32_offset(src) || !fits_u32_offset(mask) ||
+      !fits_u32_offset(dst)) {
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer(src, s)) {
+    return false;
+  }
+  array mask_arr = mask;
+  if (!ensure_vulkan_buffer(mask_arr, s)) {
+    return false;
+  }
+  if (!ensure_vulkan_buffer(dst, s)) {
+    return false;
+  }
+
+  struct PushConstants {
+    uint32_t total;
+    uint32_t block_size;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t src_offset;
+    uint32_t dst_offset;
+    uint32_t mask_offset;
+    uint32_t shape[4];
+    uint32_t src_strides[4];
+    uint32_t mask_shape[4];
+    uint32_t mask_strides[4];
+  } pc{};
+  pc.total = static_cast<uint32_t>(src.size());
+  pc.block_size = static_cast<uint32_t>(block_size);
+  pc.rows = static_cast<uint32_t>(rows);
+  pc.cols = static_cast<uint32_t>(cols);
+  pc.src_offset = static_cast<uint32_t>(src.offset() / size_of(src.dtype()));
+  pc.dst_offset = static_cast<uint32_t>(dst.offset() / size_of(dst.dtype()));
+  pc.mask_offset =
+      static_cast<uint32_t>(mask_arr.offset() / size_of(mask_arr.dtype()));
+  if (!fill_shape_and_strides(src, pc.shape, pc.src_strides) ||
+      !fill_shape_and_strides(mask_arr, pc.mask_shape, pc.mask_strides)) {
+    return false;
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {{&src, 0}, {&mask_arr, 1}, {&dst, 2}};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      std::string("dynamic_block_mask_copy_") +
+          block_mask_dtype_name(src.dtype()) + "_" +
+          block_mask_dtype_name(mask_arr.dtype()) + "_" +
+          std::to_string(src.ndim()) + "d",
+      build_block_mask_copy_shader(
+          src.dtype(), mask_arr.dtype(), src.ndim(), mask_arr.ndim()),
+      3,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
+std::optional<array> copy_with_block_mask_vulkan(
+    array src,
+    const array& mask,
+    int block_size,
+    int64_t rows,
+    int64_t cols,
+    Stream s,
+    const char* scratch_lane) {
+  array dst =
+      vulkan::acquire_scratch_array(s, scratch_lane, src.shape(), src.dtype());
+  if (!dispatch_block_mask_copy_vulkan(
+          src, mask, dst, block_size, rows, cols, s)) {
+    return std::nullopt;
+  }
+  vulkan::mark_scratch_array_written(s, scratch_lane);
+  return dst;
+}
+
+bool apply_block_mask_vulkan(
+    array& data,
+    const array& mask,
+    int block_size,
+    int64_t rows,
+    int64_t cols,
+    Stream s) {
+  return dispatch_block_mask_copy_vulkan(
+      data, mask, data, block_size, rows, cols, s);
+}
+
 } // namespace
 
 bool try_eval_matmul_vulkan(
@@ -1535,8 +2337,74 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 }
 
+void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!try_eval_gather_mm_vulkan(inputs, out, stream())) {
+    throw std::runtime_error(
+        "GatherMM operation failed on Vulkan (unsupported dtype or layout).");
+  }
+}
+
+void SegmentedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!try_eval_segmented_mm_vulkan(inputs, out, stream())) {
+    throw std::runtime_error(
+        "SegmentedMM operation failed on Vulkan (unsupported dtype or layout).");
+  }
+}
+
 void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  throw std::runtime_error("BlockMaskedMM has no Vulkan implementation.");
+  if (!issubdtype(out.dtype(), floating)) {
+    throw std::runtime_error(
+        "[BlockMaskedMM] Does not yet support non-floating point types.");
+  }
+
+  auto& s = stream();
+  array a = inputs[0];
+  array b = inputs[1];
+
+  if (a.size() == 0 || b.size() == 0) {
+    zero_initialize_output(out, s);
+    return;
+  }
+
+  const int64_t M = a.shape(-2);
+  const int64_t N = b.shape(-1);
+  const int64_t K = a.shape(-1);
+  if (M == 0 || N == 0) {
+    return;
+  }
+  if (K == 0) {
+    zero_initialize_output(out, s);
+    return;
+  }
+
+  const bool has_op_mask = inputs.size() > 3;
+  const bool has_out_mask = inputs.size() == 3 || inputs.size() == 5;
+
+  if (has_op_mask) {
+    const array& lhs_mask = inputs[inputs.size() - 2];
+    const array& rhs_mask = inputs[inputs.size() - 1];
+    auto masked_a = copy_with_block_mask_vulkan(
+        a, lhs_mask, block_size_, M, K, s, kBlockMaskedMMLhsScratchLane);
+    auto masked_b = copy_with_block_mask_vulkan(
+        b, rhs_mask, block_size_, K, N, s, kBlockMaskedMMRhsScratchLane);
+    if (!masked_a.has_value() || !masked_b.has_value()) {
+      throw std::runtime_error(
+          "BlockMaskedMM operation failed on Vulkan (unsupported operand mask input).");
+    }
+    a = *masked_a;
+    b = *masked_b;
+  }
+
+  if (!try_eval_matmul_vulkan_impl({a, b}, out, s, nullptr)) {
+    throw std::runtime_error(
+        "BlockMaskedMM operation failed on Vulkan (unsupported matmul input).");
+  }
+
+  if (has_out_mask &&
+      !apply_block_mask_vulkan(out, inputs[2], block_size_, M, N, s)) {
+    throw std::runtime_error(
+        "BlockMaskedMM operation failed on Vulkan (unsupported output mask input).");
+  }
 }
 
 } // namespace mlx::core

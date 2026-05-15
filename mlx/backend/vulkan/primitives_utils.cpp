@@ -528,6 +528,24 @@ std::optional<vulkan::StaticShaderId> scatter_axis_shader_id(
   return std::nullopt;
 }
 
+std::optional<vulkan::StaticShaderId> scatter_sum_axis_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, scatter_sum_axis_f32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, scatter_sum_axis_f32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, scatter_sum_axis_f32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, scatter_sum_axis_f32_u64);
+  MLX_VK_GATHER_CASE(int32, int32, scatter_sum_axis_i32_i32);
+  MLX_VK_GATHER_CASE(int32, int64, scatter_sum_axis_i32_i64);
+  MLX_VK_GATHER_CASE(int32, uint32, scatter_sum_axis_i32_u32);
+  MLX_VK_GATHER_CASE(int32, uint64, scatter_sum_axis_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, int32, scatter_sum_axis_u32_i32);
+  MLX_VK_GATHER_CASE(uint32, int64, scatter_sum_axis_u32_i64);
+  MLX_VK_GATHER_CASE(uint32, uint32, scatter_sum_axis_u32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint64, scatter_sum_axis_u32_u64);
+  return std::nullopt;
+}
+
 std::optional<vulkan::StaticShaderId> masked_scatter_shader_id(
     Dtype value_dtype) {
   switch (value_dtype) {

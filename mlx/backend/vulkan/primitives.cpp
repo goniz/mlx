@@ -1849,16 +1849,16 @@ void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (swap_endianness_) {
     switch (out.itemsize()) {
       case 2:
-        swap_endianness<2>(reinterpret_cast<uint8_t*>(host_data->data()),
-                           out.size());
+        swap_endianness<2>(
+            reinterpret_cast<uint8_t*>(host_data->data()), out.size());
         break;
       case 4:
-        swap_endianness<4>(reinterpret_cast<uint8_t*>(host_data->data()),
-                           out.size());
+        swap_endianness<4>(
+            reinterpret_cast<uint8_t*>(host_data->data()), out.size());
         break;
       case 8:
-        swap_endianness<8>(reinterpret_cast<uint8_t*>(host_data->data()),
-                           out.size());
+        swap_endianness<8>(
+            reinterpret_cast<uint8_t*>(host_data->data()), out.size());
         break;
     }
   }
@@ -1984,6 +1984,13 @@ void ArgSort::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_argpartition_or_argsort_gpu(inputs, out, axis_, 0, stream());
 }
 
+void Sort::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto result = take_along_axis(
+      inputs[0], argsort(inputs[0], axis_, stream()), axis_, stream());
+  copy_gpu(result, out, CopyType::General, stream());
+}
+
 void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   auto result = take_along_axis(
@@ -2004,7 +2011,6 @@ NYI_OP(ArcTan2)
 NYI_OP(ArcTanh)
 NYI_OP(BitwiseInvert)
 NYI_OP(Cosh)
-NYI_OP_STATE(GatherMM)
 NYI_OP_STATE(Hadamard)
 // Linear algebra operations - throw NYI like Metal backend
 NO_GPU_MULTI(LUF)
@@ -2078,7 +2084,6 @@ void Real::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 NYI_OP(Sinh)
-NYI_OP_STATE(Sort)
 NYI_OP(Tan)
 // Scatter and ScatterAxis are implemented in scatter.cpp
 
@@ -2153,8 +2158,6 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
       CopyType::GeneralGeneral,
       stream());
 }
-
-NYI_OP(SegmentedMM)
 
 void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_select_vulkan(inputs, out, stream())) {

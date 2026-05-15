@@ -1224,9 +1224,10 @@ bool try_eval_scatter_axis_vulkan(
     return false;
   }
 
-  if (reduce_type != ScatterAxis::None) {
+  if (reduce_type != ScatterAxis::None && reduce_type != ScatterAxis::Sum) {
     trace_vulkan_unsupported(
-        "ScatterAxis", "only non-reducing put_along_axis is implemented");
+        "ScatterAxis",
+        "only put_along_axis and scatter_add_axis are implemented");
     return false;
   }
 
@@ -1246,7 +1247,17 @@ bool try_eval_scatter_axis_vulkan(
     return false;
   }
 
-  const auto shader_id = scatter_axis_shader_id(out.dtype(), idx.dtype());
+  if (reduce_type == ScatterAxis::Sum && out.dtype() == float32 &&
+      !vulkan::VulkanContext::get().shader_buffer_atomic_float32_supported()) {
+    trace_vulkan_unsupported(
+        "ScatterAxis",
+        "float32 scatter_add_axis requires shader atomic float support");
+    return false;
+  }
+
+  const auto shader_id = reduce_type == ScatterAxis::Sum
+      ? scatter_sum_axis_shader_id(out.dtype(), idx.dtype())
+      : scatter_axis_shader_id(out.dtype(), idx.dtype());
   if (!shader_id.has_value()) {
     trace_vulkan_unsupported(
         "ScatterAxis",

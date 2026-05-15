@@ -3,6 +3,10 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_scalar_block_layout : require
 
+#if defined(REDUCE_SUM) && defined(VALUE_IS_FLOAT)
+#extension GL_EXT_shader_atomic_float : require
+#endif
+
 #if defined(INDEX_IS_I64)
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #if defined(INDEX_IS_UNSIGNED)
@@ -58,5 +62,9 @@ void main() {
     const uint scatter_idx = normalize_index(data_i[linear_idx]);
     const uint out_idx = (prefix * p.size_axis + scatter_idx) * p.size_post + suffix;
 
+#if defined(REDUCE_SUM)
+    atomicAdd(data_d[out_idx], data_u[linear_idx]);
+#else
     data_d[out_idx] = data_u[linear_idx];
+#endif
 }

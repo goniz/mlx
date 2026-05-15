@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <optional>
+#include <sstream>
 #include <vector>
 
 namespace mlx::core {
@@ -198,14 +199,95 @@ bool try_eval_reduce_sum_rows_vulkan(
     }
   }
 
-  if (in.ndim() > 4 || reduce_out_target.ndim() > 4) {
+  bool out_is_keepdims = false;
+  bool out_is_squeezed = false;
+  bool reshape_final_to_output = false;
+
+  if (in.ndim() > 4 && !full_reduce && normalized_axes.size() == 2 &&
+      normalized_axes[0] == in.ndim() - 3 &&
+      normalized_axes[1] == in.ndim() - 1) {
+    const bool high_rank_keepdims =
+        has_keepdims_axes_shape(in, reduce_out_target, normalized_axes);
+    const bool high_rank_squeezed =
+        has_squeezed_axes_shape(in, reduce_out_target, normalized_axes);
+    if (high_rank_keepdims || high_rank_squeezed) {
+      Shape reshaped = {1, in.shape(-3), in.shape(-2), in.shape(-1)};
+      for (int i = 0; i < in.ndim() - 3; ++i) {
+        reshaped[0] *= in.shape(i);
+      }
+      in = reshape_in_eval(in, reshaped, s);
+      normalized_axes = {1, 3};
+      out_is_keepdims = true;
+      out_is_squeezed = high_rank_squeezed;
+      reshape_final_to_output = true;
+    }
+  }
+
+  if (in.ndim() > 4 && !full_reduce && !reshape_final_to_output &&
+      normalized_axes.size() == 1) {
+    const bool high_rank_keepdims =
+        has_keepdims_axes_shape(in, reduce_out_target, normalized_axes);
+    const bool high_rank_squeezed =
+        has_squeezed_axes_shape(in, reduce_out_target, normalized_axes);
+    if (high_rank_keepdims || high_rank_squeezed) {
+      const int axis = normalized_axes[0];
+      ShapeElem before = 1;
+      for (int i = 0; i < axis; ++i) {
+        before *= in.shape(i);
+      }
+      ShapeElem after = 1;
+      for (int i = axis + 1; i < in.ndim(); ++i) {
+        after *= in.shape(i);
+      }
+      in = reshape_in_eval(in, {before, in.shape(axis), after}, s);
+      normalized_axes = {1};
+      out_is_keepdims = true;
+      out_is_squeezed = high_rank_squeezed;
+      reshape_final_to_output = true;
+    }
+  }
+
+  if (f32_io && sum_reduce && in.ndim() > 4 && !full_reduce &&
+      !reshape_final_to_output && normalized_axes.size() > 2) {
+    const int block_row_axis = in.ndim() - 3;
+    const int block_col_axis = in.ndim() - 1;
+    bool has_block_row_axis = false;
+    bool has_block_col_axis = false;
+    std::vector<int> remaining_axes;
+    remaining_axes.reserve(normalized_axes.size() - 2);
+    for (int axis : normalized_axes) {
+      if (axis == block_row_axis) {
+        has_block_row_axis = true;
+      } else if (axis == block_col_axis) {
+        has_block_col_axis = true;
+      } else {
+        remaining_axes.push_back(axis);
+      }
+    }
+    if (has_block_row_axis && has_block_col_axis && !remaining_axes.empty()) {
+      const std::vector<int> block_axes = {block_row_axis, block_col_axis};
+      array block_reduced(
+          keepdims_shape_for_axes(in, block_axes), in.dtype(), nullptr, {});
+      if (!try_eval_reduce_sum_rows_vulkan(
+              {in}, block_reduced, reduce_type, block_axes, s)) {
+        return false;
+      }
+      return try_eval_reduce_sum_rows_vulkan(
+          {block_reduced}, out, reduce_type, remaining_axes, s);
+    }
+  }
+
+  if (in.ndim() > 4 ||
+      (reduce_out_target.ndim() > 4 && !reshape_final_to_output)) {
     return false;
   }
 
-  const bool out_is_keepdims = staged_full_reduce_output ||
-      has_keepdims_axes_shape(in, reduce_out_target, normalized_axes);
-  const bool out_is_squeezed =
-      has_squeezed_axes_shape(in, reduce_out_target, normalized_axes);
+  if (!reshape_final_to_output && !out_is_squeezed) {
+    out_is_keepdims = staged_full_reduce_output ||
+        has_keepdims_axes_shape(in, reduce_out_target, normalized_axes);
+    out_is_squeezed =
+        has_squeezed_axes_shape(in, reduce_out_target, normalized_axes);
+  }
   if (!out_is_keepdims && !out_is_squeezed) {
     return false;
   }
@@ -277,21 +359,29 @@ bool try_eval_reduce_sum_rows_vulkan(
         : swapaxes_in_eval(kernel_out, axis, reduced.ndim() - 1);
   }
 
-  array final_result = out_is_squeezed
+  array final_result =
+      (reshape_final_to_output || out_is_squeezed || staged_full_reduce_output)
       ? reshape_in_eval(reduced, out.shape(), s)
-      : staged_full_reduce_output ? reshape_in_eval(reduced, out.shape(), s)
-                                  : reduced;
+      : reduced;
 
   if (use_f32_staging_io) {
-    copy_gpu(final_result, reduce_out_target, CopyType::General, s);
-    copy_gpu(reduce_out_target, out, CopyType::General, s);
+    if (reshape_final_to_output) {
+      copy_gpu(final_result, out, CopyType::General, s);
+    } else {
+      copy_gpu(final_result, reduce_out_target, CopyType::General, s);
+      copy_gpu(reduce_out_target, out, CopyType::General, s);
+    }
   } else if (use_u8_staging_io) {
-    out.copy_shared_buffer(
-        final_result,
-        final_result.strides(),
-        final_result.flags(),
-        final_result.data_size(),
-        final_result.offset());
+    if (reshape_final_to_output) {
+      copy_gpu(final_result, out, CopyType::General, s);
+    } else {
+      out.copy_shared_buffer(
+          final_result,
+          final_result.strides(),
+          final_result.flags(),
+          final_result.data_size(),
+          final_result.offset());
+    }
   } else if (final_result.ndim() == 0 && out.ndim() == 0) {
     copy_gpu(final_result, out, CopyType::Scalar, s);
   } else {
@@ -419,6 +509,16 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axes] = state();
   if (!try_eval_reduce_sum_rows_vulkan(
           inputs, out, reduce_type, axes, stream())) {
+    if (trace_fallback_enabled() && !inputs.empty()) {
+      std::ostringstream oss;
+      oss << "reduce_vulkan_unsupported in_shape=" << inputs[0].shape()
+          << " in_dtype=" << inputs[0].dtype() << " out_shape=" << out.shape()
+          << " out_dtype=" << out.dtype() << " axes=";
+      for (auto axis : axes) {
+        oss << axis << ",";
+      }
+      trace_fallback(oss.str());
+    }
     throw std::runtime_error(
         "Reduce has no Vulkan implementation for this input.");
   }

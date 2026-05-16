@@ -15,6 +15,7 @@ namespace mlx::core {
 namespace {
 
 constexpr int MAX_STOCKHAM_FFT_SIZE = 4096;
+constexpr int MAX_FOUR_STEP_FFT_SIZE = 1 << 20;
 
 inline const std::vector<int>& supported_radices() {
   static const std::vector<int> kRadices = {13, 11, 8, 7, 6, 5, 4, 3, 2};
@@ -80,15 +81,6 @@ bool try_eval_fft_stockham_c2c_vulkan(
     return false;
   }
 
-  // The current shader only safely covers stages where one 256-thread wave can
-  // read every butterfly input before writes begin.
-  const auto radices = supported_radices();
-  for (int i = 0; i < stockham_plan.size(); ++i) {
-    if (stockham_plan[i] > 0 && (n / radices[i]) > 256) {
-      return false;
-    }
-  }
-
   array in_kernel = in;
   array out_kernel = out;
   if (normalized_axis != in.ndim() - 1) {
@@ -145,6 +137,111 @@ bool try_eval_fft_stockham_c2c_vulkan(
       s,
       pc,
       specialization_constants);
+  vulkan::end_command_recording(s.index);
+
+  if (normalized_axis != in.ndim() - 1) {
+    array restored =
+        swapaxes_in_eval(out_kernel_storage, out.ndim() - 1, normalized_axis);
+    copy_gpu(restored, out, CopyType::GeneralGeneral, s);
+  } else {
+    copy_gpu(out_kernel_storage, out, CopyType::GeneralGeneral, s);
+  }
+  return true;
+}
+
+bool try_eval_fft_four_step_c2c_vulkan(
+    const array& in,
+    array& out,
+    int axis,
+    bool inverse,
+    Stream s) {
+  if (in.dtype() != complex64 || out.dtype() != complex64) {
+    return false;
+  }
+
+  const int normalized_axis = normalize_axis(axis, in.ndim());
+  const int n = static_cast<int>(in.shape(normalized_axis));
+  if (n <= MAX_STOCKHAM_FFT_SIZE || n > MAX_FOUR_STEP_FFT_SIZE ||
+      !is_power_of_2(n)) {
+    return false;
+  }
+
+  const int n2 = n > 65536 ? 1024 : 64;
+  const int n1 = n / n2;
+  std::vector<int> plan1;
+  std::vector<int> plan2;
+  if (!try_plan_stockham_fft(n1, plan1) || !try_plan_stockham_fft(n2, plan2)) {
+    return false;
+  }
+
+  array in_kernel = in;
+  array out_kernel = out;
+  if (normalized_axis != in.ndim() - 1) {
+    in_kernel = swapaxes_in_eval(in_kernel, normalized_axis, in.ndim() - 1);
+    out_kernel = swapaxes_in_eval(out_kernel, normalized_axis, out.ndim() - 1);
+  }
+
+  in_kernel = make_axis_contiguous_copy(in_kernel, in_kernel.ndim() - 1, s);
+  array temp(in_kernel.shape(), complex64, nullptr, {});
+  temp.set_data(allocator::malloc(temp.nbytes()));
+  array out_kernel_storage(out_kernel.shape(), out_kernel.dtype(), nullptr, {});
+  out_kernel_storage.set_data(allocator::malloc(out_kernel_storage.nbytes()));
+
+  const uint64_t in_offset = in_kernel.offset() / size_of(in_kernel.dtype());
+  const uint64_t temp_offset = temp.offset() / size_of(temp.dtype());
+  const uint64_t out_offset =
+      out_kernel_storage.offset() / size_of(out_kernel_storage.dtype());
+  const uint64_t total = out_kernel_storage.data_size();
+  if (in_offset > std::numeric_limits<uint32_t>::max() ||
+      temp_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  auto make_spec = [&](const std::vector<int>& plan, uint32_t step) {
+    std::vector<uint32_t> spec;
+    spec.reserve(plan.size() + 3);
+    for (int count : plan) {
+      spec.push_back(static_cast<uint32_t>(count));
+    }
+    spec.push_back(static_cast<uint32_t>(n1));
+    spec.push_back(static_cast<uint32_t>(n2));
+    spec.push_back(step);
+    return spec;
+  };
+
+  vulkan::FFTPushConstants pc0{};
+  pc0.in_offset = static_cast<uint32_t>(in_offset);
+  pc0.out_offset = static_cast<uint32_t>(temp_offset);
+  pc0.batch_count = static_cast<uint32_t>((total / n) * n2);
+  pc0.n = static_cast<uint32_t>(n1);
+  pc0.inverse = inverse ? 1u : 0u;
+
+  vulkan::FFTPushConstants pc1{};
+  pc1.in_offset = static_cast<uint32_t>(temp_offset);
+  pc1.out_offset = static_cast<uint32_t>(out_offset);
+  pc1.batch_count = static_cast<uint32_t>((total / n) * n1);
+  pc1.n = static_cast<uint32_t>(n2);
+  pc1.inverse = inverse ? 1u : 0u;
+
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_fft_op(
+      in_kernel,
+      temp,
+      vulkan::StaticShaderId::fft_four_step_c64,
+      command_buffer,
+      s,
+      pc0,
+      make_spec(plan1, 0));
+  vulkan::dispatch_fft_op(
+      temp,
+      out_kernel_storage,
+      vulkan::StaticShaderId::fft_four_step_c64,
+      command_buffer,
+      s,
+      pc1,
+      make_spec(plan2, 1));
   vulkan::end_command_recording(s.index);
 
   if (normalized_axis != in.ndim() - 1) {
@@ -217,7 +314,9 @@ void fft_op(
     slice_gpu(full_fft, out, starts, strides, s);
     return;
   }
-  if (!try_eval_fft_stockham_c2c_vulkan(in, out, normalized_axis, inverse, s)) {
+  if (!try_eval_fft_stockham_c2c_vulkan(in, out, normalized_axis, inverse, s) &&
+      !try_eval_fft_four_step_c2c_vulkan(
+          in, out, normalized_axis, inverse, s)) {
     throw std::runtime_error("FFT has no Vulkan implementation.");
   }
 }

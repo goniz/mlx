@@ -111,7 +111,9 @@ std::vector<VkDescriptorSetLayoutBinding> conv_layout_bindings() {
   return bindings;
 }
 
-VkDescriptorBufferInfo descriptor_buffer_info(const array& arr, const char* name) {
+VkDescriptorBufferInfo descriptor_buffer_info(
+    const array& arr,
+    const char* name) {
   auto* vulkan_buffer = static_cast<const vulkan::VulkanBuffer*>(
       static_cast<const void*>(arr.buffer().ptr()));
   if (vulkan_buffer == nullptr || vulkan_buffer->buffer == VK_NULL_HANDLE) {
@@ -146,6 +148,56 @@ array permute_view(
       base,
       permuted_strides,
       {contiguous, row_contiguous, col_contiguous},
+      base.data_size(),
+      base.offset());
+  return view;
+}
+
+array squeeze_unit_axis_view(const array& base, int axis) {
+  if (base.shape(axis) != 1) {
+    throw std::runtime_error(
+        "[vulkan::conv] Cannot squeeze non-unit axis from view.");
+  }
+
+  Shape squeezed_shape;
+  Strides squeezed_strides;
+  squeezed_shape.reserve(base.ndim() - 1);
+  squeezed_strides.reserve(base.ndim() - 1);
+  for (int i = 0; i < base.ndim(); ++i) {
+    if (i == axis) {
+      continue;
+    }
+    squeezed_shape.push_back(base.shape(i));
+    squeezed_strides.push_back(base.strides(i));
+  }
+
+  array view(squeezed_shape, base.dtype(), nullptr, {});
+  const auto [data_size, row_contiguous, col_contiguous] =
+      check_contiguity(squeezed_shape, squeezed_strides);
+  view.copy_shared_buffer(
+      base,
+      squeezed_strides,
+      {data_size == base.data_size(), row_contiguous, col_contiguous},
+      base.data_size(),
+      base.offset());
+  return view;
+}
+
+array expand_unit_axis_view(const array& base, int axis) {
+  Shape expanded_shape(base.shape().begin(), base.shape().end());
+  Strides expanded_strides(base.strides().begin(), base.strides().end());
+  expanded_shape.insert(expanded_shape.begin() + axis, 1);
+  expanded_strides.insert(
+      expanded_strides.begin() + axis,
+      axis < base.ndim() ? base.strides(axis) : int64_t{1});
+
+  array view(expanded_shape, base.dtype(), nullptr, {});
+  const auto [data_size, row_contiguous, col_contiguous] =
+      check_contiguity(expanded_shape, expanded_strides);
+  view.copy_shared_buffer(
+      base,
+      expanded_strides,
+      {data_size == base.data_size(), row_contiguous, col_contiguous},
       base.data_size(),
       base.offset());
   return view;
@@ -186,8 +238,7 @@ ConvPipelineConfig select_conv2d_pipeline(
     config.shmem_pad =
         ctx.architecture() == vulkan::GpuArchitecture::AmdCdna ? 1u : 4u;
 
-    if (
-        ctx.coopmat_flash_attention_f32acc_supported() && crs >= 64 &&
+    if (ctx.coopmat_flash_attention_f32acc_supported() && crs >= 64 &&
         cout >= 64) {
       config.shmem_pad = 0u;
       config.shader_id = weight_dtype == float16
@@ -215,7 +266,10 @@ ConvPipelineConfig select_conv2d_pipeline(
   return config;
 }
 
-array make_tracked_contiguous_copy(const array& src, Stream s, const char* name) {
+array make_tracked_contiguous_copy(
+    const array& src,
+    Stream s,
+    const char* name) {
   array out(src.shape(), src.dtype(), nullptr, {});
   out.set_data(vulkan::allocator().malloc(out.nbytes()));
   vulkan::record_primitive_for_stream(s, name);
@@ -241,8 +295,8 @@ bool try_eval_conv2d_vulkan(
     return false;
   }
   if (kernel_strides.size() != 2 || padding_lo.size() != 2 ||
-      padding_hi.size() != 2 ||
-      kernel_dilation.size() != 2 || input_dilation.size() != 2) {
+      padding_hi.size() != 2 || kernel_dilation.size() != 2 ||
+      input_dilation.size() != 2) {
     return false;
   }
   if (groups <= 0) {
@@ -267,12 +321,13 @@ bool try_eval_conv2d_vulkan(
   const int out_height = out.shape(1);
   const int out_width = out.shape(2);
 
-  if (in_channels != channels_per_group * groups || out_channels % groups != 0) {
+  if (in_channels != channels_per_group * groups ||
+      out_channels % groups != 0) {
     return false;
   }
 
-  const bool supports_direct_kernel =
-      groups == 1 && !flip && input_dilation[0] == 1 && input_dilation[1] == 1 &&
+  const bool supports_direct_kernel = groups == 1 && !flip &&
+      input_dilation[0] == 1 && input_dilation[1] == 1 &&
       padding_lo == padding_hi;
 
   if (!supports_direct_kernel) {
@@ -341,7 +396,8 @@ bool try_eval_conv2d_vulkan(
           wt_shape,
           {wt_strides[0], -wt_strides[1], -wt_strides[2], wt_strides[3]},
           static_cast<size_t>(
-              (wt_shape[1] - 1) * wt_strides[1] + (wt_shape[2] - 1) * wt_strides[2]),
+              (wt_shape[1] - 1) * wt_strides[1] +
+              (wt_shape[2] - 1) * wt_strides[2]),
           s);
     }
 
@@ -395,16 +451,22 @@ bool try_eval_conv2d_vulkan(
       auto wt_g = slice(
           wt_work,
           {g * out_channels_per_group, 0, 0, 0},
-          {(g + 1) * out_channels_per_group, kernel_h, kernel_w, channels_per_group},
+          {(g + 1) * out_channels_per_group,
+           kernel_h,
+           kernel_w,
+           channels_per_group},
           s);
       wt_g = reshape(
-          wt_g, {out_channels_per_group, kernel_h * kernel_w * channels_per_group}, s);
+          wt_g,
+          {out_channels_per_group, kernel_h * kernel_w * channels_per_group},
+          s);
       wt_g = transpose(wt_g, {1, 0}, s);
 
       auto out_g = matmul(patches_g, wt_g, s);
-      group_outputs.push_back(
-          reshape(
-              out_g, {batch_size, out_height, out_width, out_channels_per_group}, s));
+      group_outputs.push_back(reshape(
+          out_g,
+          {batch_size, out_height, out_width, out_channels_per_group},
+          s));
     }
 
     auto result = group_outputs.size() == 1
@@ -423,13 +485,16 @@ bool try_eval_conv2d_vulkan(
   const uint32_t kw = checked_u32_size(wt.shape(2), "kernel width");
   const uint32_t oh = checked_u32_size(out.shape(1), "output height");
   const uint32_t ow = checked_u32_size(out.shape(2), "output width");
-  const uint32_t crs = checked_mul_u32(cin, checked_mul_u32(kh, kw, "kernel area"), "crs");
-  const uint32_t npq = checked_mul_u32(batch, checked_mul_u32(oh, ow, "output pixels"), "npq");
+  const uint32_t crs =
+      checked_mul_u32(cin, checked_mul_u32(kh, kw, "kernel area"), "crs");
+  const uint32_t npq =
+      checked_mul_u32(batch, checked_mul_u32(oh, ow, "output pixels"), "npq");
   if (cout == 0 || cin == 0 || kh == 0 || kw == 0 || oh == 0 || ow == 0 ||
       npq == 0 || crs == 0) {
     out.set_data(vulkan::allocator().malloc(out.nbytes()));
     if (out.nbytes() > 0) {
-      auto out_buf = static_cast<const vulkan::VulkanBuffer*>(out.buffer().ptr());
+      auto out_buf =
+          static_cast<const vulkan::VulkanBuffer*>(out.buffer().ptr());
       vulkan::record_primitive_for_stream(s, "conv2d.zero_fill");
       auto cmd_buffer = vulkan::begin_command_recording(s.index);
       vkCmdFillBuffer(cmd_buffer, out_buf->buffer, 0, out.nbytes(), 0);
@@ -445,7 +510,8 @@ bool try_eval_conv2d_vulkan(
   auto in_work = make_tracked_contiguous_copy(in_nchw, s, "conv2d.copy_input");
   auto wt_work = make_tracked_contiguous_copy(wt_ochw, s, "conv2d.copy_weight");
 
-  Shape out_work_shape = {out.shape(0), out.shape(3), out.shape(1), out.shape(2)};
+  Shape out_work_shape = {
+      out.shape(0), out.shape(3), out.shape(1), out.shape(2)};
   array out_work(out_work_shape, out.dtype(), nullptr, {});
   out_work.set_data(vulkan::allocator().malloc(out_work.nbytes()));
 
@@ -522,7 +588,8 @@ bool try_eval_conv2d_vulkan(
   push_constants.nb1 = checked_u32_size(out_work.strides(2), "output stride 1");
   push_constants.nb2 = checked_u32_size(out_work.strides(1), "output stride 2");
   push_constants.nb3 = checked_u32_size(out_work.strides(0), "output stride 3");
-  init_fastdiv_values(push_constants.OW, push_constants.OWmp, push_constants.OWL);
+  init_fastdiv_values(
+      push_constants.OW, push_constants.OWmp, push_constants.OWL);
   init_fastdiv_values(
       checked_mul_u32(push_constants.OW, push_constants.OH, "ow*oh"),
       push_constants.OWOHmp,
@@ -538,7 +605,8 @@ bool try_eval_conv2d_vulkan(
   auto command_buffer = vulkan::begin_command_recording(s.index);
   vkCmdBindPipeline(
       command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  VkDescriptorSet vk_descriptor_set = static_cast<VkDescriptorSet>(descriptor_set);
+  VkDescriptorSet vk_descriptor_set =
+      static_cast<VkDescriptorSet>(descriptor_set);
   vkCmdBindDescriptorSets(
       command_buffer,
       VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -734,8 +802,10 @@ bool try_eval_conv1d_direct_vulkan(
     int groups,
     bool flip,
     Stream s) {
-  if ((in.dtype() != float32 && in.dtype() != float16 && in.dtype() != bfloat16) ||
-      (wt.dtype() != float32 && wt.dtype() != float16 && wt.dtype() != bfloat16)) {
+  if ((in.dtype() != float32 && in.dtype() != float16 &&
+       in.dtype() != bfloat16) ||
+      (wt.dtype() != float32 && wt.dtype() != float16 &&
+       wt.dtype() != bfloat16)) {
     return false;
   }
   if (stride <= 0 || padding < 0 || dilation <= 0 || input_dilation <= 0 ||
@@ -762,9 +832,10 @@ bool try_eval_conv1d_direct_vulkan(
   pc.out_len = checked_u32_size(out.shape(1), "conv1d output length");
   pc.out_channels = checked_u32_size(out.shape(2), "conv1d output channels");
   pc.kernel = checked_u32_size(wt.shape(1), "conv1d kernel");
-  pc.channels_per_group = checked_u32_size(wt.shape(2), "conv1d channels/group");
-  pc.out_channels_per_group = checked_u32_size(
-      out.shape(2) / groups, "conv1d output channels/group");
+  pc.channels_per_group =
+      checked_u32_size(wt.shape(2), "conv1d channels/group");
+  pc.out_channels_per_group =
+      checked_u32_size(out.shape(2) / groups, "conv1d output channels/group");
   pc.stride = checked_u32_size(stride, "conv1d stride");
   pc.padding = checked_u32_size(padding, "conv1d padding");
   pc.dilation = checked_u32_size(dilation, "conv1d dilation");
@@ -847,6 +918,57 @@ bool try_eval_conv1d_vulkan(
       s);
 }
 
+bool try_eval_conv2d_as_conv1d_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    const std::vector<int>& kernel_strides,
+    const std::vector<int>& padding_lo,
+    const std::vector<int>& padding_hi,
+    const std::vector<int>& kernel_dilation,
+    const std::vector<int>& input_dilation,
+    int groups,
+    bool flip,
+    Stream s) {
+  if (inputs.size() != 2 || inputs[0].ndim() != 4 || inputs[1].ndim() != 4 ||
+      out.ndim() != 4) {
+    return false;
+  }
+  if (kernel_strides.size() != 2 || padding_lo.size() != 2 ||
+      padding_hi.size() != 2 || kernel_dilation.size() != 2 ||
+      input_dilation.size() != 2) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  const auto& wt = inputs[1];
+  if (in.shape(2) != 1 || wt.shape(2) != 1 || out.shape(2) != 1 ||
+      kernel_strides[1] != 1 || padding_lo[1] != 0 || padding_hi[1] != 0 ||
+      kernel_dilation[1] != 1 || input_dilation[1] != 1) {
+    return false;
+  }
+
+  array in_1d = squeeze_unit_axis_view(in, 2);
+  array wt_1d = squeeze_unit_axis_view(wt, 2);
+  array out_1d(
+      {out.shape(0), out.shape(1), out.shape(3)}, out.dtype(), nullptr, {});
+  if (!try_eval_conv1d_vulkan(
+          {in_1d, wt_1d},
+          out_1d,
+          {kernel_strides[0]},
+          {padding_lo[0]},
+          {padding_hi[0]},
+          {kernel_dilation[0]},
+          {input_dilation[0]},
+          groups,
+          flip,
+          s)) {
+    return false;
+  }
+
+  out.copy_shared_buffer(expand_unit_axis_view(out_1d, 2));
+  return true;
+}
+
 bool try_eval_conv3d_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -889,25 +1011,21 @@ bool try_eval_conv3d_vulkan(
   const int out_height = out.shape(2);
   const int out_width = out.shape(3);
 
-  if (in_channels != channels_per_group * groups || out_channels % groups != 0) {
+  if (in_channels != channels_per_group * groups ||
+      out_channels % groups != 0) {
     return false;
   }
 
   auto in_work = in;
   if (input_dilation[0] != 1) {
     auto expanded = expand_dims(in_work, 2, s);
-    auto padded =
-        pad(expanded,
-            std::vector<std::pair<int, int>>{
-                {0, 0},
-                {0, 0},
-                {0, input_dilation[0] - 1},
-                {0, 0},
-                {0, 0},
-                {0, 0}},
-            array(0, in.dtype()),
-            "constant",
-            s);
+    auto padded = pad(
+        expanded,
+        std::vector<std::pair<int, int>>{
+            {0, 0}, {0, 0}, {0, input_dilation[0] - 1}, {0, 0}, {0, 0}, {0, 0}},
+        array(0, in.dtype()),
+        "constant",
+        s);
     auto reshaped = reshape(
         padded,
         {
@@ -932,18 +1050,13 @@ bool try_eval_conv3d_vulkan(
   }
   if (input_dilation[1] != 1) {
     auto expanded = expand_dims(in_work, 3, s);
-    auto padded =
-        pad(expanded,
-            std::vector<std::pair<int, int>>{
-                {0, 0},
-                {0, 0},
-                {0, 0},
-                {0, input_dilation[1] - 1},
-                {0, 0},
-                {0, 0}},
-            array(0, in.dtype()),
-            "constant",
-            s);
+    auto padded = pad(
+        expanded,
+        std::vector<std::pair<int, int>>{
+            {0, 0}, {0, 0}, {0, 0}, {0, input_dilation[1] - 1}, {0, 0}, {0, 0}},
+        array(0, in.dtype()),
+        "constant",
+        s);
     auto reshaped = reshape(
         padded,
         {
@@ -968,18 +1081,13 @@ bool try_eval_conv3d_vulkan(
   }
   if (input_dilation[2] != 1) {
     auto expanded = expand_dims(in_work, 4, s);
-    auto padded =
-        pad(expanded,
-            std::vector<std::pair<int, int>>{
-                {0, 0},
-                {0, 0},
-                {0, 0},
-                {0, 0},
-                {0, input_dilation[2] - 1},
-                {0, 0}},
-            array(0, in.dtype()),
-            "constant",
-            s);
+    auto padded = pad(
+        expanded,
+        std::vector<std::pair<int, int>>{
+            {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, input_dilation[2] - 1}, {0, 0}},
+        array(0, in.dtype()),
+        "constant",
+        s);
     auto reshaped = reshape(
         padded,
         {
@@ -1126,6 +1234,20 @@ bool try_eval_conv3d_vulkan(
 } // namespace
 
 void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (try_eval_conv2d_as_conv1d_vulkan(
+          inputs,
+          out,
+          kernel_strides_,
+          padding_lo_,
+          padding_hi_,
+          kernel_dilation_,
+          input_dilation_,
+          groups_,
+          flip_,
+          stream())) {
+    return;
+  }
+
   if (try_eval_conv2d_vulkan(
           inputs,
           out,

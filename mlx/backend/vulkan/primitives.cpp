@@ -78,6 +78,16 @@ void swap_endianness(uint8_t* data_bytes, size_t N) {
   }
 }
 
+array scalar_storage_view(const array& base) {
+  array view({1}, base.dtype(), nullptr, {});
+  array::Flags flags{};
+  flags.contiguous = true;
+  flags.row_contiguous = true;
+  flags.col_contiguous = true;
+  view.copy_shared_buffer(base, {1}, flags, 1, base.offset());
+  return view;
+}
+
 array collapse_power_leading_dims(const array& arr, Stream s) {
   if (arr.ndim() <= 4) {
     return arr;
@@ -406,7 +416,12 @@ equal_input_expr(Dtype dtype, const char* buffer_name, const char* index_name) {
   return std::string(buffer_name) + ".data[" + index_name + "]";
 }
 
-std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
+std::string build_equal_shader(
+    Dtype a_dtype,
+    Dtype b_dtype,
+    bool equal_nan,
+    bool a_scalar,
+    bool b_scalar) {
   if (a_dtype == bool_ && b_dtype == bool_) {
     std::ostringstream os;
     os << vulkan::emit_dynamic_shader_preamble(bool_, bool_, false);
@@ -417,8 +432,12 @@ std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
     os << "void main() {\n";
     os << "  uint idx = gl_GlobalInvocationID.x;\n";
     os << "  if (idx >= pc.total_elements) return;\n";
-    os << "  bool lhs = a_buf.data[idx + pc.a_offset] != uint8_t(0);\n";
-    os << "  bool rhs = b_buf.data[idx + pc.b_offset] != uint8_t(0);\n";
+    os << "  uint a_idx = " << (a_scalar ? "pc.a_offset" : "idx + pc.a_offset")
+       << ";\n";
+    os << "  uint b_idx = " << (b_scalar ? "pc.b_offset" : "idx + pc.b_offset")
+       << ";\n";
+    os << "  bool lhs = a_buf.data[a_idx] != uint8_t(0);\n";
+    os << "  bool rhs = b_buf.data[b_idx] != uint8_t(0);\n";
     os << "  out_buf.data[idx + pc.out_offset] = (lhs == rhs) ? uint8_t(1) : uint8_t(0);\n";
     os << "}\n";
     return os.str();
@@ -459,8 +478,10 @@ std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
   os << "  if (linear_idx >= pc.total_elements) return;\n";
   os << "  uint idx = linear_idx;\n";
-  os << "  uint a_idx = idx + pc.a_offset;\n";
-  os << "  uint b_idx = idx + pc.b_offset;\n";
+  os << "  uint a_idx = " << (a_scalar ? "pc.a_offset" : "idx + pc.a_offset")
+     << ";\n";
+  os << "  uint b_idx = " << (b_scalar ? "pc.b_offset" : "idx + pc.b_offset")
+     << ";\n";
   if (a_dtype == complex64 && b_dtype == complex64) {
     os << "  vec2 lhs = " << equal_input_expr(a_dtype, "a_buf", "a_idx")
        << ";\n";
@@ -483,7 +504,12 @@ std::string build_equal_shader(Dtype a_dtype, Dtype b_dtype, bool equal_nan) {
   return os.str();
 }
 
-std::string build_compare_shader(Dtype a_dtype, Dtype b_dtype, CompareOp op) {
+std::string build_compare_shader(
+    Dtype a_dtype,
+    Dtype b_dtype,
+    CompareOp op,
+    bool a_scalar,
+    bool b_scalar) {
   std::ostringstream os;
   const bool uses_bfloat16 = a_dtype == bfloat16 || b_dtype == bfloat16;
   const bool uses_float16 = a_dtype == float16 || b_dtype == float16;
@@ -537,8 +563,10 @@ std::string build_compare_shader(Dtype a_dtype, Dtype b_dtype, CompareOp op) {
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
-  os << "  uint a_idx = idx + pc.a_offset;\n";
-  os << "  uint b_idx = idx + pc.b_offset;\n";
+  os << "  uint a_idx = " << (a_scalar ? "pc.a_offset" : "idx + pc.a_offset")
+     << ";\n";
+  os << "  uint b_idx = " << (b_scalar ? "pc.b_offset" : "idx + pc.b_offset")
+     << ";\n";
   os << "  bool result = (" << equal_input_expr(a_dtype, "a_buf", "a_idx")
      << ") " << expr << " (" << equal_input_expr(b_dtype, "b_buf", "b_idx")
      << ");\n";
@@ -574,13 +602,21 @@ bool try_eval_equal_vulkan(
 
   auto stage_lowbit_equal_input = [&](array& in) {
     if (in.dtype() == bool_ || in.dtype() == uint8 || in.dtype() == uint16) {
-      array staged(in.shape(), uint32, nullptr, {});
+      if (in.data_size() == 1 && in.size() != 1) {
+        in = scalar_storage_view(in);
+      }
+      array staged(
+          in.data_size() == 1 ? Shape{1} : in.shape(), uint32, nullptr, {});
       copy_gpu(in, staged, CopyType::General, s);
       in = staged;
       return;
     }
     if (in.dtype() == int8 || in.dtype() == int16) {
-      array staged(in.shape(), int32, nullptr, {});
+      if (in.data_size() == 1 && in.size() != 1) {
+        in = scalar_storage_view(in);
+      }
+      array staged(
+          in.data_size() == 1 ? Shape{1} : in.shape(), int32, nullptr, {});
       copy_gpu(in, staged, CopyType::General, s);
       in = staged;
     }
@@ -588,12 +624,13 @@ bool try_eval_equal_vulkan(
   stage_lowbit_equal_input(a);
   stage_lowbit_equal_input(b);
 
-  if (!ensure_vulkan_buffer_compare(a, s) ||
-      !ensure_vulkan_buffer_compare(b, s)) {
-    return false;
-  }
-
   auto materialize_broadcast_input = [&](array& in) {
+    if (in.data_size() == 1) {
+      if (in.size() != 1) {
+        in = scalar_storage_view(in);
+      }
+      return true;
+    }
     if (in.shape() == out.shape()) {
       return true;
     }
@@ -610,6 +647,11 @@ bool try_eval_equal_vulkan(
   };
 
   if (!materialize_broadcast_input(a) || !materialize_broadcast_input(b)) {
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer_compare(a, s) ||
+      !ensure_vulkan_buffer_compare(b, s)) {
     return false;
   }
 
@@ -631,16 +673,9 @@ bool try_eval_equal_vulkan(
 
   const bool staged_output =
       flatten_rank || !is_supported_elementwise_layout(out);
-  array out_work = staged_output
-      ? array(
-            out.shape(),
-            bool_,
-            nullptr,
-            {})
-      : out;
+  array out_work = staged_output ? array(out.shape(), bool_, nullptr, {}) : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  array out_kernel =
-      flatten_rank
+  array out_kernel = flatten_rank
       ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
       : collapse_compare_leading_dims(out_work, s);
 
@@ -666,6 +701,8 @@ bool try_eval_equal_vulkan(
   const auto out_offset =
       static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
   const auto total = static_cast<uint64_t>(out_kernel.data_size());
+  const bool a_scalar = a.data_size() == 1;
+  const bool b_scalar = b.data_size() == 1;
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -676,9 +713,10 @@ bool try_eval_equal_vulkan(
   const std::string shader_name =
       std::string(equal_nan ? "dynamic_nan_equal_" : "dynamic_equal_") +
       std::to_string(static_cast<int>(a.dtype().val())) + "_" +
-      std::to_string(static_cast<int>(b.dtype().val()));
+      std::to_string(static_cast<int>(b.dtype().val())) +
+      (a_scalar ? "_as" : "_av") + (b_scalar ? "_bs" : "_bv");
   const std::string glsl_source =
-      build_equal_shader(a.dtype(), b.dtype(), equal_nan);
+      build_equal_shader(a.dtype(), b.dtype(), equal_nan, a_scalar, b_scalar);
   vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_kernel, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
@@ -738,12 +776,13 @@ bool try_eval_compare_vulkan(
     return false;
   }
 
-  if (!ensure_vulkan_buffer_compare(a, s) ||
-      !ensure_vulkan_buffer_compare(b, s)) {
-    return false;
-  }
-
   auto materialize_broadcast_input = [&](array& in) {
+    if (in.data_size() == 1) {
+      if (in.size() != 1) {
+        in = scalar_storage_view(in);
+      }
+      return true;
+    }
     if (in.shape() == out.shape()) {
       return true;
     }
@@ -781,16 +820,9 @@ bool try_eval_compare_vulkan(
 
   const bool staged_output =
       flatten_rank || !is_supported_elementwise_layout(out);
-  array out_work = staged_output
-      ? array(
-            out.shape(),
-            bool_,
-            nullptr,
-            {})
-      : out;
+  array out_work = staged_output ? array(out.shape(), bool_, nullptr, {}) : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  array out_kernel =
-      flatten_rank
+  array out_kernel = flatten_rank
       ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
       : collapse_compare_leading_dims(out_work, s);
 
@@ -816,6 +848,8 @@ bool try_eval_compare_vulkan(
   const auto out_offset =
       static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
   const auto total = static_cast<uint64_t>(out_kernel.data_size());
+  const bool a_scalar = a.data_size() == 1;
+  const bool b_scalar = b.data_size() == 1;
   if (a_offset > std::numeric_limits<uint32_t>::max() ||
       b_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -826,9 +860,10 @@ bool try_eval_compare_vulkan(
   const std::string shader_name = std::string("dynamic_compare_") +
       std::to_string(static_cast<int>(op)) + "_" +
       std::to_string(static_cast<int>(a.dtype().val())) + "_" +
-      std::to_string(static_cast<int>(b.dtype().val()));
+      std::to_string(static_cast<int>(b.dtype().val())) +
+      (a_scalar ? "_as" : "_av") + (b_scalar ? "_bs" : "_bv");
   const std::string glsl_source =
-      build_compare_shader(a.dtype(), b.dtype(), op);
+      build_compare_shader(a.dtype(), b.dtype(), op, a_scalar, b_scalar);
   vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out_kernel, 2}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 4;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
@@ -1115,11 +1150,11 @@ bool try_eval_logical_not_vulkan(
     in = collapse_compare_leading_dims(in, s);
   }
 
-  const bool staged_output = flatten_rank || !is_supported_elementwise_layout(out);
+  const bool staged_output =
+      flatten_rank || !is_supported_elementwise_layout(out);
   array out_work = staged_output ? array(out.shape(), bool_, nullptr, {}) : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  array out_kernel =
-      flatten_rank
+  array out_kernel = flatten_rank
       ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
       : collapse_compare_leading_dims(out_work, s);
 
@@ -1240,11 +1275,11 @@ bool try_eval_logical_binary_vulkan(
     b = collapse_compare_leading_dims(b, s);
   }
 
-  const bool staged_output = flatten_rank || !is_supported_elementwise_layout(out);
+  const bool staged_output =
+      flatten_rank || !is_supported_elementwise_layout(out);
   array out_work = staged_output ? array(out.shape(), bool_, nullptr, {}) : out;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
-  array out_kernel =
-      flatten_rank
+  array out_kernel = flatten_rank
       ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
       : collapse_compare_leading_dims(out_work, s);
 

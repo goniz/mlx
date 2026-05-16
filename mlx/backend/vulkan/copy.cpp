@@ -472,14 +472,12 @@ bool dispatch_dynamic_general_copy(
   return true;
 }
 
-bool dispatch_dynamic_complex_scalar_fill(
+bool dispatch_dynamic_scalar_fill(
     const mlx::core::array& in,
     mlx::core::array& out,
     const mlx::core::Stream& s) {
   if (!is_vulkan_storage_array(in) || !is_vulkan_storage_array(out) ||
-      in.dtype() != mlx::core::complex64 ||
-      out.dtype() != mlx::core::complex64 || in.data_size() != 1 ||
-      out.size() == 0) {
+      in.data_size() != 1 || out.size() == 0) {
     return false;
   }
 
@@ -493,14 +491,33 @@ bool dispatch_dynamic_complex_scalar_fill(
   }
 
   std::ostringstream os;
-  os << emit_dynamic_shader_preamble(mlx::core::complex64, false);
+  os << emit_dynamic_shader_preamble(in.dtype(), out.dtype(), false);
+  if (needs_bf16_helpers(in.dtype(), out.dtype())) {
+    os << emit_bf16_conversion_helpers();
+  }
   os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {vec2 data[];} input_buf;\n";
-  os << "layout(set = 0, binding = 1) buffer OutputBuffer {vec2 data[];} output_buf;\n\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
+     << dtype_to_glsl_storage_type(in.dtype()) << " data[];} input_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
+     << dtype_to_glsl_storage_type(out.dtype()) << " data[];} output_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
-  os << "  output_buf.data[idx + pc.out_offset] = input_buf.data[pc.in_offset];\n";
+  std::string cast_expr;
+  if (needs_bf16_helpers(in.dtype(), out.dtype())) {
+    cast_expr =
+        bf16_cast_expr("input_buf.data[pc.in_offset]", in.dtype(), out.dtype());
+  } else if (
+      in.dtype() == mlx::core::complex64 && out.dtype() == mlx::core::float32) {
+    cast_expr = "input_buf.data[pc.in_offset].x";
+  } else if (
+      in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::complex64) {
+    cast_expr = "vec2(input_buf.data[pc.in_offset], 0.0)";
+  } else {
+    cast_expr = cast_expr_for_dtype(
+        "input_buf.data[pc.in_offset]", in.dtype(), out.dtype());
+  }
+  os << "  output_buf.data[idx + pc.out_offset] = " << cast_expr << ";\n";
   os << "}\n";
 
   vulkan::DynamicArrayRef arrays[] = {
@@ -509,7 +526,14 @@ bool dispatch_dynamic_complex_scalar_fill(
   };
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 3;
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      "dynamic_fill_c64_scalar", os.str(), 2, arrays, kPushConstantSize, s);
+      "dynamic_fill_scalar_" +
+          std::to_string(static_cast<int>(in.dtype().val())) + "_" +
+          std::to_string(static_cast<int>(out.dtype().val())),
+      os.str(),
+      2,
+      arrays,
+      kPushConstantSize,
+      s);
 
   struct PushConstants {
     uint32_t in_off;
@@ -1761,21 +1785,37 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
     scalar_flags.contiguous = true;
     scalar_flags.row_contiguous = true;
     scalar_flags.col_contiguous = true;
-    scalar_view.copy_shared_buffer(fill_val, {1}, scalar_flags, 1);
+    scalar_view.copy_shared_buffer(
+        fill_val, {1}, scalar_flags, 1, fill_val.offset());
     fill_val = scalar_view;
   }
   if (fill_val.has_primitive()) {
-    fill_val.eval();
+    fill_val = contiguous_copy_gpu(fill_val, s);
   } else {
     auto data = fill_val.data_shared_ptr();
-    if (data == nullptr || data->buffer.ptr() == nullptr) {
+    if ((data == nullptr || data->buffer.ptr() == nullptr) &&
+        fill_val.is_available()) {
       fill_val.wait();
     }
   }
 
   out.set_data(allocator::malloc(out.nbytes()));
 
-  if (dispatch_dynamic_complex_scalar_fill(fill_val, out, s)) {
+  if (dispatch_dynamic_scalar_fill(fill_val, out, s)) {
+    return;
+  }
+
+  if (!fill_val.is_available() && is_vulkan_storage_array(fill_val)) {
+    copy_gpu_inplace(
+        fill_val,
+        out,
+        out.shape(),
+        Strides(out.ndim(), 0),
+        out.strides(),
+        0,
+        0,
+        CopyType::GeneralGeneral,
+        s);
     return;
   }
 
@@ -1790,8 +1830,6 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
     }
   }
 
-  // CPU-side scalar replication must observe the final scalar value, even when
-  // it was produced by a prior GPU op.
   fill_val.wait();
 
   // For unified memory, we can directly fill on CPU

@@ -127,8 +127,12 @@ void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_
     }
 
     if (i0 >= p.n_dims) {
-        rope_data_d[idst + 0] = float_to_rope_d_type(load_a_as_float(ix + 0));
-        rope_data_d[idst + p.n_dims/2] = float_to_rope_d_type(load_a_as_float(ix + p.n_dims/2));
+        const uint tail_idst = i0 + i1 * p.nb11 + i2 * p.nb12 + i3 * p.nb13;
+        const uint tail_ix = rope_a_coord(i0, i1, i2, i3, p);
+        rope_data_d[tail_idst + 0] = float_to_rope_d_type(load_a_as_float(tail_ix + 0));
+        if (i0 + 1 < p.ne00) {
+            rope_data_d[tail_idst + 1] = float_to_rope_d_type(load_a_as_float(tail_ix + 1));
+        }
 
         return;
     }

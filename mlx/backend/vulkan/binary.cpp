@@ -1092,6 +1092,7 @@ bool try_eval_binary_op_vulkan(
   if (!is_supported_elementwise_layout(b) && !is_supported_unary_layout(b)) {
     b = contiguous_copy_gpu(b, s);
   }
+  const bool collapsed_rank = a.ndim() > 4 || b.ndim() > 4 || out.ndim() > 4;
   a = collapse_binary_leading_dims(a, s);
   b = collapse_binary_leading_dims(b, s);
 
@@ -1111,6 +1112,10 @@ bool try_eval_binary_op_vulkan(
 
   auto bopt = get_binary_op_type(a, b);
   if (small_signed_integer_case || small_unsigned_integer_case) {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  } else if (collapsed_rank) {
+    // Collapsing rank creates 4D views over 5D+ tensors. Reusing one of those
+    // views for the logical output would copy 4D strides into a 5D shape.
     out_work.set_data(allocator::malloc(out_work.nbytes()));
   } else if constexpr (std::is_same_v<Primitive, Multiply>) {
     out_work.set_data(allocator::malloc(out_work.nbytes()));

@@ -2448,7 +2448,72 @@ void RMSNorm::eval_gpu(
 void RMSNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("[RMSNormVJP::eval_gpu] Not implemented.");
+  if (inputs.size() != 3 || outputs.size() != 2) {
+    throw std::runtime_error("RMSNormVJP expects 3 inputs and 2 outputs.");
+  }
+
+  auto s = stream();
+  array x = inputs[0];
+  const array& w = inputs[1];
+  array g = inputs[2];
+  array& gx = outputs[0];
+  array& gw = outputs[1];
+
+  const bool has_w = w.ndim() != 0;
+  array wg = has_w ? multiply(w, g, s) : g;
+
+  if (!x.flags().row_contiguous || x.offset() != 0) {
+    x = contiguous_copy_gpu(x, s);
+  }
+  if (has_w) {
+    array wg_work(wg.shape(), wg.dtype(), nullptr, {});
+    copy_gpu(wg, wg_work, CopyType::General, s);
+    wg = wg_work;
+  } else if (!wg.flags().row_contiguous || wg.offset() != 0) {
+    wg = contiguous_copy_gpu(wg, s);
+  }
+
+  const uint32_t axis_size =
+      checked_u32_size(x.shape(x.ndim() - 1), "rms_norm_vjp axis_size");
+  if (axis_size == 0 || axis_size > 32u * 512u || x.dtype() != float32 ||
+      wg.dtype() != float32 || gx.dtype() != float32) {
+    throw std::runtime_error("RMSNormVJP unsupported dtype or shape on Vulkan.");
+  }
+  const uint32_t nrows = checked_u32_size(
+      x.data_size() / x.shape(x.ndim() - 1), "rms_norm_vjp nrows");
+
+  gx.set_data(allocator::malloc(gx.nbytes()));
+  const std::vector<array> tracked_inputs = {wg, x};
+  const std::vector<array> tracked_outputs = {gx};
+  begin_tracked_manual_op(s, "rms_norm_vjp", tracked_inputs, tracked_outputs);
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vulkan::dispatch_rms_norm_back_op(
+      wg,
+      x,
+      gx,
+      vulkan::StaticShaderId::rms_norm_back_f32,
+      command_buffer,
+      s,
+      axis_size,
+      nrows,
+      eps_);
+  vulkan::end_command_recording(s.index);
+  end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
+
+  array norm = number_of_elements(x, {-1}, true, x.dtype(), s);
+  array mean_x2 = multiply(sum(square(x, s), -1, true, s), norm, s);
+  array scale = rsqrt(add(mean_x2, array(eps_, x.dtype()), s), s);
+
+  array gw_tmp = has_w ? multiply(g, multiply(x, scale, s), s)
+                       : zeros_like(w, s);
+  if (has_w) {
+    std::vector<int> axes(g.ndim() - 1);
+    std::iota(axes.begin(), axes.end(), 0);
+    gw_tmp = sum(gw_tmp, axes, false, s);
+  }
+  copy_gpu(gw_tmp, gw, CopyType::General, s);
+  gx.set_status(array::Status::evaluated);
+  gw.set_status(array::Status::evaluated);
 }
 
 void ConvertFP8::eval_gpu(

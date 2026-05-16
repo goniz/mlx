@@ -1141,6 +1141,10 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
+  if (try_eval_f32_unary_with_staging_vulkan(
+          inputs, out, vulkan::StaticShaderId::cos_f32, stream())) {
+    return;
+  }
   throw std::runtime_error(
       "Cos operation failed on Vulkan (unsupported dtype or layout).");
 }
@@ -1217,6 +1221,10 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
             inputs, out, vulkan::StaticShaderId::sin_f32, stream())) {
       return;
     }
+  }
+  if (try_eval_f32_unary_with_staging_vulkan(
+          inputs, out, vulkan::StaticShaderId::sin_f32, stream())) {
+    return;
   }
   throw std::runtime_error(
       "Sin operation failed on Vulkan (unsupported dtype or layout).");

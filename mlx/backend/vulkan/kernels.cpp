@@ -403,6 +403,7 @@ enum class KernelSpecId {
   GatherAffineMatmul,
   Nvfp4QMatmul,
   LayerNormAffine,
+  RMSNormBack,
   Argsort,
   ArgsortLarge,
   FFT,
@@ -431,7 +432,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 38> kKernelSpecs = {
+const std::array<KernelSpec, 39> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -572,6 +573,10 @@ const std::array<KernelSpec, 38> kKernelSpecs = {
         {0, 1, 2, 3},
         sizeof(LayerNormAffinePushConstants),
         DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2},
+        sizeof(GenericPushConstants),
+        DispatchGridKind::RowWise),
     make_kernel_spec(
         {0, 2},
         sizeof(ArgsortPushConstants),
@@ -2384,6 +2389,39 @@ void dispatch_generic_unary_op(
       bound_arrays,
       push_constants,
       push_constants.KX,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_rms_norm_back_op(
+    const array& g,
+    const array& x,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t axis_size,
+    uint32_t row_count,
+    float eps) {
+  if (out.size() == 0 || row_count == 0) {
+    return;
+  }
+
+  auto push_constants =
+      make_generic_push_constants(axis_size, eps, 0.0f, 0.0f, 0.0f);
+  push_constants.KY = row_count;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&g, "src0"},
+      {&x, "src1"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::RMSNormBack,
+      bound_arrays,
+      push_constants,
+      row_count,
       cmd_buffer,
       s);
 }

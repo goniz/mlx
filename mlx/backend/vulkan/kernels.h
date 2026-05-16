@@ -724,6 +724,17 @@ void dispatch_generic_unary_op(
     float param3 = 0.0f,
     float param4 = 0.0f);
 
+void dispatch_rms_norm_back_op(
+    const array& g,
+    const array& x,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t axis_size,
+    uint32_t row_count,
+    float eps);
+
 void dispatch_arange_op(
     array& out,
     StaticShaderId shader_id,

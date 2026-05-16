@@ -119,6 +119,30 @@ void radix6(vec2 x[6], out vec2 y[6]) {
   y[5] = a9 - a12;
 }
 
+void radix8(vec2 x[8], out vec2 y[8]) {
+  const float rsqrt2 = 0.7071067811865476;
+  vec2 even_in[4] = vec2[4](x[0], x[2], x[4], x[6]);
+  vec2 odd_in[4] = vec2[4](x[1], x[3], x[5], x[7]);
+  vec2 even_out[4];
+  vec2 odd_out[4];
+  radix4(even_in, even_out);
+  radix4(odd_in, odd_out);
+
+  vec2 t0 = odd_out[0];
+  vec2 t1 = complex_mul(odd_out[1], vec2(rsqrt2, -rsqrt2));
+  vec2 t2 = vec2(odd_out[2].y, -odd_out[2].x);
+  vec2 t3 = complex_mul(odd_out[3], vec2(-rsqrt2, -rsqrt2));
+
+  y[0] = even_out[0] + t0;
+  y[4] = even_out[0] - t0;
+  y[1] = even_out[1] + t1;
+  y[5] = even_out[1] - t1;
+  y[2] = even_out[2] + t2;
+  y[6] = even_out[2] - t2;
+  y[3] = even_out[3] + t3;
+  y[7] = even_out[3] - t3;
+}
+
 void apply_radix(uint radix, vec2 x[13], out vec2 y[13]) {
   if (radix == 2u) {
     vec2 a = x[0];
@@ -154,6 +178,13 @@ void apply_radix(uint radix, vec2 x[13], out vec2 y[13]) {
     vec2 yy[6];
     radix6(xx, yy);
     for (uint i = 0; i < 6u; ++i) y[i] = yy[i];
+    return;
+  }
+  if (radix == 8u) {
+    vec2 xx[8] = vec2[8](x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
+    vec2 yy[8];
+    radix8(xx, yy);
+    for (uint i = 0; i < 8u; ++i) y[i] = yy[i];
     return;
   }
 

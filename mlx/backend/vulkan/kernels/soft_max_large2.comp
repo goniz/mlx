@@ -36,7 +36,7 @@ void main() {
     barrier();
     [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            vals[tid] = max(max_val, vals[tid + s]);
+            vals[tid] = max(vals[tid], vals[tid + s]);
         }
         barrier();
     }

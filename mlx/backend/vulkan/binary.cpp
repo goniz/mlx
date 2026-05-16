@@ -79,6 +79,19 @@ bool shares_storage(const array& a, const array& b) {
   return a_data != nullptr && a_data == b_data;
 }
 
+bool offset_fits_binary_operand(const array& arr, uint32_t max_offset) {
+  const int64_t item_size = static_cast<int64_t>(size_of(arr.dtype()));
+  return item_size > 0 && arr.offset() >= 0 &&
+      (arr.offset() % item_size) == 0 &&
+      (arr.offset() / item_size) <= static_cast<int64_t>(max_offset);
+}
+
+bool is_supported_binary_input_layout(const array& arr, uint32_t max_offset) {
+  return is_supported_elementwise_layout(arr) ||
+      (is_supported_unary_layout(arr) &&
+       offset_fits_binary_operand(arr, max_offset));
+}
+
 void ensure_materialized_scalar_input(array& arr) {
   if (arr.data_size() != 1 || !arr.has_primitive()) {
     return;
@@ -1086,10 +1099,10 @@ bool try_eval_binary_op_vulkan(
     return false;
   }
 
-  if (!is_supported_elementwise_layout(a) && !is_supported_unary_layout(a)) {
+  if (!is_supported_binary_input_layout(a, 0xFFFFu)) {
     a = contiguous_copy_gpu(a, s);
   }
-  if (!is_supported_elementwise_layout(b) && !is_supported_unary_layout(b)) {
+  if (!is_supported_binary_input_layout(b, 0xFFu)) {
     b = contiguous_copy_gpu(b, s);
   }
   const bool collapsed_rank = a.ndim() > 4 || b.ndim() > 4 || out.ndim() > 4;
@@ -1125,8 +1138,8 @@ bool try_eval_binary_op_vulkan(
     set_binary_op_output_data(a, b, out_work, bopt);
   }
   array out_kernel = collapse_binary_leading_dims(out_work, s);
-  if ((!is_supported_elementwise_layout(a) && !is_supported_unary_layout(a)) ||
-      (!is_supported_elementwise_layout(b) && !is_supported_unary_layout(b)) ||
+  if (!is_supported_binary_input_layout(a, 0xFFFFu) ||
+      !is_supported_binary_input_layout(b, 0xFFu) ||
       !is_supported_elementwise_layout(out_kernel)) {
     trace_binary_unsupported("unsupported_elementwise_layout", a, b);
     return false;

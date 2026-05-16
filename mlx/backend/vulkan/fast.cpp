@@ -100,15 +100,23 @@ std::mutex flash_attention_causal_mask_cache_mutex;
 std::unordered_map<int, FlashAttentionCausalMaskCacheEntry>
     flash_attention_causal_mask_cache;
 
-bool experimental_flash_attention_enabled() {
-  static const bool enabled = []() {
+std::optional<bool> experimental_flash_attention_override() {
+  static const std::optional<bool> enabled = []() -> std::optional<bool> {
     if (const char* env = std::getenv("MLX_VULKAN_EXPERIMENTAL_FLASH_ATTN");
         env != nullptr) {
       return std::string(env) != "0";
     }
-    return true;
+    return std::nullopt;
   }();
   return enabled;
+}
+
+bool flash_attention_enabled_for(const array& k, const array& v) {
+  if (auto override = experimental_flash_attention_override();
+      override.has_value()) {
+    return *override;
+  }
+  return k.dtype() == bfloat16 || v.dtype() == bfloat16;
 }
 
 bool trace_flash_attention_debug_enabled() {
@@ -879,13 +887,13 @@ bool try_eval_flash_attention_vulkan(
   if (inputs.size() != 3) {
     return false;
   }
-  if (!experimental_flash_attention_enabled()) {
-    return false;
-  }
-
   array q = inputs[0];
   array k = inputs[1];
   array v = inputs[2];
+
+  if (!flash_attention_enabled_for(k, v)) {
+    return false;
+  }
 
   const bool supported_kv_dtype =
       (k.dtype() == float16 || k.dtype() == bfloat16) &&
@@ -1016,12 +1024,6 @@ bool sdpa_vulkan_supported(
     }
     return false;
   }
-  if (has_sinks) {
-    if (reason != nullptr) {
-      *reason = "sinks unsupported";
-    }
-    return false;
-  }
   if (has_mask && !do_causal && !has_arr_mask) {
     if (reason != nullptr) {
       *reason = "non-causal mask unsupported";
@@ -1044,7 +1046,7 @@ bool sdpa_vulkan_supported(
   if (q.shape(0) != k.shape(0) || q.shape(0) != v.shape(0) ||
       q.shape(-1) != k.shape(-1) || k.shape(1) != v.shape(1) ||
       q.shape(1) % k.shape(1) != 0 || k.shape(2) != v.shape(2) ||
-      q.shape(2) > k.shape(2) || v.shape(-1) <= 0) {
+      v.shape(-1) <= 0) {
     if (reason != nullptr) {
       *reason = "incompatible attention shapes";
     }
@@ -1889,11 +1891,12 @@ bool try_eval_layer_norm_vulkan(
     copy_gpu(x, x_f32, CopyType::General, s);
     x = x_f32;
   }
-  if (!is_supported_unary_layout(x)) {
+  if (!x.flags().contiguous || x.offset() != 0 || x.strides().back() != 1) {
     x = contiguous_copy_gpu(x, s);
   }
 
-  if (!is_supported_unary_layout(x)) {
+  if (!x.flags().contiguous || x.offset() != 0 || x.strides().back() != 1 ||
+      !is_supported_unary_layout(x)) {
     return false;
   }
 
@@ -2038,11 +2041,14 @@ bool ScaledDotProductAttention::use_fallback(
   if (s.device == Device::cpu) {
     return true;
   }
+  if (is_training && has_arr_mask) {
+    return true;
+  }
   return false;
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
-  return false;
+  return true;
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
@@ -2095,8 +2101,22 @@ void ScaledDotProductAttention::eval_gpu(
   const int n_q_heads = q.shape(1);
   const int n_kv_heads = k.shape(1);
   const int n_repeats = n_q_heads / n_kv_heads;
+  const bool has_strided_input =
+      !q_in.flags().row_contiguous || q_in.offset() != 0 ||
+      q_in.strides().back() != 1 || !k_in.flags().row_contiguous ||
+      k_in.offset() != 0 || k_in.strides().back() != 1 ||
+      !v_in.flags().row_contiguous || v_in.offset() != 0 ||
+      v_in.strides().back() != 1;
 
-  if (output_logsumexp_ || n_repeats > 1) {
+  if (!output_logsumexp_ &&
+      (has_sinks_ || has_arr_mask || do_causal_ || n_repeats > 1 ||
+       has_strided_input)) {
+    auto fallback_outputs = fallback_(inputs);
+    copy_gpu(fallback_outputs[0], outputs[0], CopyType::General, s);
+    return;
+  }
+
+  if (output_logsumexp_) {
     array* logsumexp_out = outputs.size() > 1 ? &outputs[1] : nullptr;
     if (try_eval_sdpa_heads_vulkan(
             inputs, outputs[0], logsumexp_out, scale_, do_causal_, s)) {
@@ -2174,22 +2194,8 @@ void ScaledDotProductAttention::eval_gpu(
     }
   }
 
-  array result_f32(
-      Shape{
-          scores_work.shape(0),
-          scores_work.shape(1),
-          scores_work.shape(2),
-          v_work.shape(-1),
-      },
-      float32,
-      nullptr,
-      {});
-  eval_sdpa_matmul_vulkan(scores_work, v_work, result_f32, s);
-  copy_gpu(
-      reshape_sdpa_contiguous_view(result_f32, outputs[0].shape()),
-      outputs[0],
-      CopyType::General,
-      s);
+  array result = matmul(scores_work, v_work, s);
+  copy_gpu(result, outputs[0], CopyType::General, s);
 
   if (output_logsumexp_) {
     throw std::runtime_error(

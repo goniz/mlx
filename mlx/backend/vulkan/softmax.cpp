@@ -120,10 +120,7 @@ bool try_eval_softmax_vulkan(
           softmax_out_storage, softmax_out_target, CopyType::GeneralGeneral, s);
     }
     if (use_f32_staging_io) {
-      array target_kernel =
-          collapse_softmax_leading_dims(softmax_out_target, s);
-      array out_kernel = collapse_softmax_leading_dims(out, s);
-      copy_gpu(target_kernel, out_kernel, CopyType::General, s);
+      copy_gpu(softmax_out_target, out, CopyType::General, s);
     }
     return true;
   }
@@ -157,10 +154,7 @@ bool try_eval_softmax_vulkan(
           softmax_out_storage, softmax_out_target, CopyType::GeneralGeneral, s);
     }
     if (use_f32_staging_io) {
-      array target_kernel =
-          collapse_softmax_leading_dims(softmax_out_target, s);
-      array out_kernel = collapse_softmax_leading_dims(out, s);
-      copy_gpu(target_kernel, out_kernel, CopyType::General, s);
+      copy_gpu(softmax_out_target, out, CopyType::General, s);
     }
     return true;
   } catch (const std::runtime_error& e) {

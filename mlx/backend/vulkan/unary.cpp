@@ -578,7 +578,7 @@ bool try_eval_f32_unary_with_staging_vulkan(
       ? array(out_target.shape(), out_target.dtype(), nullptr, {})
       : out_target;
 
-  set_unary_output_data(in, out_work);
+   out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (!is_supported_generic_unary_layout(in) ||
       !is_supported_generic_unary_layout(out_work)) {
     return false;
@@ -593,9 +593,19 @@ bool try_eval_f32_unary_with_staging_vulkan(
     return true;
   }
 
+  array in_kernel = in;
+  array out_kernel = out_work;
+  if (in_kernel.ndim() > 4) {
+    in_kernel = flatten_in_eval(in_kernel, 0, -1, s);
+  }
+  if (out_kernel.ndim() > 4) {
+    out_kernel = flatten_in_eval(out_kernel, 0, -1, s);
+  }
+
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_unary_op(in, out_work, shader_id, command_buffer, s);
+    vulkan::dispatch_unary_op(
+        in_kernel, out_kernel, shader_id, command_buffer, s);
     vulkan::end_command_recording(s.index);
     if (staged_output) {
       copy_gpu(out_work, out_target, CopyType::General, s);

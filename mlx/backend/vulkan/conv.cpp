@@ -148,8 +148,7 @@ array permute_view(
       base,
       permuted_strides,
       {contiguous, row_contiguous, col_contiguous},
-      base.data_size(),
-      base.offset());
+      base.data_size());
   return view;
 }
 
@@ -178,8 +177,7 @@ array squeeze_unit_axis_view(const array& base, int axis) {
       base,
       squeezed_strides,
       {data_size == base.data_size(), row_contiguous, col_contiguous},
-      base.data_size(),
-      base.offset());
+      base.data_size());
   return view;
 }
 
@@ -198,8 +196,7 @@ array expand_unit_axis_view(const array& base, int axis) {
       base,
       expanded_strides,
       {data_size == base.data_size(), row_contiguous, col_contiguous},
-      base.data_size(),
-      base.offset());
+      base.data_size());
   return view;
 }
 

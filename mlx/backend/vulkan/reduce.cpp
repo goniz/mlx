@@ -277,6 +277,29 @@ bool try_eval_reduce_sum_rows_vulkan(
     }
   }
 
+  // For remaining >4D multi-axis reductions, reuse the supported keepdims
+  // single-axis path one axis at a time.
+  if (in.ndim() > 4 && !full_reduce && normalized_axes.size() > 1 &&
+      has_keepdims_axes_shape(in, out, normalized_axes)) {
+    array reduced = in;
+    for (int axis : normalized_axes) {
+      array axis_out(
+          keepdims_shape_for_axis(reduced, axis), out.dtype(), nullptr, {});
+      if (!try_eval_reduce_sum_rows_vulkan(
+              {reduced}, axis_out, reduce_type, {axis}, s)) {
+        return false;
+      }
+      reduced = std::move(axis_out);
+    }
+
+    if (reduced.ndim() == 0 && out.ndim() == 0) {
+      copy_gpu(reduced, out, CopyType::Scalar, s);
+    } else {
+      copy_gpu(reduced, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
   if (in.ndim() > 4 ||
       (reduce_out_target.ndim() > 4 && !reshape_final_to_output)) {
     return false;

@@ -933,9 +933,10 @@ bool try_eval_flash_attention_vulkan(
 
   // After casting, arrays are already row_contiguous with offset 0.
   // Only check layout for k and v which haven't been cast yet.
-  auto ensure_contiguous_zero_offset = [&](array x) {
-    if (!x.flags().row_contiguous || x.strides().back() != 1 ||
-        x.offset() != 0) {
+  auto ensure_flash_attention_kv_layout = [&](array x) {
+    auto data = x.data_shared_ptr();
+    if (data == nullptr || data->buffer.ptr() == nullptr ||
+        x.strides().back() != 1 || x.offset() != 0) {
       x = contiguous_copy_gpu(x, s);
     }
     return x;
@@ -943,8 +944,8 @@ bool try_eval_flash_attention_vulkan(
 
   // Note: q is already processed by cast_flash_attention_q_to_f32 which
   // ensures proper layout. Only k and v need layout enforcement here.
-  k = ensure_contiguous_zero_offset(k);
-  v = ensure_contiguous_zero_offset(v);
+  k = ensure_flash_attention_kv_layout(k);
+  v = ensure_flash_attention_kv_layout(v);
 
   // Cast K/V to appropriate dtype if needed. When use_native_bf16_kv is true,
   // we skip casting since K/V are already bfloat16.

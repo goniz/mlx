@@ -116,7 +116,7 @@ VkDescriptorBufferInfo descriptor_buffer_info(
     const char* name) {
   auto* vulkan_buffer = static_cast<const vulkan::VulkanBuffer*>(
       static_cast<const void*>(arr.buffer().ptr()));
-  if (vulkan_buffer == nullptr || vulkan_buffer->buffer == VK_NULL_HANDLE) {
+  if (vulkan_buffer == nullptr || !vulkan_buffer->buffer) {
     throw std::runtime_error(
         std::string("[vulkan::conv] Missing Vulkan buffer for ") + name + ".");
   }
@@ -244,11 +244,8 @@ ConvPipelineConfig select_conv2d_pipeline(
     }
   }
 
-  if (ctx.coopmat2_conv2d_supported()) {
-    config.shader_id = weight_dtype == float16
-        ? vulkan::StaticShaderId::conv2d_f16_f32_cm2
-        : vulkan::StaticShaderId::conv2d_f32_cm2;
-  }
+  // TODO: Implement conv2d cm2 cooperative matrix shaders
+  // and add pipeline selection here when shaders are available.
 
   const uint32_t shmem_bytes =
       (config.block_size.k * (config.block_size.crs + config.shmem_pad) +

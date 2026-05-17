@@ -348,7 +348,7 @@ void init_unary_fastdiv(UnaryPushConstants& p) {
 VkDescriptorBufferInfo make_buffer_info(const array& arr, const char* name) {
   auto* vulkan_buffer = static_cast<const VulkanBuffer*>(
       static_cast<const void*>(arr.buffer().ptr()));
-  if (vulkan_buffer == nullptr || vulkan_buffer->buffer == VK_NULL_HANDLE) {
+  if (vulkan_buffer == nullptr || !vulkan_buffer->buffer) {
     throw std::runtime_error(
         std::string("[vulkan::kernels] Missing Vulkan buffer for ") + name +
         ".");
@@ -1038,7 +1038,7 @@ void dispatch_with_spec(
 } // namespace
 
 ShaderModule::~ShaderModule() {
-  if (module != VK_NULL_HANDLE) {
+  if (module) {
     vk::Device device = VulkanContext::get().device();
     device.destroyShaderModule(module, nullptr);
   }
@@ -1046,13 +1046,13 @@ ShaderModule::~ShaderModule() {
 
 ComputePipeline::~ComputePipeline() {
   vk::Device device = VulkanContext::get().device();
-  if (pipeline != VK_NULL_HANDLE) {
+  if (pipeline) {
     device.destroyPipeline(pipeline, nullptr);
   }
-  if (layout != VK_NULL_HANDLE) {
+  if (layout) {
     device.destroyPipelineLayout(layout, nullptr);
   }
-  if (descriptor_layout != VK_NULL_HANDLE) {
+  if (descriptor_layout) {
     device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
   }
 }
@@ -1111,14 +1111,14 @@ void KernelManager::register_static_shader(
   auto& shader = static_shaders_[index];
   if (!shader) {
     shader = std::make_unique<ShaderModule>();
-  } else if (shader->module != VK_NULL_HANDLE) {
+  } else if (shader->module) {
     vkDestroyShaderModule(
         VulkanContext::get().device(), shader->module, nullptr);
   }
   shader->debug_name = static_shader_name(id);
   shader->spirv_code = copy_spirv_code(data, size_bytes);
   shader->compiled = false;
-  shader->module = VK_NULL_HANDLE;
+  shader->module = vk::ShaderModule{};
 }
 
 void KernelManager::register_shader(
@@ -1130,7 +1130,7 @@ void KernelManager::register_shader(
   auto& shader = dynamic_shaders_[name];
   if (!shader) {
     shader = std::make_unique<ShaderModule>();
-  } else if (shader->module != VK_NULL_HANDLE) {
+  } else if (shader->module) {
     vkDestroyShaderModule(
         VulkanContext::get().device(), shader->module, nullptr);
   }
@@ -1769,7 +1769,7 @@ vk::DescriptorSet KernelManager::allocate_descriptor_set(
 }
 
 void KernelManager::free_descriptor_set(VkDescriptorSet set) {
-  if (descriptor_pool_ != VK_NULL_HANDLE) {
+  if (descriptor_pool_) {
     {
       std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
       descriptor_set_layouts_.erase(set);
@@ -1859,7 +1859,7 @@ void KernelManager::reclaim_descriptor_set_epoch(
     }
   }
 
-  if (sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {
+  if (sets.empty() || !descriptor_pool_) {
     return;
   }
 
@@ -1869,10 +1869,10 @@ void KernelManager::reclaim_descriptor_set_epoch(
   {
     std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
     for (const auto& record : sets) {
-      if (record.set == VK_NULL_HANDLE) {
+      if (!record.set) {
         continue;
       }
-      if (record.layout != VK_NULL_HANDLE) {
+      if (record.layout) {
         reusable_descriptor_sets_[record.layout].push_back(record.set);
         ++reusable_count;
       } else {
@@ -1933,7 +1933,7 @@ void KernelManager::reclaim_descriptor_sets(
     }
   }
 
-  if (sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {
+  if (sets.empty() || !descriptor_pool_) {
     return;
   }
 
@@ -1943,10 +1943,10 @@ void KernelManager::reclaim_descriptor_sets(
   {
     std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
     for (const auto& record : sets) {
-      if (record.set == VK_NULL_HANDLE) {
+      if (!record.set) {
         continue;
       }
-      if (record.layout != VK_NULL_HANDLE) {
+      if (record.layout) {
         reusable_descriptor_sets_[record.layout].push_back(record.set);
         ++reusable_count;
       } else {
@@ -1982,7 +1982,7 @@ void KernelManager::reclaim_all_descriptor_sets() {
     for (auto& [_, epoch_map] : deferred_descriptor_sets_) {
       for (auto& [_, sets] : epoch_map) {
         for (auto& record : sets) {
-          if (record.set != VK_NULL_HANDLE) {
+          if (record.set) {
             all_sets.push_back(record.set);
           }
         }
@@ -2000,7 +2000,7 @@ void KernelManager::reclaim_all_descriptor_sets() {
     descriptor_set_layouts_.clear();
   }
 
-  if (all_sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {
+  if (all_sets.empty() || !descriptor_pool_) {
     return;
   }
 
@@ -2034,7 +2034,7 @@ void KernelManager::purge_descriptor_sets_for_layouts(
       for (auto epoch_it = epoch_map.begin(); epoch_it != epoch_map.end();) {
         auto& records = epoch_it->second;
         for (auto record_it = records.begin(); record_it != records.end();) {
-          if (record_it->layout != VK_NULL_HANDLE &&
+          if (record_it->layout &&
               layouts.contains(record_it->layout)) {
             freeable_sets.push_back(record_it->set);
             record_it = records.erase(record_it);
@@ -2079,7 +2079,7 @@ void KernelManager::purge_descriptor_sets_for_layouts(
     }
   }
 
-  if (freeable_sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {
+  if (freeable_sets.empty() || !descriptor_pool_) {
     return;
   }
 
@@ -2111,10 +2111,10 @@ void KernelManager::cleanup() {
 
   {
     std::lock_guard<std::mutex> lock(descriptor_pool_mutex_);
-    if (descriptor_pool_ != VK_NULL_HANDLE) {
+    if (descriptor_pool_) {
       VkDevice device = VulkanContext::get().device();
       vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
-      descriptor_pool_ = VK_NULL_HANDLE;
+      descriptor_pool_ = vk::DescriptorPool{};
       descriptor_pool_initialized_ = false;
     }
   }
@@ -4059,7 +4059,7 @@ void write_descriptor_buffer(
     std::vector<VkWriteDescriptorSet>& writes) {
   auto* vulkan_buffer = static_cast<const VulkanBuffer*>(
       static_cast<const void*>(arr.buffer().ptr()));
-  if (vulkan_buffer == nullptr || vulkan_buffer->buffer == VK_NULL_HANDLE) {
+  if (vulkan_buffer == nullptr || !vulkan_buffer->buffer) {
     throw std::runtime_error("Missing Vulkan buffer for dynamic copy shader.");
   }
 

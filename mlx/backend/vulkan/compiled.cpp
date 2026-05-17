@@ -1231,7 +1231,7 @@ void Compiled::eval_gpu(
     vulkan::retain_array_for_stream(s, arr);
     auto* vulkan_buffer = static_cast<const vulkan::VulkanBuffer*>(
         static_cast<const void*>(arr.buffer().ptr()));
-    if (!vulkan_buffer || vulkan_buffer->buffer == VK_NULL_HANDLE) {
+    if (!vulkan_buffer || !vulkan_buffer->buffer) {
       throw std::runtime_error("Missing Vulkan buffer for compiled kernel");
     }
 

@@ -534,7 +534,7 @@ constexpr size_t kDefaultStagingArenaBytes = 1 << 20;
 std::shared_ptr<array::Data> make_owned_staging_allocation(size_t size) {
   auto data = std::make_shared<array::Data>(allocator::malloc(size));
   auto* buffer = static_cast<VulkanBuffer*>(data->buffer.ptr());
-  if (buffer == nullptr || buffer->buffer == VK_NULL_HANDLE ||
+  if (buffer == nullptr || !buffer->buffer ||
       buffer->mapped_ptr == nullptr) {
     throw std::runtime_error(
         "[vulkan::staging] Failed to allocate host-visible staging buffer.");
@@ -1643,7 +1643,7 @@ class VulkanDevice {
       }
 
       auto* storage = referenced_vulkan_buffer(data);
-      if (storage == nullptr || storage->buffer == VK_NULL_HANDLE) {
+      if (storage == nullptr || !storage->buffer) {
         continue;
       }
 
@@ -2482,7 +2482,7 @@ void enqueue_owned_staging_upload(
     throw std::invalid_argument(
         "[vulkan::enqueue_owned_staging_upload] Null host source.");
   }
-  if (dst_buffer == VK_NULL_HANDLE) {
+  if (!dst_buffer) {
     throw std::invalid_argument(
         "[vulkan::enqueue_owned_staging_upload] Null destination buffer.");
   }
@@ -2490,7 +2490,7 @@ void enqueue_owned_staging_upload(
   auto staging = VulkanDevice::get().acquire_staging_scratch(
       s, kStagingUploadScratchLane, size);
   auto* staging_buffer = get_vulkan_buffer(staging.owner);
-  if (staging_buffer == nullptr || staging_buffer->buffer == VK_NULL_HANDLE ||
+  if (staging_buffer == nullptr || !staging_buffer->buffer ||
       staging_buffer->mapped_ptr == nullptr) {
     throw std::runtime_error(
         "[vulkan::staging] Failed to acquire host-visible upload buffer.");
@@ -2533,7 +2533,7 @@ void enqueue_owned_staging_readback(
     throw std::invalid_argument(
         "[vulkan::enqueue_owned_staging_readback] Missing completion callback.");
   }
-  if (src_buffer == VK_NULL_HANDLE) {
+  if (!src_buffer) {
     throw std::invalid_argument(
         "[vulkan::enqueue_owned_staging_readback] Null source buffer.");
   }
@@ -2541,7 +2541,7 @@ void enqueue_owned_staging_readback(
   auto staging = VulkanDevice::get().acquire_staging_scratch(
       s, kStagingReadbackScratchLane, size);
   auto* staging_buffer = get_vulkan_buffer(staging.owner);
-  if (staging_buffer == nullptr || staging_buffer->buffer == VK_NULL_HANDLE ||
+  if (staging_buffer == nullptr || !staging_buffer->buffer ||
       staging_buffer->mapped_ptr == nullptr) {
     throw std::runtime_error(
         "[vulkan::staging] Failed to acquire host-visible readback buffer.");

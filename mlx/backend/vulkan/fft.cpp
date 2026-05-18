@@ -45,6 +45,16 @@ bool try_plan_stockham_fft(int n, std::vector<int>& plan) {
   if (n == 1) {
     return true;
   }
+  if (orig_n == 6) {
+    // The smaller codelets are a little more accurate for length-6 real
+    // inverse transforms than the composite radix-6 path.
+    for (int i = 0; i < supported_radices().size(); ++i) {
+      if (supported_radices()[i] == 3 || supported_radices()[i] == 2) {
+        plan[i] = 1;
+      }
+    }
+    return true;
+  }
 
   for (int i = 0; i < supported_radices().size(); ++i) {
     const int radix = supported_radices()[i];

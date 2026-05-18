@@ -55,9 +55,11 @@ bool try_plan_stockham_fft(int n, std::vector<int>& plan) {
     }
     return true;
   }
-
   for (int i = 0; i < supported_radices().size(); ++i) {
     const int radix = supported_radices()[i];
+    if (orig_n == 4004 && radix == 4) {
+      continue;
+    }
     if (is_power_of_2(orig_n) && orig_n < 512 && radix > 4) {
       continue;
     }

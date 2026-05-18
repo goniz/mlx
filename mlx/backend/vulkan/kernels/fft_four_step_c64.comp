@@ -38,7 +38,9 @@ vec2 complex_conj(vec2 x) {
 }
 
 vec2 get_twiddle(uint k, uint p) {
-  float theta = -6.2831853071795864769 * float(k) / float(p);
+  k %= p;
+  float signed_k = k > p / 2u ? -float(p - k) : float(k);
+  float theta = -6.2831853071795864769 * signed_k / float(p);
   return vec2(cos(theta), sin(theta));
 }
 

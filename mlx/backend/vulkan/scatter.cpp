@@ -44,6 +44,11 @@ array ensure_host_readable_row_contiguous(array arr, Stream s) {
   if (arr.has_primitive()) {
     arr.eval();
   }
+  if (arr.data_size() == 1 && arr.size() != 1) {
+    array materialized(arr.shape(), arr.dtype(), nullptr, {});
+    copy_gpu(arr, materialized, CopyType::Scalar, s);
+    arr = std::move(materialized);
+  }
   if (needs_row_contiguous(arr)) {
     arr = contiguous_copy_gpu(arr, s);
   }
@@ -707,12 +712,12 @@ bool try_eval_scatter_vulkan(
             }
 
             reduced_axes.push_back(axis);
-            reduced_indices.push_back(inputs[j + 1]);
+            reduced_indices.push_back(
+                ensure_host_readable_row_contiguous(flat_indices[j], s));
           }
 
           if (dropped_full_slice_axis && reduced_axes.size() == 2 &&
-              (reduce_type == Scatter::Prod || reduce_type == Scatter::Max ||
-               reduce_type == Scatter::Min)) {
+              reduce_type == Scatter::Prod) {
             std::vector<array> reduced_inputs;
             reduced_inputs.reserve(reduced_indices.size() + 2);
             reduced_inputs.push_back(src);

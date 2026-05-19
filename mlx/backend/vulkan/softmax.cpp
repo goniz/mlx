@@ -205,7 +205,7 @@ bool try_eval_logsumexp_vulkan(
     out_work = array(out_target.shape(), out_target.dtype(), nullptr, {});
   }
 
-  set_unary_output_data(in, out_work);
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out_work)) {
     return false;
   }

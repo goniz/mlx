@@ -1308,7 +1308,12 @@ void copy_gpu(const array& src, array& out, CopyType ctype, const Stream& s) {
       src.data_size() == 1 && out.size() != 1) {
     ctype = CopyType::Scalar;
   }
-  bool donated = set_copy_output_data(src, out, ctype);
+  bool donated = false;
+  if (src.status() != array::Status::unscheduled) {
+    donated = set_copy_output_data(src, out, ctype);
+  } else {
+    out.set_data(allocator::malloc(out.nbytes()));
+  }
   if (donated && src.dtype() == out.dtype()) {
     // If the output has the same type as the input then there is nothing to
     // copy, just use the buffer.

@@ -14,6 +14,21 @@ namespace mlx::core {
 
 namespace {
 
+const array* broadcast_scalar_source(const array& arr, const array& out) {
+  if (!arr.has_primitive()) {
+    return nullptr;
+  }
+  if (typeid(arr.primitive()) != typeid(Broadcast) || arr.inputs().size() != 1) {
+    return nullptr;
+  }
+  const array& src = arr.inputs()[0];
+  if (arr.shape() != out.shape() || arr.dtype() != out.dtype() ||
+      src.data_size() != 1) {
+    return nullptr;
+  }
+  return &src;
+}
+
 array collapse_binary_leading_dims(const array& arr, Stream s) {
   if (arr.ndim() <= 4) {
     return arr;
@@ -684,8 +699,10 @@ bool try_eval_divmod_vulkan(
     return false;
   }
 
-  array a = inputs[0];
-  array b = inputs[1];
+  const array& a_input = inputs[0];
+  const array& b_input = inputs[1];
+  array a = a_input;
+  array b = b_input;
   auto& quotient = outputs[0];
   auto& remainder = outputs[1];
   const bool float_case =
@@ -878,44 +895,82 @@ bool try_eval_binary_op_vulkan(
     return false;
   }
 
-  array a = inputs[0];
-  array b = inputs[1];
+  const array& a_input = inputs[0];
+  const array& b_input = inputs[1];
   const bool mixed_numeric_div = std::string_view(op_name) == "div" &&
-      out.dtype() == float32 && is_vulkan_div_cast_dtype(a.dtype()) &&
-      is_vulkan_div_cast_dtype(b.dtype());
-  const bool bool_add = std::is_same_v<Primitive, Add> && a.dtype() == bool_ &&
-      b.dtype() == bool_ && out.dtype() == bool_;
-  const bool small_signed_integer_case = a.dtype() == b.dtype() &&
-      a.dtype() == out.dtype() && (a.dtype() == int8 || a.dtype() == int16);
-  const bool small_unsigned_integer_case = a.dtype() == b.dtype() &&
-      a.dtype() == out.dtype() && (a.dtype() == uint8 || a.dtype() == uint16);
-  const bool float_case = is_vulkan_float_dtype(a.dtype()) &&
-      is_vulkan_float_dtype(b.dtype()) && is_vulkan_float_dtype(out.dtype());
-  const bool integer_case = a.dtype() == b.dtype() &&
-      a.dtype() == out.dtype() && is_vulkan_integer_dtype(a.dtype());
+      out.dtype() == float32 && is_vulkan_div_cast_dtype(a_input.dtype()) &&
+      is_vulkan_div_cast_dtype(b_input.dtype());
+  const bool bool_add = std::is_same_v<Primitive, Add> &&
+      a_input.dtype() == bool_ && b_input.dtype() == bool_ &&
+      out.dtype() == bool_;
+  const bool small_signed_integer_case =
+      a_input.dtype() == b_input.dtype() && a_input.dtype() == out.dtype() &&
+      (a_input.dtype() == int8 || a_input.dtype() == int16);
+  const bool small_unsigned_integer_case =
+      a_input.dtype() == b_input.dtype() && a_input.dtype() == out.dtype() &&
+      (a_input.dtype() == uint8 || a_input.dtype() == uint16);
+  const bool float_case = is_vulkan_float_dtype(a_input.dtype()) &&
+      is_vulkan_float_dtype(b_input.dtype()) &&
+      is_vulkan_float_dtype(out.dtype());
+  const bool integer_case = a_input.dtype() == b_input.dtype() &&
+      a_input.dtype() == out.dtype() &&
+      is_vulkan_integer_dtype(a_input.dtype());
   const bool complex_add =
-      std::is_same_v<Primitive, Add> && is_same_complex_add(a, b, out);
+      std::is_same_v<Primitive, Add> &&
+      is_same_complex_add(a_input, b_input, out);
   const bool complex_sub =
-      std::is_same_v<Primitive, Subtract> && is_same_complex_sub(a, b, out);
+      std::is_same_v<Primitive, Subtract> &&
+      is_same_complex_sub(a_input, b_input, out);
   const bool complex_scalar_mul =
-      std::is_same_v<Primitive, Multiply> && is_complex_scalar_mul(a, b, out);
+      std::is_same_v<Primitive, Multiply> &&
+      is_complex_scalar_mul(a_input, b_input, out);
   const bool complex_float_mul =
-      std::is_same_v<Primitive, Multiply> && is_complex_float_mul(a, b, out);
+      std::is_same_v<Primitive, Multiply> &&
+      is_complex_float_mul(a_input, b_input, out);
   const bool complex_mul =
-      std::is_same_v<Primitive, Multiply> && is_same_complex_mul(a, b, out);
+      std::is_same_v<Primitive, Multiply> &&
+      is_same_complex_mul(a_input, b_input, out);
   const bool complex_div =
-      std::is_same_v<Primitive, Divide> && is_same_complex_div(a, b, out);
+      std::is_same_v<Primitive, Divide> &&
+      is_same_complex_div(a_input, b_input, out);
   const bool complex_max =
-      std::is_same_v<Primitive, Maximum> && is_same_complex_max(a, b, out);
+      std::is_same_v<Primitive, Maximum> &&
+      is_same_complex_max(a_input, b_input, out);
   const bool complex_min =
-      std::is_same_v<Primitive, Minimum> && is_same_complex_min(a, b, out);
+      std::is_same_v<Primitive, Minimum> &&
+      is_same_complex_min(a_input, b_input, out);
   if (!float_case && !integer_case && !bool_add && !mixed_numeric_div &&
       !complex_add && !complex_sub && !complex_scalar_mul &&
       !complex_float_mul && !complex_mul && !complex_div && !complex_max &&
       !complex_min) {
-    trace_binary_unsupported("unsupported_dtype_combo", a, b);
+    trace_binary_unsupported("unsupported_dtype_combo", a_input, b_input);
     return false;
   }
+
+  const array* input_broadcast_scalar_a = broadcast_scalar_source(a_input, out);
+  const array* input_broadcast_scalar_b = broadcast_scalar_source(b_input, out);
+  const bool scalar_vector_case =
+      (a_input.data_size() == 1 && b_input.size() > 1) ||
+      (b_input.data_size() == 1 && a_input.size() > 1) ||
+      (input_broadcast_scalar_a != nullptr && b_input.size() > 1) ||
+      (input_broadcast_scalar_b != nullptr && a_input.size() > 1);
+  const bool scalar_is_a = scalar_vector_case &&
+      (a_input.data_size() == 1 || input_broadcast_scalar_a != nullptr);
+  const array* vector_input = scalar_vector_case
+      ? (scalar_is_a ? &b_input : &a_input)
+      : nullptr;
+  const bool can_donate_scalar_vector_input =
+      scalar_vector_case && std::is_same_v<Primitive, Multiply> &&
+      vector_input != nullptr && has_vulkan_buffer(*vector_input) &&
+      is_donatable(*vector_input, out) && vector_input->dtype() == out.dtype() &&
+      vector_input->shape() == out.shape() && vector_input->flags().row_contiguous &&
+      vector_input->flags().contiguous &&
+      vector_input->size() == vector_input->data_size() &&
+      vector_input->offset() == 0 && vector_input->ndim() == 1 &&
+      out.ndim() == 1;
+
+  array a = a_input;
+  array b = b_input;
 
   if ((a.data_size() == 1 && a.has_primitive()) ||
       (b.data_size() == 1 && b.has_primitive())) {
@@ -929,10 +984,6 @@ bool try_eval_binary_op_vulkan(
 
   if (out.size() == 0) {
     return true;
-  }
-
-  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s)) {
-    return false;
   }
 
   if (complex_add) {
@@ -1019,37 +1070,29 @@ bool try_eval_binary_op_vulkan(
     b = b_f32;
   }
 
-  const bool scalar_vector_case =
-      (a.data_size() == 1 && b.size() > 1) || (b.data_size() == 1 && a.size() > 1);
-  if (scalar_vector_case) {
-    bool scalar_is_a = a.data_size() == 1;
-    array scalar = scalar_is_a ? a : b;
-    array vec = scalar_is_a ? b : a;
+  const array* broadcast_scalar_a = broadcast_scalar_source(a, out);
+  const array* broadcast_scalar_b = broadcast_scalar_source(b, out);
+  const bool use_scalar_vector_fast_path = can_donate_scalar_vector_input;
 
-    if (scalar.has_primitive()) {
-      ensure_materialized_scalar_input(scalar);
-    }
-    if (vec.has_primitive() || !has_vulkan_buffer(vec) ||
-        !is_supported_elementwise_layout(vec)) {
-      vec = contiguous_copy_gpu(vec, s);
-    }
+  if (broadcast_scalar_a != nullptr) {
+    a = *broadcast_scalar_a;
+  }
+  if (broadcast_scalar_b != nullptr) {
+    b = *broadcast_scalar_b;
+  }
 
-    array scalar_broadcast(
-        out.shape(),
-        scalar.dtype(),
-        std::make_shared<Broadcast>(s, out.shape()),
-        {scalar});
-    ensure_materialized_scalar_input(scalar_broadcast);
-    array scalar_full(out.shape(), scalar.dtype(), nullptr, {});
-    copy_gpu(scalar_broadcast, scalar_full, CopyType::Scalar, s);
-
-    if (scalar_is_a) {
-      a = scalar_full;
-      b = vec;
-    } else {
-      a = vec;
-      b = scalar_full;
+  if (use_scalar_vector_fast_path) {
+    array& scalar = scalar_is_a ? a : b;
+    if (scalar.shape() != Shape{} && scalar.data_size() == 1) {
+      array scalar_base(Shape{}, scalar.dtype(), nullptr, {});
+      scalar_base.copy_shared_buffer(
+          scalar, Strides{}, {true, true, true}, 1);
+      scalar = scalar_base;
     }
+  }
+
+  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b, s)) {
+    return false;
   }
 
   bool a_materialized = false;
@@ -1093,8 +1136,8 @@ bool try_eval_binary_op_vulkan(
     return true;
   };
 
-  if (!materialize_broadcast_input(a, a_materialized) ||
-      !materialize_broadcast_input(b, b_materialized)) {
+  if ((!use_scalar_vector_fast_path && !materialize_broadcast_input(a, a_materialized)) ||
+      (!use_scalar_vector_fast_path && !materialize_broadcast_input(b, b_materialized))) {
     trace_binary_unsupported("broadcast_materialization_failed", a, b);
     return false;
   }
@@ -1130,6 +1173,8 @@ bool try_eval_binary_op_vulkan(
     // Collapsing rank creates 4D views over 5D+ tensors. Reusing one of those
     // views for the logical output would copy 4D strides into a 5D shape.
     out_work.set_data(allocator::malloc(out_work.nbytes()));
+  } else if (can_donate_scalar_vector_input) {
+    out_work.copy_shared_buffer(*vector_input);
   } else if constexpr (std::is_same_v<Primitive, Multiply>) {
     out_work.set_data(allocator::malloc(out_work.nbytes()));
   } else if (a_materialized || b_materialized) {
@@ -1137,6 +1182,7 @@ bool try_eval_binary_op_vulkan(
   } else {
     set_binary_op_output_data(a, b, out_work, bopt);
   }
+
   array out_kernel = collapse_binary_leading_dims(out_work, s);
   if (!is_supported_binary_input_layout(a, 0xFFFFu) ||
       !is_supported_binary_input_layout(b, 0xFFu) ||

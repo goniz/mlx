@@ -1341,6 +1341,10 @@ std::string build_complex_matmul_shader() {
   os << "  uint b_stride1;\n";
   os << "  uint out_stride0;\n";
   os << "  uint out_stride1;\n";
+  os << "  uint batch_count;\n";
+  os << "  uint a_batch_stride;\n";
+  os << "  uint b_batch_stride;\n";
+  os << "  uint out_batch_stride;\n";
   os << "} p;\n";
   os << "layout(set = 0, binding = 0) readonly buffer A { vec2 data[]; } a;\n";
   os << "layout(set = 0, binding = 1) readonly buffer B { vec2 data[]; } b;\n";
@@ -1348,15 +1352,21 @@ std::string build_complex_matmul_shader() {
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= p.total) return;\n";
-  os << "  uint row = idx / p.N;\n";
-  os << "  uint col = idx - row * p.N;\n";
+  os << "  uint batch_elems = p.M * p.N;\n";
+  os << "  uint batch = idx / batch_elems;\n";
+  os << "  uint elem = idx - batch * batch_elems;\n";
+  os << "  uint row = elem / p.N;\n";
+  os << "  uint col = elem - row * p.N;\n";
+  os << "  uint a_base = p.a_offset + (p.batch_count == 1 ? 0 : batch) * p.a_batch_stride;\n";
+  os << "  uint b_base = p.b_offset + (p.batch_count == 1 ? 0 : batch) * p.b_batch_stride;\n";
+  os << "  uint out_base = p.out_offset + batch * p.out_batch_stride;\n";
   os << "  vec2 acc = vec2(0.0, 0.0);\n";
   os << "  for (uint kk = 0; kk < p.K; ++kk) {\n";
-  os << "    vec2 av = a.data[p.a_offset + row * p.a_stride0 + kk * p.a_stride1];\n";
-  os << "    vec2 bv = b.data[p.b_offset + kk * p.b_stride0 + col * p.b_stride1];\n";
+  os << "    vec2 av = a.data[a_base + row * p.a_stride0 + kk * p.a_stride1];\n";
+  os << "    vec2 bv = b.data[b_base + kk * p.b_stride0 + col * p.b_stride1];\n";
   os << "    acc += vec2(av.x * bv.x - av.y * bv.y, av.x * bv.y + av.y * bv.x);\n";
   os << "  }\n";
-  os << "  out_buf.data[p.out_offset + row * p.out_stride0 + col * p.out_stride1] = acc;\n";
+  os << "  out_buf.data[out_base + row * p.out_stride0 + col * p.out_stride1] = acc;\n";
   os << "}\n";
   return os.str();
 }
@@ -1372,12 +1382,17 @@ bool try_eval_complex_matmul_vulkan(
   array a = inputs[0];
   array b = inputs[1];
   if (a.dtype() != complex64 || b.dtype() != complex64 ||
-      out.dtype() != complex64 || a.ndim() != 2 || b.ndim() != 2 ||
-      out.ndim() != 2) {
+      out.dtype() != complex64 || a.ndim() != b.ndim() ||
+      a.ndim() != out.ndim() || (a.ndim() != 2 && a.ndim() != 3)) {
     return false;
   }
   if (a.shape(-1) != b.shape(-2) || out.shape(-2) != a.shape(-2) ||
       out.shape(-1) != b.shape(-1)) {
+    return false;
+  }
+  if (a.ndim() == 3 &&
+      !((a.shape(0) == out.shape(0) || a.shape(0) == 1) &&
+        (b.shape(0) == out.shape(0) || b.shape(0) == 1))) {
     return false;
   }
   if (out.size() > std::numeric_limits<uint32_t>::max() ||
@@ -1415,6 +1430,10 @@ bool try_eval_complex_matmul_vulkan(
     uint32_t b_stride1;
     uint32_t out_stride0;
     uint32_t out_stride1;
+    uint32_t batch_count;
+    uint32_t a_batch_stride;
+    uint32_t b_batch_stride;
+    uint32_t out_batch_stride;
   } pc{};
   pc.total = static_cast<uint32_t>(out.size());
   pc.M = static_cast<uint32_t>(out.shape(-2));
@@ -1429,6 +1448,13 @@ bool try_eval_complex_matmul_vulkan(
   pc.b_stride1 = static_cast<uint32_t>(b.strides(-1));
   pc.out_stride0 = static_cast<uint32_t>(out.strides(-2));
   pc.out_stride1 = static_cast<uint32_t>(out.strides(-1));
+  pc.batch_count = static_cast<uint32_t>(out.ndim() == 3 ? out.shape(0) : 1);
+  pc.a_batch_stride = static_cast<uint32_t>(
+      a.ndim() == 3 && a.shape(0) != 1 ? a.strides(0) : 0);
+  pc.b_batch_stride = static_cast<uint32_t>(
+      b.ndim() == 3 && b.shape(0) != 1 ? b.strides(0) : 0);
+  pc.out_batch_stride =
+      static_cast<uint32_t>(out.ndim() == 3 ? out.strides(0) : 0);
 
   vulkan::DynamicArrayRef arrays[] = {{&a, 0}, {&b, 1}, {&out, 2}};
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(

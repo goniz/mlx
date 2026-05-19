@@ -382,6 +382,12 @@ bool try_dispatch_generic_gather(
 
     vulkan::end_command_recording(s.index);
 
+    vulkan::retain_array_for_stream(s, src);
+    for (const auto& flat_idx : flat_indices) {
+      vulkan::retain_array_for_stream(s, flat_idx);
+    }
+    vulkan::retain_array_for_stream(s, out_work);
+
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
     }

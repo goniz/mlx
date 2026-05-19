@@ -1606,6 +1606,14 @@ bool try_eval_select_vulkan(
     return false;
   }
 
+  const bool broadcast_condition = condition.shape() != inputs[0].shape();
+  if (broadcast_condition) {
+    array staged_condition(out.shape(), bool_, nullptr, {});
+    staged_condition.set_data(allocator::malloc(staged_condition.nbytes()));
+    copy_gpu(condition, staged_condition, CopyType::General, s);
+    condition = staged_condition;
+  }
+
   auto materialize_elementwise = [&](array arr) {
     if (!is_supported_elementwise_layout(arr)) {
       array staged(arr.shape(), arr.dtype(), nullptr, {});

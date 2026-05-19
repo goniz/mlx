@@ -8,7 +8,7 @@ layout (push_constant) uniform parameter
 {
     uint ncols;
     uint rows_per_channel;
-    uint n_past;
+    int n_past;
 } p;
 
 #include "types.glsl"
@@ -32,7 +32,8 @@ void main() {
 #else
     A_TYPE in_val = data_a[i];
 #endif
-    if (col > p.n_past + row % p.rows_per_channel) {
+    const int row_in_channel = int(row % p.rows_per_channel);
+    if (int(col) > p.n_past + row_in_channel) {
 #ifdef DATA_D_BF16
         data_d[i] = uint16_t(fp32_to_bf16(uintBitsToFloat(0xFF800000)));
 #else

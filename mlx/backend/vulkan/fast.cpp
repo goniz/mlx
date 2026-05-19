@@ -93,6 +93,7 @@ float from_fp8_e4m3_scalar(uint8_t x) {
 
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
 array ensure_sdpa_rowwise_layout(array arr, Stream s);
+void eval_sdpa_binary_add_vulkan(array lhs, array rhs, array& out, Stream s);
 
 struct FlashAttentionCausalMaskCacheEntry {
   Shape shape;
@@ -187,8 +188,10 @@ array cast_flash_attention_kv_to_f16(
     const array& x,
     const char* scratch_lane,
     Stream s) {
-  // Early exit: if already float16, return as-is
-  if (x.dtype() == float16) {
+  auto data = x.data_shared_ptr();
+  if (x.dtype() == float16 && x.offset() == 0 && x.flags().row_contiguous &&
+      x.strides().back() == 1 && data != nullptr &&
+      data->buffer.ptr() != nullptr) {
     return x;
   }
   array out =
@@ -200,8 +203,8 @@ array cast_flash_attention_kv_to_f16(
 
 array cast_flash_attention_mask_to_f16(const array& x, Stream s) {
   auto data = x.data_shared_ptr();
-  if (x.dtype() == float16 && x.offset() == 0 && x.flags().row_contiguous &&
-      x.strides().back() == 1 && data != nullptr &&
+  if (x.dtype() == float16 && x.offset() == 0 && x.strides().back() == 1 &&
+      data != nullptr &&
       data->buffer.ptr() != nullptr) {
     return x;
   }
@@ -922,12 +925,17 @@ bool try_eval_flash_attention_vulkan(
     bool has_sinks,
     Stream s) {
   const bool has_arr_mask = inputs.size() > static_cast<size_t>(3 + has_sinks);
+  const bool has_bool_mask = has_arr_mask && inputs[3].dtype() == bool_;
   if (inputs.size() != static_cast<size_t>(3 + has_sinks + has_arr_mask)) {
     return false;
   }
   array q = inputs[0];
   array k = inputs[1];
   array v = inputs[2];
+
+  if (has_bool_mask) {
+    return false;
+  }
 
   if (!flash_attention_enabled_for(k, v)) {
     return false;
@@ -948,6 +956,20 @@ bool try_eval_flash_attention_vulkan(
   const uint32_t kv_heads = checked_u32_size(k.shape(1), "flash_attn kv_heads");
   const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
   const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
+  const bool is_lowp_mha =
+      q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16 &&
+      q_heads == kv_heads;
+  const bool is_lowp_gqa =
+      q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16 &&
+      q_heads != kv_heads;
+
+  // The native flash path currently matches the Vulkan SDPA reference more
+  // reliably on the GQA-style inference shapes it was added for. Keep plain
+  // float16 MHA on the manual Vulkan path until flash numerics are tightened.
+  if (is_lowp_mha || is_lowp_gqa) {
+    return false;
+  }
+
   // Use native bf16 KV when:
   // 1. bf16 is supported by the shader
   // 2. K and V are already bf16 (no cast needed)
@@ -969,11 +991,12 @@ bool try_eval_flash_attention_vulkan(
 
   q = cast_flash_attention_q_to_f32(q, s);
 
-  // After casting, arrays are already row_contiguous with offset 0.
-  // Only check layout for k and v which haven't been cast yet.
+  // Q casting already materializes dense storage; native bf16 K/V may still
+  // arrive as sliced views and need an explicit contiguous copy here.
   auto ensure_flash_attention_kv_layout = [&](array x) {
     auto data = x.data_shared_ptr();
     if (data == nullptr || data->buffer.ptr() == nullptr ||
+        !x.flags().row_contiguous ||
         x.strides().back() != 1 || x.offset() != 0) {
       x = contiguous_copy_gpu(x, s);
     }
@@ -1223,6 +1246,47 @@ array cast_to_dtype_sdpa(const array& arr, Dtype dtype, Stream s) {
 
 array cast_to_f32_sdpa(const array& arr, Stream s) {
   return cast_to_dtype_sdpa(arr, float32, s);
+}
+
+array prepare_sdpa_mask_vulkan(
+    array mask,
+    bool is_bool_mask,
+    Dtype additive_dtype,
+    const Shape& broadcast_shape,
+    const Shape& scores_shape,
+    Stream s) {
+  if (!is_bool_mask) {
+    mask = cast_to_dtype_sdpa(mask, additive_dtype, s);
+  }
+  if (mask.shape() != broadcast_shape) {
+    mask = broadcast_to(mask, broadcast_shape, s);
+  }
+  mask = ensure_sdpa_rowwise_layout(mask, s);
+  mask = reshape_sdpa_contiguous_view(mask, scores_shape);
+  mask = ensure_sdpa_rowwise_layout(mask, s);
+  mask.set_status(array::Status::evaluated);
+  return mask;
+}
+
+array apply_sdpa_mask_vulkan(
+    array scores,
+    const array& mask,
+    bool is_bool_mask,
+    Stream s) {
+  if (is_bool_mask) {
+    scores = where(
+        mask,
+        scores,
+        array(finfo(scores.dtype()).min, scores.dtype()),
+        s);
+    scores = ensure_sdpa_rowwise_layout(scores, s);
+    scores.set_status(array::Status::evaluated);
+    return scores;
+  }
+
+  array masked(scores.shape(), scores.dtype(), nullptr, {});
+  eval_sdpa_binary_add_vulkan(scores, mask, masked, s);
+  return masked;
 }
 
 void eval_sdpa_binary_vulkan(
@@ -1571,6 +1635,8 @@ bool try_eval_sdpa_heads_vulkan(
     const int q_dim = q_in.shape(3);
     const int v_dim = v_in.shape(3);
     const int batch_heads = batch * n_kv_heads;
+    const bool has_arr_mask = inputs.size() > 3;
+    const bool has_bool_mask = has_arr_mask && inputs[3].dtype() == bool_;
 
     const bool is_decode = (q_len == 1 && n_repeats > 1);
 
@@ -1582,7 +1648,7 @@ bool try_eval_sdpa_heads_vulkan(
     if (logsumexp_out != nullptr) {
       tracked_outputs.push_back(*logsumexp_out);
     }
-    vulkan::record_primitive_for_stream(s, "sdpa_heads");
+    vulkan::record_primitive_for_stream(s, "sdpa_manual_heads");
     vulkan::ScopedPrimitiveTracking tracking_scope(s, inputs, tracked_outputs);
 
     if (false && is_decode && k_in.dtype() != float32 &&
@@ -1778,7 +1844,8 @@ bool try_eval_sdpa_heads_vulkan(
 
     const bool use_lowp_path =
         logsumexp_out == nullptr && q_in.dtype() == float16 &&
-        k_in.dtype() == float16 && v_in.dtype() == float16;
+        k_in.dtype() == float16 && v_in.dtype() == float16 &&
+        !(has_arr_mask && n_repeats > 1 && kv_len >= 8192);
     const Dtype compute_dtype = use_lowp_path ? float16 : float32;
 
     stage = "cast_inputs";
@@ -1805,17 +1872,23 @@ bool try_eval_sdpa_heads_vulkan(
     eval_sdpa_matmul_vulkan(q, swap_sdpa_last_two_dims_view(k), scores, s);
 
     std::optional<array> mask_work;
-    if (inputs.size() > 3) {
+    if (has_arr_mask) {
       stage = "prepare_mask";
-      array mask = cast_to_dtype_sdpa(inputs[3], compute_dtype, s);
-      if (mask.ndim() == 4 && mask.shape(1) == 1) {
-        mask = broadcast_to(mask, {batch, n_q_heads, q_len, kv_len}, s);
+      array mask = inputs[3];
+      if (has_bool_mask) {
+        mask = where(
+            mask,
+            array(0.0f, compute_dtype),
+            array(finfo(compute_dtype).min, compute_dtype),
+            s);
       }
-      mask = ensure_sdpa_rowwise_layout(mask, s);
-      mask = reshape_sdpa_contiguous_view(mask, scores.shape());
-      mask = ensure_sdpa_rowwise_layout(mask, s);
-      mask.set_status(array::Status::evaluated);
-      mask_work = mask;
+      mask_work = prepare_sdpa_mask_vulkan(
+          mask,
+          false,
+          compute_dtype,
+          {batch, n_q_heads, q_len, kv_len},
+          scores.shape(),
+          s);
     }
 
     if (do_causal) {
@@ -1826,10 +1899,8 @@ bool try_eval_sdpa_heads_vulkan(
 
     if (mask_work.has_value()) {
       stage = "add_mask";
-        array masked(scores.shape(), compute_dtype, nullptr, {});
-        eval_sdpa_binary_add_vulkan(scores, *mask_work, masked, s);
-        scores = masked;
-      }
+      scores = apply_sdpa_mask_vulkan(scores, *mask_work, false, s);
+    }
 
     if (logsumexp_out != nullptr) {
       stage = "logsumexp";
@@ -1906,7 +1977,7 @@ array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
       command_buffer,
       s,
       checked_u32_size(in.shape(in.ndim() - 2), "rows_per_channel"),
-      checked_u32_size(n_past, "n_past"));
+      n_past);
   vulkan::end_command_recording(s.index);
   end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
 
@@ -2229,7 +2300,7 @@ bool ScaledDotProductAttention::use_fallback(
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
-  return false;
+  return true;
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
@@ -2248,6 +2319,7 @@ void ScaledDotProductAttention::eval_gpu(
   const array& k_in = inputs[1];
   const array& v_in = inputs[2];
   const bool has_arr_mask = inputs.size() > static_cast<size_t>(3 + has_sinks_);
+  const bool has_bool_mask = has_arr_mask && inputs[3].dtype() == bool_;
 
   std::string reason;
   if (!sdpa_vulkan_supported(
@@ -2302,6 +2374,12 @@ void ScaledDotProductAttention::eval_gpu(
   const int n_kv_heads = k.shape(1);
   const int n_repeats = n_q_heads / n_kv_heads;
 
+  if (n_repeats > 1) {
+    q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
+    k = expand_dims(k, 2, s);
+    v = expand_dims(v, 2, s);
+  }
+
   auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
   if (has_arr_mask) {
     if (scores.dtype() != float32) {
@@ -2318,10 +2396,18 @@ void ScaledDotProductAttention::eval_gpu(
     if (mask.shape() != scores.shape()) {
       mask = broadcast_to(mask, scores.shape(), s);
     }
-    if (mask.dtype() != scores.dtype()) {
+    if (has_bool_mask) {
+      scores = where(
+          mask,
+          scores,
+          array(finfo(scores.dtype()).min, scores.dtype()),
+          s);
+    } else if (mask.dtype() != scores.dtype()) {
       mask = astype(mask, scores.dtype(), s);
+      scores = add(scores, mask, s);
+    } else {
+      scores = add(scores, mask, s);
     }
-    scores = add(scores, mask, s);
     if (!scores.flags().row_contiguous || scores.offset() != 0 ||
         scores.strides().back() != 1) {
       scores = contiguous_copy_gpu(scores, s);
@@ -2370,23 +2456,14 @@ void ScaledDotProductAttention::eval_gpu(
 
   array scores_work = scores;
   if (n_repeats > 1) {
-    Shape v_shape = scores.shape();
-    v_shape.back() = v_work.shape(-1);
-    v_work = broadcast_to(v_work, v_shape, s);
-    scores_work = flatten(scores_work, 1, 2, s);
-    v_work = flatten(v_work, 1, 2, s);
-    if (!scores_work.flags().row_contiguous || scores_work.offset() != 0 ||
-        scores_work.strides().back() != 1) {
-      scores_work = contiguous_copy_gpu(scores_work, s);
-    }
-    if (!v_work.flags().row_contiguous || v_work.offset() != 0 ||
-        v_work.strides().back() != 1) {
-      v_work = contiguous_copy_gpu(v_work, s);
-    }
+    copy_gpu(
+        flatten(matmul(scores_work, v_work, s), 1, 2, s),
+        outputs[0],
+        CopyType::General,
+        s);
+  } else {
+    copy_gpu(matmul(scores_work, v_work, s), outputs[0], CopyType::General, s);
   }
-
-  array result = matmul(scores_work, v_work, s);
-  copy_gpu(result, outputs[0], CopyType::General, s);
 
   if (output_logsumexp_) {
     throw std::runtime_error(
@@ -2413,6 +2490,7 @@ void ScaledDotProductAttentionVJP::eval_gpu(
   auto s = stream();
   const int primals_size = static_cast<int>(inputs.size()) - 3;
   const bool has_arr_mask = primals_size > 3;
+  const bool has_bool_mask = has_arr_mask && inputs[3].dtype() == bool_;
 
   const array& q_in = inputs[0];
   const array& k_in = inputs[1];
@@ -2464,16 +2542,14 @@ void ScaledDotProductAttentionVJP::eval_gpu(
       q_scaled_h, swap_sdpa_last_two_dims_view(k4_h), scores, s);
 
   if (has_arr_mask) {
-    array mask = cast_to_f32_sdpa(inputs[3], s);
-    if (mask.ndim() == 4 && mask.shape(1) == 1) {
-      mask = broadcast_to(mask, {batch, n_q_heads, q_len, kv_len}, s);
-    }
-    mask = ensure_sdpa_rowwise_layout(mask, s);
-    mask = reshape_sdpa_contiguous_view(mask, scores_shape);
-    mask.set_status(array::Status::evaluated);
-    array masked(scores_shape, float32, nullptr, {});
-    eval_sdpa_binary_add_vulkan(scores, mask, masked, s);
-    scores = masked;
+    array mask = prepare_sdpa_mask_vulkan(
+        inputs[3],
+        has_bool_mask,
+        float32,
+        {batch, n_q_heads, q_len, kv_len},
+        scores_shape,
+        s);
+    scores = apply_sdpa_mask_vulkan(scores, mask, has_bool_mask, s);
   }
 
   if (do_causal_) {

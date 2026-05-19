@@ -2900,7 +2900,7 @@ void dispatch_diag_mask_inf_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t rows_per_channel,
-    uint32_t n_past) {
+    int32_t n_past) {
   if (out.size() == 0) {
     return;
   }

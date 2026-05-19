@@ -1739,11 +1739,14 @@ class VulkanDevice {
       return DecodeResourceClass::ReadOnlyWeight;
     }
 
-    const uint64_t bytes =
-        static_cast<uint64_t>(arr.size()) * size_of(arr.dtype());
     const uint64_t offset =
         arr.offset() < 0 ? 0ull : static_cast<uint64_t>(arr.offset());
-    if (offset > 0 || (bytes > 0 && bytes < buffer->size)) {
+    // Treat only non-zero-offset views as append-only KV writes. Ordinary
+    // donated outputs (for example Softmax reusing a larger input buffer) can
+    // have a smaller logical span than the backing allocation at offset 0, and
+    // skipping barriers for those outputs breaks visibility across deferred
+    // submissions.
+    if (offset > 0) {
       return DecodeResourceClass::AppendOnlyKVWrite;
     }
 

@@ -372,7 +372,7 @@ struct FFTPushConstants {
 struct DiagMaskInfPushConstants {
   uint32_t ncols;
   uint32_t rows_per_channel;
-  uint32_t n_past;
+  int32_t n_past;
 };
 
 struct FlashAttentionPushConstants {
@@ -814,7 +814,7 @@ void dispatch_diag_mask_inf_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t rows_per_channel,
-    uint32_t n_past);
+    int32_t n_past);
 
 void dispatch_flash_attention_op(
     const array& q,

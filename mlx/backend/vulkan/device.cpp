@@ -221,7 +221,7 @@ bool decode_batch_enabled() {
         env != nullptr) {
       return std::string(env) != "0";
     }
-    return true;
+    return false;
   }();
   return enabled;
 }

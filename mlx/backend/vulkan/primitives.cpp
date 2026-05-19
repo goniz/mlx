@@ -1098,6 +1098,24 @@ std::string build_bitwise_binary_shader(Dtype dtype, BitwiseBinary::Op op) {
   return os.str();
 }
 
+std::string build_bitwise_invert_shader(Dtype dtype) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(
+      dtype, dtype, dtype == int64 || dtype == uint64);
+  os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer Input {"
+     << vulkan::dtype_to_glsl_storage_type(dtype) << " data[];} in_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer Output {"
+     << vulkan::dtype_to_glsl_storage_type(dtype) << " data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = ~("
+     << bitwise_input_expr(dtype, "in_buf", "idx + pc.in_offset") << ");\n";
+  os << "}\n";
+  return os.str();
+}
+
 std::string build_logical_not_shader() {
   std::ostringstream os;
   os << vulkan::emit_dynamic_shader_preamble(bool_, bool_, false);
@@ -1477,6 +1495,102 @@ bool try_eval_bitwise_binary_vulkan(
   return true;
 }
 
+bool try_eval_bitwise_invert_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 1) {
+    return false;
+  }
+
+  array in = inputs[0];
+  if (in.dtype() != out.dtype() || !(issubdtype(out.dtype(), integer))) {
+    return false;
+  }
+
+  if (!ensure_vulkan_buffer_compare(in, s)) {
+    return false;
+  }
+  if (!is_supported_elementwise_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
+  }
+
+  const bool flatten_rank = in.ndim() > 4 || out.ndim() > 4;
+  if (flatten_rank) {
+    in = reshape_in_eval(in, {static_cast<ShapeElem>(in.size())}, s);
+  } else {
+    in = collapse_compare_leading_dims(in, s);
+  }
+
+  const bool staged_output =
+      flatten_rank || !is_supported_elementwise_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  array out_kernel = flatten_rank
+      ? reshape_in_eval(out_work, {static_cast<ShapeElem>(out.size())}, s)
+      : collapse_compare_leading_dims(out_work, s);
+
+  if (!is_supported_elementwise_layout(in) ||
+      !is_supported_elementwise_layout(out_kernel)) {
+    return false;
+  }
+  if (!ensure_vulkan_buffer_compare(in, s) ||
+      !ensure_vulkan_buffer_compare(out_kernel, s)) {
+    return false;
+  }
+  if (out_kernel.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::General, s);
+    }
+    return true;
+  }
+
+  const auto in_offset = static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
+  const auto total = static_cast<uint64_t>(out_kernel.data_size());
+  if (in_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  const std::string shader_name = std::string("dynamic_bitwise_invert_") +
+      std::to_string(static_cast<int>(out.dtype().val()));
+  const std::string glsl_source = build_bitwise_invert_shader(out.dtype());
+  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out_kernel, 1}};
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 3;
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      shader_name, glsl_source, 2, arrays, kPushConstantSize, s);
+
+  struct PushConstants {
+    uint32_t in_offset;
+    uint32_t out_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(in_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &pc);
+  const uint32_t workgroups =
+      std::max<uint32_t>((static_cast<uint32_t>(total) + 255u) / 256u, 1u);
+  vkCmdDispatch(dispatch.command_buffer, workgroups, 1, 1);
+  vulkan::end_command_recording(s.index);
+
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::General, s);
+  }
+  return true;
+}
+
 array collapse_select_leading_dims(const array& arr, Stream s) {
   if (arr.ndim() <= 4) {
     return arr;
@@ -1797,6 +1911,13 @@ void BitwiseBinary::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 }
 
+void BitwiseInvert::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!try_eval_bitwise_invert_vulkan(inputs, out, stream())) {
+    throw std::runtime_error(
+        "BitwiseInvert has no Vulkan implementation for this input.");
+  }
+}
+
 void Greater::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_compare_vulkan(inputs, out, stream(), CompareOp::Greater)) {
     throw std::runtime_error(
@@ -2037,14 +2158,10 @@ void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 // CPU fallbacks for primitives not implemented on Vulkan
-NYI_OP(ArcCos)
 NYI_OP(ArcCosh)
-NYI_OP(ArcSin)
 NYI_OP(ArcSinh)
-NYI_OP(ArcTan)
 NYI_OP(ArcTan2)
 NYI_OP(ArcTanh)
-NYI_OP(BitwiseInvert)
 NYI_OP(Cosh)
 NYI_OP_STATE(Hadamard)
 // Linear algebra operations - throw NYI like Metal backend

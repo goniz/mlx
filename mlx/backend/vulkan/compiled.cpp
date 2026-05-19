@@ -222,11 +222,15 @@ std::string glsl_cast_expr(Dtype dst, Dtype src, const std::string& expr) {
 
 bool supports_primitive_name(const std::string& prim_name) {
   static const std::unordered_set<std::string> supported = {
-       "Abs",       "Add",     "AsType",  "Broadcast", "Ceil",     "Conjugate",
-       "Cos",       "Divide",  "Equal",   "Erf",       "Exp",      "Floor",
-       "Imag",      "Log",     "LogAddExp", "LogicalOr", "Maximum",  "Minimum",
-       "Multiply",  "Negative", "Power",  "Real",      "Round",    "Sigmoid",
-       "Sin",       "Select",  "Sqrt",    "Subtract",  "Square",   "Tan",
+       "Abs",         "Add",         "AsType",      "Broadcast",
+       "Ceil",        "Conjugate",   "Cos",         "Divide",
+       "Equal",       "Erf",         "Exp",         "Floor",
+       "Greater",     "GreaterEqual", "Imag",       "Less",
+       "LessEqual",   "Log",         "LogAddExp",   "LogicalAnd",
+       "LogicalOr",   "Maximum",     "Minimum",     "Multiply",
+       "Negative",    "NotEqual",    "Power",       "Real",
+       "Round",       "Sigmoid",     "Sin",         "Select",
+       "Sign",        "Sqrt",        "Subtract",    "Square",      "Tan",
        "Tanh"};
   return supported.contains(prim_name);
 }
@@ -401,6 +405,12 @@ std::string get_glsl_operator(const std::string& primitive_name) {
       {"Multiply", "*"},
       {"Divide", "/"},
       {"Equal", "=="},
+      {"NotEqual", "!="},
+      {"Greater", ">"},
+      {"Less", "<"},
+      {"GreaterEqual", ">="},
+      {"LessEqual", "<="},
+      {"LogicalAnd", "&&"},
       {"LogicalOr", "||"},
       {"Maximum", "max"},
       {"Minimum", "min"},
@@ -417,6 +427,7 @@ std::string get_glsl_operator(const std::string& primitive_name) {
       {"Ceil", "ceil"},
       {"Round", "round"},
       {"Power", "pow"},
+      {"Sign", "sign"},
       {"Sigmoid", "sigmoid"},
       {"Tanh", "tanh"},
   };

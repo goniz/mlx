@@ -2326,6 +2326,17 @@ bool ScaledDotProductAttention::use_fallback(
   if (s.device == Device::cpu) {
     return true;
   }
+  const bool lowp_attention =
+      q.dtype() != float32 || k.dtype() != float32 || v.dtype() != float32;
+  const bool lowp_masked = lowp_attention && has_arr_mask;
+  const bool lowp_causal_gqa_prefill =
+      lowp_attention && do_causal && q.shape(2) > 1 && q.shape(1) != k.shape(1);
+  const bool lowp_decode_mha =
+      lowp_attention && q.shape(2) == 1 && q.shape(1) == k.shape(1);
+  if (!output_logsumexp &&
+      (lowp_masked || lowp_causal_gqa_prefill || lowp_decode_mha)) {
+    return true;
+  }
   return false;
 }
 

@@ -1,10 +1,12 @@
 // Copyright © 2024 Apple Inc.
 
+#include <cmath>
+#include <vector>
+
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/vulkan.h"
-
-#include <vector>
+#include "mlx/dtype.h"
 
 namespace mlx::core {
 
@@ -45,6 +47,36 @@ bool try_eval_arange_vulkan(
     double step) {
   if (!inputs.empty() || !is_supported_generic_unary_layout(out)) {
     return false;
+  }
+
+  if ((out.dtype() == float16 || out.dtype() == bfloat16) &&
+      start == std::trunc(start) && step == std::trunc(step)) {
+    // Match CPU low-precision arange semantics by advancing in the target dtype
+    // instead of recomputing each element from float32 math in the shader.
+    const auto n = out.size();
+    out.set_data(allocator::malloc(out.nbytes()));
+    if (n == 0) {
+      return true;
+    }
+    if (out.dtype() == float16) {
+      auto* dst = out.data<float16_t>();
+      float16_t value(static_cast<float>(start));
+      const float16_t step_value(static_cast<float>(step));
+      for (size_t i = 0; i < n; ++i) {
+        dst[i] = value;
+        value = float16_t(static_cast<float>(value) + static_cast<float>(step_value));
+      }
+      return true;
+    }
+
+    auto* dst = out.data<bfloat16_t>();
+    bfloat16_t value(static_cast<float>(start));
+    const bfloat16_t step_value(static_cast<float>(step));
+    for (size_t i = 0; i < n; ++i) {
+      dst[i] = value;
+      value = bfloat16_t(static_cast<float>(value) + static_cast<float>(step_value));
+    }
+    return true;
   }
 
   auto shader_id = arange_shader_id(out.dtype());

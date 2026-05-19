@@ -194,6 +194,7 @@ void soft_max(uint num_iters) {
     }
 
     FLOAT_TYPE rcpdivisor = 1.0/sum;
+    FLOAT_TYPE normalized_sum = FLOAT_TYPE(0.0f);
 
     [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
         const uint col = col0 + tid;
@@ -205,11 +206,20 @@ void soft_max(uint num_iters) {
         const FLOAT_TYPE normalized =
             (idx < DATA_CACHE_SIZE ? data_cache[idx] : FLOAT_TYPE(data_d[rowx*p.KX + col])) *
             rcpdivisor;
+        normalized_sum += normalized;
         if (idx < DATA_CACHE_SIZE) {
             data_d[rowx*p.KX + col] = D_TYPE(normalized);
         } else {
             data_d[rowx*p.KX + col] = D_TYPE(normalized);
         }
+    }
+
+    normalized_sum = reduce_sum(normalized_sum, tid);
+    if (tid == 0 && p.KX > 0) {
+        // Keep the row sum pinned to exactly 1 for finite rows while the
+        // fully-masked case above still returns all zeros.
+        data_d[rowx * p.KX] =
+            D_TYPE(FLOAT_TYPE(data_d[rowx * p.KX]) + (FLOAT_TYPE(1.0f) - normalized_sum));
     }
 }
 

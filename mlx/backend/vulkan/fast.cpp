@@ -1842,6 +1842,41 @@ bool try_eval_sdpa_heads_vulkan(
     // Prefill (or non-decode) path: original broadcast + materialize logic
     // ==========================================================================
 
+    const bool use_precise_masked_gqa_path =
+        logsumexp_out == nullptr && has_arr_mask && !has_bool_mask &&
+        !do_causal && n_repeats > 1;
+    if (use_precise_masked_gqa_path) {
+      // Additive-mask GQA is more reliable when we reuse the primitive op
+      // sequence directly instead of the flattened manual helper path.
+      stage = "precise_masked_gqa";
+      array q = multiply(array(scale, q_in.dtype()), q_in, s);
+      array k = k_in;
+      array v = v_in;
+
+      q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
+      k = expand_dims(k, 2, s);
+      v = expand_dims(v, 2, s);
+
+      array scores = matmul(q, swapaxes(k, -1, -2, s), s);
+      array mask = inputs[3];
+      if (mask.ndim() >= 3) {
+        if (mask.shape(-3) == 1) {
+          mask = expand_dims(mask, -3, s);
+        } else {
+          mask = unflatten(mask, -3, {n_kv_heads, n_repeats}, s);
+        }
+      }
+      if (mask.shape() != scores.shape()) {
+        mask = broadcast_to(mask, scores.shape(), s);
+      }
+      scores = add(scores, mask, s);
+      scores = softmax(scores, std::vector<int>{-1}, true, s);
+
+      copy_gpu(flatten(matmul(scores, v, s), 1, 2, s), out, CopyType::General, s);
+      out.set_status(array::Status::evaluated);
+      return true;
+    }
+
     const bool use_lowp_path =
         logsumexp_out == nullptr && q_in.dtype() == float16 &&
         k_in.dtype() == float16 && v_in.dtype() == float16 &&

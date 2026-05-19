@@ -769,6 +769,25 @@ layout(push_constant) uniform PushConstants {
       } else if (prim_name == "Square" && x.inputs().size() == 1) {
         const auto input = get_input_expr(x.inputs()[0]);
         os += fmt::format("({} * {});\n", input, input);
+      } else if (prim_name == "Sign" && x.inputs().size() == 1) {
+        const auto input = get_input_expr(x.inputs()[0]);
+        const auto input_dtype = x.inputs()[0].dtype();
+        if (x.dtype() == complex64) {
+          os += fmt::format(
+              "(({} == vec2(0.0, 0.0)) ? {} : complex_div({}, vec2(complex_abs({}), 0.0)));\n",
+              input,
+              input,
+              input,
+              input);
+        } else if (x.dtype() == bool_) {
+          os += fmt::format("{};\n", input);
+        } else if (
+            input_dtype == uint8 || input_dtype == uint16 ||
+            input_dtype == uint32 || input_dtype == uint64) {
+          os += fmt::format("(({} == {}(0)) ? {}(0) : {}(1));\n", input, type_str, type_str, type_str);
+        } else {
+          os += fmt::format("sign({});\n", input);
+        }
       } else if (
           prim_name == "Power" && x.inputs().size() == 2 && !is_complex) {
         const auto lhs = get_input_expr(x.inputs()[0]);

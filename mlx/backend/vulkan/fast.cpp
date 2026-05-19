@@ -308,6 +308,9 @@ struct FlashAttentionExecutionPlan {
   FlashAttentionTuningParams tuning;
   bool aligned;
   bool use_mask_opt;
+  uint32_t gqa_ratio;
+  uint32_t n_rows;
+  uint32_t workgroups_y;
   uint32_t split_kv;
   uint32_t split_k;
 };
@@ -549,17 +552,35 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
     uint32_t hsv,
     uint32_t q_len,
     uint32_t q_heads,
+    uint32_t kv_heads,
     uint32_t kv_len,
     uint32_t batch,
     bool has_mask,
     bool do_causal,
+    uint32_t mask_heads,
     bool use_native_bf16_kv,
     uint32_t q_stride,
     uint32_t k_stride,
     uint32_t v_stride) {
+  uint32_t gqa_ratio = 1u;
+  uint32_t n_rows = q_len;
+  uint32_t workgroups_y = q_heads;
+  const uint32_t qk_ratio = kv_heads == 0u ? 0u : q_heads / kv_heads;
+
   auto tuning = use_native_bf16_kv
-      ? get_flash_attention_tuning_params_scalar(hsk, hsv, q_len, kv_len)
-      : get_flash_attention_tuning_params(hsk, hsv, q_len, kv_len);
+      ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
+      : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
+
+  if (q_len <= 8u && qk_ratio > 1u && qk_ratio <= tuning.block_rows &&
+      qk_ratio * kv_heads == q_heads && mask_heads <= 1u) {
+    gqa_ratio = qk_ratio;
+    n_rows = gqa_ratio;
+    workgroups_y /= gqa_ratio;
+    tuning = use_native_bf16_kv
+        ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
+        : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
+  }
+
   const bool aligned = (kv_len % tuning.block_cols) == 0 &&
       (q_stride & 7u) == 0 && (k_stride & 7u) == 0 && (v_stride & 7u) == 0;
 
@@ -567,6 +588,9 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
       tuning,
       aligned,
       false,
+      gqa_ratio,
+      n_rows,
+      workgroups_y,
       kv_len,
       1u,
   };
@@ -576,8 +600,9 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
         static_cast<uint64_t>(q_len) * static_cast<uint64_t>(kv_len) >= 32768u;
   }
 
-  const uint32_t tr = (q_len + tuning.block_rows - 1u) / tuning.block_rows;
-  const uint32_t total_wgs_no_split = std::max(tr * q_heads * batch, 1u);
+  const uint32_t tr = (n_rows + tuning.block_rows - 1u) / tuning.block_rows;
+  const uint32_t total_wgs_no_split =
+      std::max(tr * workgroups_y * batch, 1u);
   uint32_t shader_core_count = vulkan::VulkanContext::get().shader_core_count();
   if (shader_core_count == 0u) {
     shader_core_count = 16u;
@@ -695,10 +720,12 @@ bool try_dispatch_flash_attention_native_vulkan(
       hsv,
       q_len,
       q_heads,
+      kv_heads,
       kv_len,
       batch,
       has_mask,
       do_causal,
+      has_mask ? checked_u32_size((*mask).shape(1), "flash_attn mask_heads") : 1u,
       use_native_bf16_kv,
       q_stride,
       k_stride,
@@ -721,7 +748,7 @@ bool try_dispatch_flash_attention_native_vulkan(
   };
 
   vulkan::FlashAttentionPushConstants push_constants{};
-  push_constants.N = q_len;
+  push_constants.N = plan.n_rows;
   push_constants.KV = kv_len;
   push_constants.ne1 = q_heads;
   push_constants.ne2 = q_len;
@@ -757,7 +784,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       sinks != nullptr ? kFlashAttnSinkEnableBit : 0u;
   push_constants.m0 = 0.0f;
   push_constants.m1 = 0.0f;
-  push_constants.gqa_ratio = 1u;
+  push_constants.gqa_ratio = plan.gqa_ratio;
   push_constants.split_kv = plan.split_kv;
   push_constants.k_num = plan.split_k;
 
@@ -874,9 +901,9 @@ bool try_dispatch_flash_attention_native_vulkan(
         s,
         push_constants,
         {
-            ((q_len + tuning.block_rows - 1u) / tuning.block_rows) *
+            ((plan.n_rows + tuning.block_rows - 1u) / tuning.block_rows) *
                 plan.split_k,
-            q_heads,
+            plan.workgroups_y,
             batch,
         },
         specialization_constants);

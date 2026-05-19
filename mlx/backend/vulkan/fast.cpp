@@ -816,7 +816,6 @@ bool try_dispatch_flash_attention_native_vulkan(
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    insert_compute_barrier(command_buffer);
 
     if (plan.use_mask_opt) {
       const uint32_t mask_opt_subgroup_size =
@@ -956,17 +955,13 @@ bool try_eval_flash_attention_vulkan(
   const uint32_t kv_heads = checked_u32_size(k.shape(1), "flash_attn kv_heads");
   const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
   const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
-  const bool is_lowp_mha =
-      q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16 &&
-      q_heads == kv_heads;
-  const bool is_lowp_gqa =
-      q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16 &&
-      q_heads != kv_heads;
+  const bool is_lowp_attention =
+      q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16;
 
-  // The native flash path currently matches the Vulkan SDPA reference more
-  // reliably on the GQA-style inference shapes it was added for. Keep plain
-  // float16 MHA on the manual Vulkan path until flash numerics are tightened.
-  if (is_lowp_mha || is_lowp_gqa) {
+  // Keep low-precision prefill on the manual path for now, but allow the
+  // native flash kernel on decode shapes where generation throughput matters
+  // most and the path was originally introduced.
+  if (is_lowp_attention && q_len > 1) {
     return false;
   }
 
@@ -1844,7 +1839,7 @@ bool try_eval_sdpa_heads_vulkan(
 
     const bool use_precise_masked_gqa_path =
         logsumexp_out == nullptr && has_arr_mask && !has_bool_mask &&
-        !do_causal && n_repeats > 1;
+        !do_causal && n_repeats > 1 && q_len > 1;
     if (use_precise_masked_gqa_path) {
       // Additive-mask GQA is more reliable when we reuse the primitive op
       // sequence directly instead of the flattened manual helper path.

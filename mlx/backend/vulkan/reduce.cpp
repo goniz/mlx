@@ -122,6 +122,9 @@ vec2 cmul(vec2 a, vec2 b) {
 bool cless(vec2 a, vec2 b) {
   return a.x < b.x || (a.x == b.x && a.y < b.y);
 }
+bool cisnan(vec2 a) {
+  return isnan(a.x) || isnan(a.y);
+}
 )";
   }
   os << "void main() {\n";
@@ -140,12 +143,20 @@ bool cless(vec2 a, vec2 b) {
     }
   } else if (reduce_type == Reduce::Min) {
     if (dtype == complex64) {
+      os << "    if (cisnan(value)) {\n";
+      os << "      acc = value;\n";
+      os << "      break;\n";
+      os << "    }\n";
       os << "    acc = cless(value, acc) ? value : acc;\n";
     } else {
       os << "    acc = value < acc ? value : acc;\n";
     }
   } else if (reduce_type == Reduce::Max) {
     if (dtype == complex64) {
+      os << "    if (cisnan(value)) {\n";
+      os << "      acc = value;\n";
+      os << "      break;\n";
+      os << "    }\n";
       os << "    acc = cless(acc, value) ? value : acc;\n";
     } else {
       os << "    acc = value > acc ? value : acc;\n";
@@ -166,13 +177,21 @@ bool cless(vec2 a, vec2 b) {
     }
   } else if (reduce_type == Reduce::Min) {
     if (dtype == complex64) {
-      os << "      vals[tid] = cless(vals[tid + s], vals[tid]) ? vals[tid + s] : vals[tid];\n";
+      os << "      if (cisnan(vals[tid + s])) {\n";
+      os << "        vals[tid] = vals[tid + s];\n";
+      os << "      } else if (!cisnan(vals[tid])) {\n";
+      os << "        vals[tid] = cless(vals[tid + s], vals[tid]) ? vals[tid + s] : vals[tid];\n";
+      os << "      }\n";
     } else {
       os << "      vals[tid] = vals[tid + s] < vals[tid] ? vals[tid + s] : vals[tid];\n";
     }
   } else if (reduce_type == Reduce::Max) {
     if (dtype == complex64) {
-      os << "      vals[tid] = cless(vals[tid], vals[tid + s]) ? vals[tid + s] : vals[tid];\n";
+      os << "      if (cisnan(vals[tid + s])) {\n";
+      os << "        vals[tid] = vals[tid + s];\n";
+      os << "      } else if (!cisnan(vals[tid])) {\n";
+      os << "        vals[tid] = cless(vals[tid], vals[tid + s]) ? vals[tid + s] : vals[tid];\n";
+      os << "      }\n";
     } else {
       os << "      vals[tid] = vals[tid + s] > vals[tid] ? vals[tid + s] : vals[tid];\n";
     }

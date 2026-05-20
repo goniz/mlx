@@ -534,8 +534,7 @@ constexpr size_t kDefaultStagingArenaBytes = 1 << 20;
 std::shared_ptr<array::Data> make_owned_staging_allocation(size_t size) {
   auto data = std::make_shared<array::Data>(allocator::malloc(size));
   auto* buffer = static_cast<VulkanBuffer*>(data->buffer.ptr());
-  if (buffer == nullptr || !buffer->buffer ||
-      buffer->mapped_ptr == nullptr) {
+  if (buffer == nullptr || !buffer->buffer || buffer->mapped_ptr == nullptr) {
     throw std::runtime_error(
         "[vulkan::staging] Failed to allocate host-visible staging buffer.");
   }
@@ -690,6 +689,7 @@ struct StreamData {
   uint64_t deferred_heavy_bytes{0};
   uint64_t deferred_compiled_bytes{0};
   uint32_t deferred_heavy_ops{0};
+  bool last_op_budget_free{false};
   uint32_t submission_count{0};
   bool force_immediate_submit_{false};
   uint32_t decode_barrier_count{0};
@@ -827,6 +827,7 @@ class VulkanDevice {
       stream->recording_completion_callbacks.clear();
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
+      stream->last_op_budget_free = false;
       stream->decode_barrier_count = 0;
       stream->decode_transfer_submit_count = 0;
       clear_scratch_barriers(stream.get());
@@ -977,6 +978,14 @@ class VulkanDevice {
         submission.refs.push_back(std::move(data));
       }
     }
+  }
+
+  bool is_retained_by_current_recording(int stream_index, const array& arr) {
+    auto* stream = get_stream(stream_index);
+    auto data = arr.data_shared_ptr();
+    return data && stream->recording &&
+        stream->recording_ref_ids.find(data.get()) !=
+        stream->recording_ref_ids.end();
   }
 
   void retain_shared(int stream_index, std::shared_ptr<void> resource) {
@@ -1171,6 +1180,23 @@ class VulkanDevice {
       StreamData* stream,
       const std::vector<array>& inputs,
       const std::vector<array>& outputs) {
+    const std::string primitive = stream->recent_primitives.empty()
+        ? std::string{}
+        : stream->recent_primitives.back();
+
+    stream->last_op_budget_free = false;
+    if (!inputs.empty() && !outputs.empty()) {
+      const auto input_data = inputs[0].data_shared_ptr();
+      const bool in_place = input_data &&
+          std::all_of(outputs.begin(), outputs.end(), [&](const array& out) {
+                              return out.data_shared_ptr() == input_data;
+                            });
+      if (in_place) {
+        stream->last_op_budget_free = true;
+        return;
+      }
+    }
+
     uint64_t input_bytes = 0;
     uint64_t output_bytes = 0;
     for (const auto& in : inputs) {
@@ -1183,9 +1209,6 @@ class VulkanDevice {
     const uint64_t total_bytes = input_bytes + output_bytes;
     stream->deferred_total_bytes += total_bytes;
 
-    const std::string primitive = stream->recent_primitives.empty()
-        ? std::string{}
-        : stream->recent_primitives.back();
     if (is_heavy_primitive_name(primitive)) {
       stream->deferred_heavy_bytes +=
           weighted_heavy_bytes(primitive, input_bytes, output_bytes);
@@ -1315,11 +1338,15 @@ class VulkanDevice {
       const Stream& s,
       const std::vector<array>& inputs,
       const std::vector<array>& outputs) {
+    auto* stream = get_stream(s.index);
+    // Release references held by already-completed submissions before backend
+    // primitives decide whether input buffers are uniquely owned and donatable.
+    retire_submissions(stream, false);
+
     if (!deferred_submission_enabled()) {
       return;
     }
 
-    auto* stream = get_stream(s.index);
     if (!stream->recording) {
       return;
     }
@@ -1448,6 +1475,7 @@ class VulkanDevice {
       stream->deferred_heavy_bytes = 0;
       stream->deferred_compiled_bytes = 0;
       stream->deferred_heavy_ops = 0;
+      stream->last_op_budget_free = false;
       stream->decode_barrier_count = 0;
       stream->decode_hazard_barrier_count = 0;
       stream->decode_hazard_submit_count = 0;
@@ -1521,7 +1549,10 @@ class VulkanDevice {
     }
 
     if (should_prefer_long_decode_recording(stream) && !transfer) {
-      stream->recorded_ops += 1;
+      if (!stream->last_op_budget_free) {
+        stream->recorded_ops += 1;
+      }
+      stream->last_op_budget_free = false;
       if (exceeds_decode_hard_limits(stream)) {
         std::string submit_reason;
         (void)should_submit_recording(stream, &submit_reason);
@@ -1557,7 +1588,10 @@ class VulkanDevice {
       return;
     }
 
-    stream->recorded_ops += 1;
+    if (!stream->last_op_budget_free) {
+      stream->recorded_ops += 1;
+    }
+    stream->last_op_budget_free = false;
     std::string submit_reason;
     if (should_submit_recording(stream, &submit_reason)) {
       stream->force_immediate_submit_ = false;
@@ -2123,6 +2157,7 @@ class VulkanDevice {
       stream->deferred_heavy_bytes = 0;
       stream->deferred_compiled_bytes = 0;
       stream->deferred_heavy_ops = 0;
+      stream->last_op_budget_free = false;
       stream->decode_barrier_count = 0;
       stream->decode_hazard_barrier_count = 0;
       stream->decode_hazard_submit_count = 0;
@@ -2336,6 +2371,7 @@ class VulkanDevice {
     stream->deferred_heavy_bytes = 0;
     stream->deferred_compiled_bytes = 0;
     stream->deferred_heavy_ops = 0;
+    stream->last_op_budget_free = false;
     clear_scratch_barriers(stream);
     stream->last_decode_resource_summary.reset();
     stream->recent_primitives.clear();
@@ -2459,6 +2495,10 @@ void validate_stream_thread(Stream s) {
 
 void retain_array_for_stream(const Stream& s, const array& arr) {
   VulkanDevice::get().retain_array(s.index, arr);
+}
+
+bool is_retained_by_current_recording(const Stream& s, const array& arr) {
+  return VulkanDevice::get().is_retained_by_current_recording(s.index, arr);
 }
 
 void retain_shared_for_stream(const Stream& s, std::shared_ptr<void> resource) {

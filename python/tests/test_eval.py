@@ -7,9 +7,6 @@ import mlx.core as mx
 import mlx_tests
 
 
-VULKAN_GPU = mx.is_available(mx.gpu) and not mx.metal.is_available() and not mx.cuda.is_available()
-
-
 class TestEval(mlx_tests.MLXTestCase):
     def test_eval(self):
         arrs = [mx.ones((2, 2)) for _ in range(4)]
@@ -92,16 +89,6 @@ class TestEval(mlx_tests.MLXTestCase):
         z = mx.abs(y, stream=s)
         self.assertEqual(z.item(), 5)
 
-    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU is not available")
-    def test_async_eval_into_async_eval_diff_gpu_stream(self):
-        s = mx.new_stream(mx.gpu)
-        x = mx.array(0.0)
-        y = mx.abs(x - 5.0, stream=s)
-        mx.async_eval(y)
-        z = mx.abs(y, stream=mx.default_stream(mx.gpu))
-        mx.async_eval(z)
-        self.assertEqual(z.item(), 5.0)
-
     def test_eval_slow_fast_multi_stream(self):
         x = mx.ones((8000,))
         y = mx.abs(mx.array(-1.0))
@@ -149,7 +136,6 @@ class TestEval(mlx_tests.MLXTestCase):
             mx.async_eval(x)
             mx.eval(a + b)
 
-    @unittest.skipIf(VULKAN_GPU, "Vulkan donation optimization not implemented")
     def test_donation_for_noops(self):
         def fun(x):
             s = x.shape

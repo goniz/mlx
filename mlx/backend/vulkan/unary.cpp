@@ -4,6 +4,8 @@
 #include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 
+#include <type_traits>
+
 namespace mlx::core {
 
 namespace {
@@ -33,6 +35,32 @@ bool is_vulkan_signed_integer_dtype(Dtype dtype) {
       return true;
     default:
       return false;
+  }
+}
+
+template <typename Primitive>
+void set_vulkan_unary_output_data(const array& in, array& out, Stream s) {
+  constexpr size_t donation_extra = 16384;
+  constexpr size_t min_relaxed_donation_bytes = 16 * 1024 * 1024;
+  const bool can_reuse_stream_ref = std::is_same_v<Primitive, Abs> &&
+      in.status() != array::Status::available &&
+      vulkan::is_retained_by_current_recording(s, in) &&
+      in.itemsize() == out.itemsize() &&
+      in.buffer_size() <= out.nbytes() + donation_extra &&
+      in.nbytes() >= min_relaxed_donation_bytes;
+
+  if (in.flags().contiguous) {
+    if (is_donatable(in, out) || can_reuse_stream_ref) {
+      out.copy_shared_buffer(in);
+    } else {
+      out.set_data(
+          allocator::malloc(in.data_size() * out.itemsize()),
+          in.data_size(),
+          in.strides(),
+          in.flags());
+    }
+  } else {
+    out.set_data(allocator::malloc(out.nbytes()));
   }
 }
 
@@ -129,10 +157,13 @@ std::string build_integer_sign_shader(Dtype dtype) {
   const auto zero = unary_zero_literal(dtype);
   const auto one = unary_one_literal(dtype);
   std::ostringstream os;
-  os << vulkan::emit_dynamic_shader_preamble(dtype, dtype, dtype == int64 || dtype == uint64);
+  os << vulkan::emit_dynamic_shader_preamble(
+      dtype, dtype, dtype == int64 || dtype == uint64);
   os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer Input {" << type << " data[];} in_buf;\n";
-  os << "layout(set = 0, binding = 1) buffer Output {" << type << " data[];} out_buf;\n\n";
+  os << "layout(set = 0, binding = 0) readonly buffer Input {" << type
+     << " data[];} in_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer Output {" << type
+     << " data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
@@ -154,14 +185,16 @@ std::string build_integer_abs_shader(Dtype dtype) {
   std::ostringstream os;
   os << vulkan::emit_dynamic_shader_preamble(dtype, dtype, dtype == int64);
   os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer Input {" << type << " data[];} in_buf;\n";
-  os << "layout(set = 0, binding = 1) buffer Output {" << type << " data[];} out_buf;\n\n";
+  os << "layout(set = 0, binding = 0) readonly buffer Input {" << type
+     << " data[];} in_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer Output {" << type
+     << " data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
   os << "  " << type << " x = in_buf.data[idx + pc.in_offset];\n";
-  os << "  out_buf.data[idx + pc.out_offset] = x < " << unary_zero_literal(dtype)
-     << " ? -x : x;\n";
+  os << "  out_buf.data[idx + pc.out_offset] = x < "
+     << unary_zero_literal(dtype) << " ? -x : x;\n";
   os << "}\n";
   return os.str();
 }
@@ -268,7 +301,8 @@ void main() {
   if (idx >= pc.total_elements) return;
   vec2 z = in_buf.data[idx + pc.in_offset];
   vec2 outv = vec2(log(length(z)), atan(z.y, z.x));
-  out_buf.data[idx + pc.out_offset] = outv * )" << scale_expr << R"(;
+  out_buf.data[idx + pc.out_offset] = outv * )"
+     << scale_expr << R"(;
 }
 )";
   return os.str();
@@ -626,12 +660,7 @@ bool try_eval_complex_unary_shader_vulkan(
   vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out_work, 1}};
   constexpr uint32_t kPushConstantSize = sizeof(PushConstants);
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      shader_name,
-      shader_source,
-      2,
-      arrays,
-      kPushConstantSize,
-      s);
+      shader_name, shader_source, 2, arrays, kPushConstantSize, s);
   vkCmdPushConstants(
       dispatch.command_buffer,
       dispatch.pipeline->layout,
@@ -656,7 +685,8 @@ bool try_eval_expm1_vulkan(
     array& out,
     Stream s) {
   if (inputs.size() != 1 ||
-      !(out.dtype() == float32 || out.dtype() == float16 || out.dtype() == bfloat16)) {
+      !(out.dtype() == float32 || out.dtype() == float16 ||
+        out.dtype() == bfloat16)) {
     return false;
   }
 
@@ -665,7 +695,8 @@ bool try_eval_expm1_vulkan(
   copy_gpu(in, in_f32, CopyType::General, s);
   in = in_f32;
 
-  array out_target = out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {});
+  array out_target =
+      out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {});
   if (!is_supported_elementwise_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
@@ -746,7 +777,8 @@ bool try_eval_log_base_vulkan(
     Log::Base base,
     Stream s) {
   if (inputs.size() != 1 ||
-      !(out.dtype() == float32 || out.dtype() == float16 || out.dtype() == bfloat16)) {
+      !(out.dtype() == float32 || out.dtype() == float16 ||
+        out.dtype() == bfloat16)) {
     return false;
   }
 
@@ -755,7 +787,8 @@ bool try_eval_log_base_vulkan(
   copy_gpu(in, in_f32, CopyType::General, s);
   in = in_f32;
 
-  array out_target = out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {});
+  array out_target =
+      out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {});
   if (!is_supported_elementwise_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
@@ -802,9 +835,9 @@ bool try_eval_log_base_vulkan(
   vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out_work, 1}};
   constexpr uint32_t kPushConstantSize = sizeof(PushConstants);
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      base == Log::two ? "dynamic_log2_f32"
-      : base == Log::ten ? "dynamic_log10_f32"
-                         : "dynamic_log_f32",
+      base == Log::two       ? "dynamic_log2_f32"
+          : base == Log::ten ? "dynamic_log10_f32"
+                             : "dynamic_log_f32",
       build_log_base_shader(base),
       2,
       arrays,
@@ -838,7 +871,8 @@ bool try_eval_f32_unary_with_staging_vulkan(
     vulkan::StaticShaderId shader_id,
     Stream s) {
   if (inputs.size() != 1 ||
-      !(out.dtype() == float32 || out.dtype() == float16 || out.dtype() == bfloat16)) {
+      !(out.dtype() == float32 || out.dtype() == float16 ||
+        out.dtype() == bfloat16)) {
     return false;
   }
 
@@ -847,7 +881,8 @@ bool try_eval_f32_unary_with_staging_vulkan(
   copy_gpu(in, in_f32, CopyType::General, s);
   in = in_f32;
 
-  array out_target = out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {});
+  array out_target =
+      out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {});
   if (!is_supported_generic_unary_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
@@ -856,7 +891,7 @@ bool try_eval_f32_unary_with_staging_vulkan(
       ? array(out_target.shape(), out_target.dtype(), nullptr, {})
       : out_target;
 
-   out_work.set_data(allocator::malloc(out_work.nbytes()));
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (!is_supported_generic_unary_layout(in) ||
       !is_supported_generic_unary_layout(out_work)) {
     return false;
@@ -998,12 +1033,13 @@ bool try_eval_dynamic_f32_unary_vulkan(
     in = contiguous_copy_gpu(in, s);
   }
 
-  array out_target = out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {});
-  const bool staged_output =
-      !out_target.flags().row_contiguous || out_target.offset() != 0 ||
-      !is_supported_unary_layout(out_target);
-  array out_work =
-      staged_output ? array(out_target.shape(), out_target.dtype(), nullptr, {}) : out_target;
+  array out_target =
+      out.dtype() == float32 ? out : array(out.shape(), float32, nullptr, {});
+  const bool staged_output = !out_target.flags().row_contiguous ||
+      out_target.offset() != 0 || !is_supported_unary_layout(out_target);
+  array out_work = staged_output
+      ? array(out_target.shape(), out_target.dtype(), nullptr, {})
+      : out_target;
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out_work)) {
     return false;
@@ -1019,7 +1055,8 @@ bool try_eval_dynamic_f32_unary_vulkan(
     return true;
   }
 
-  const auto in_offset = static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  const auto in_offset =
+      static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
   const auto out_offset =
       static_cast<uint64_t>(out_work.offset() / size_of(out_work.dtype()));
   const auto total = static_cast<uint64_t>(out_work.data_size());
@@ -1053,7 +1090,8 @@ bool try_eval_dynamic_f32_unary_vulkan(
       0,
       sizeof(PushConstants),
       &pc);
-  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
+  vkCmdDispatch(
+      dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
   vulkan::end_command_recording(s.index);
   if (staged_output) {
     copy_gpu(out_work, out_target, CopyType::General, s);
@@ -1230,24 +1268,26 @@ bool try_eval_unary_op_vulkan(
     return false;
   }
 
-  array in = inputs[0];
-  const bool complex_io = in.dtype() == complex64 && out.dtype() == complex64;
-  if ((!is_vulkan_float_dtype(in.dtype()) && !is_vulkan_integer_dtype(in.dtype()) &&
-       !complex_io) ||
-      in.dtype() != out.dtype()) {
+  const array* in = &inputs[0];
+  std::optional<array> in_storage;
+  const bool complex_io = in->dtype() == complex64 && out.dtype() == complex64;
+  if ((!is_vulkan_float_dtype(in->dtype()) &&
+       !is_vulkan_integer_dtype(in->dtype()) && !complex_io) ||
+      in->dtype() != out.dtype()) {
     return false;
   }
 
   const bool use_f32_staging_io =
-      !complex_io && (in.dtype() == bfloat16 || out.dtype() == bfloat16);
+      !complex_io && (in->dtype() == bfloat16 || out.dtype() == bfloat16);
   if (use_f32_staging_io) {
-    array in_f32(in.shape(), float32, nullptr, {});
-    copy_gpu(in, in_f32, CopyType::General, s);
-    in = in_f32;
+    in_storage.emplace(in->shape(), float32, nullptr, std::vector<array>{});
+    copy_gpu(*in, *in_storage, CopyType::General, s);
+    in = &*in_storage;
   }
 
-  if (!is_supported_generic_unary_layout(in)) {
-    in = contiguous_copy_gpu(in, s);
+  if (!is_supported_generic_unary_layout(*in)) {
+    in_storage = contiguous_copy_gpu(*in, s);
+    in = &*in_storage;
   }
 
   const bool staged_output =
@@ -1260,8 +1300,8 @@ bool try_eval_unary_op_vulkan(
             {})
       : out;
 
-  set_unary_output_data(in, out_work);
-  if (!is_supported_generic_unary_layout(in) ||
+  set_vulkan_unary_output_data<Primitive>(*in, out_work, s);
+  if (!is_supported_generic_unary_layout(*in) ||
       !is_supported_generic_unary_layout(out_work)) {
     return false;
   }
@@ -1273,7 +1313,7 @@ bool try_eval_unary_op_vulkan(
     return true;
   }
 
-  array in_kernel = in;
+  array in_kernel = *in;
   array out_kernel = out_work;
   if (in_kernel.ndim() > 4) {
     in_kernel = flatten_in_eval(in_kernel, 0, -1, s);
@@ -1285,13 +1325,7 @@ bool try_eval_unary_op_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_unary_op(
-        in_kernel,
-        out_kernel,
-        shader_id,
-        command_buffer,
-        s,
-        param1,
-        param2);
+        in_kernel, out_kernel, shader_id, command_buffer, s, param1, param2);
     vulkan::end_command_recording(s.index);
     if (staged_output || use_f32_staging_io) {
       copy_gpu(out_work, out, CopyType::General, s);
@@ -1339,24 +1373,26 @@ bool try_eval_generic_unary_op_vulkan(
     return false;
   }
 
-  array in = inputs[0];
-  const bool complex_io = in.dtype() == complex64 && out.dtype() == complex64;
-  if ((!is_vulkan_float_dtype(in.dtype()) && !is_vulkan_integer_dtype(in.dtype()) &&
-       !complex_io) ||
-      in.dtype() != out.dtype()) {
+  const array* in = &inputs[0];
+  std::optional<array> in_storage;
+  const bool complex_io = in->dtype() == complex64 && out.dtype() == complex64;
+  if ((!is_vulkan_float_dtype(in->dtype()) &&
+       !is_vulkan_integer_dtype(in->dtype()) && !complex_io) ||
+      in->dtype() != out.dtype()) {
     return false;
   }
 
   const bool use_f32_staging_io =
-      in.dtype() == bfloat16 || out.dtype() == bfloat16;
+      in->dtype() == bfloat16 || out.dtype() == bfloat16;
   if (use_f32_staging_io) {
-    array in_f32(in.shape(), float32, nullptr, {});
-    copy_gpu(in, in_f32, CopyType::General, s);
-    in = in_f32;
+    in_storage.emplace(in->shape(), float32, nullptr, std::vector<array>{});
+    copy_gpu(*in, *in_storage, CopyType::General, s);
+    in = &*in_storage;
   }
 
-  if (!is_supported_generic_unary_layout(in)) {
-    in = contiguous_copy_gpu(in, s);
+  if (!is_supported_generic_unary_layout(*in)) {
+    in_storage = contiguous_copy_gpu(*in, s);
+    in = &*in_storage;
   }
 
   const bool staged_output =
@@ -1369,8 +1405,8 @@ bool try_eval_generic_unary_op_vulkan(
             {})
       : out;
 
-  set_unary_output_data(in, out_work);
-  if (!is_supported_generic_unary_layout(in) ||
+  set_vulkan_unary_output_data<Primitive>(*in, out_work, s);
+  if (!is_supported_generic_unary_layout(*in) ||
       !is_supported_generic_unary_layout(out_work)) {
     return false;
   }
@@ -1385,7 +1421,7 @@ bool try_eval_generic_unary_op_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_generic_unary_op(
-        in,
+        *in,
         out_work,
         shader_id,
         command_buffer,
@@ -1502,7 +1538,11 @@ void Round::eval_gpu(const std::vector<array>& inputs, array& out) {
 VULKAN_GENERIC_UNARY_GPU(Sigmoid, GenericUnaryShaderOp::Sigmoid)
 void Tanh::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
-          inputs, out, "dynamic_tanh_c64", build_complex_tanh_shader(), stream())) {
+          inputs,
+          out,
+          "dynamic_tanh_c64",
+          build_complex_tanh_shader(),
+          stream())) {
     return;
   }
   eval_generic_unary_suffix_vulkan<Tanh>(
@@ -1519,7 +1559,11 @@ void Sign::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
   if (try_eval_complex_unary_shader_vulkan(
-          inputs, out, "dynamic_sign_c64", build_complex_sign_shader(), stream())) {
+          inputs,
+          out,
+          "dynamic_sign_c64",
+          build_complex_sign_shader(),
+          stream())) {
     return;
   }
   eval_generic_unary_suffix_vulkan<Sign>(
@@ -1529,7 +1573,11 @@ void Sign::eval_gpu(const std::vector<array>& inputs, array& out) {
 // Specialized unary ops
 void ArcCos::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
-          inputs, out, "dynamic_acos_c64", build_complex_acos_shader(), stream())) {
+          inputs,
+          out,
+          "dynamic_acos_c64",
+          build_complex_acos_shader(),
+          stream())) {
     return;
   }
   if (try_eval_dynamic_f32_unary_vulkan(
@@ -1567,7 +1615,11 @@ void Conjugate::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
-          inputs, out, "dynamic_cos_c64", build_complex_cos_shader(), stream())) {
+          inputs,
+          out,
+          "dynamic_cos_c64",
+          build_complex_cos_shader(),
+          stream())) {
     return;
   }
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
@@ -1605,7 +1657,11 @@ void ErfInv::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void Exp::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
-          inputs, out, "dynamic_exp_c64", build_complex_exp_shader(), stream())) {
+          inputs,
+          out,
+          "dynamic_exp_c64",
+          build_complex_exp_shader(),
+          stream())) {
     return;
   }
   eval_generic_unary_suffix_vulkan<Exp>(
@@ -1620,7 +1676,8 @@ void Expm1::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == complex64 && out.dtype() == complex64) {
+  if (inputs.size() == 1 && inputs[0].dtype() == complex64 &&
+      out.dtype() == complex64) {
     const char* shader_name = nullptr;
     std::string shader_source;
     switch (state()) {
@@ -1642,7 +1699,8 @@ void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  if (state() == Log::e && inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+  if (state() == Log::e && inputs.size() == 1 &&
+      inputs[0].dtype() == out.dtype()) {
     auto shader_id = unary_shader_id(UnaryShaderOp::Log, out.dtype());
     if (shader_id.has_value() &&
         try_eval_unary_op_vulkan<Log>(inputs, out, *shader_id, stream())) {
@@ -1678,7 +1736,11 @@ void Log1p::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
-          inputs, out, "dynamic_sin_c64", build_complex_sin_shader(), stream())) {
+          inputs,
+          out,
+          "dynamic_sin_c64",
+          build_complex_sin_shader(),
+          stream())) {
     return;
   }
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
@@ -1698,7 +1760,11 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void ArcSin::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
-          inputs, out, "dynamic_asin_c64", build_complex_asin_shader(), stream())) {
+          inputs,
+          out,
+          "dynamic_asin_c64",
+          build_complex_asin_shader(),
+          stream())) {
     return;
   }
   if (try_eval_dynamic_f32_unary_vulkan(
@@ -1711,7 +1777,11 @@ void ArcSin::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void ArcTan::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
-          inputs, out, "dynamic_atan_c64", build_complex_atan_shader(), stream())) {
+          inputs,
+          out,
+          "dynamic_atan_c64",
+          build_complex_atan_shader(),
+          stream())) {
     return;
   }
   if (try_eval_dynamic_f32_unary_vulkan(

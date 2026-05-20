@@ -2986,6 +2986,26 @@ void process_shaders() {
            {"INIT_VALUE", "0u"},
            {"REDUCE_MAX", "1"}}));
   string_to_spv(
+      "max_rows_u8",
+      "integer_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint8_t"},
+           {"D_TYPE", "uint8_t"},
+           {"ACC_TYPE", "uint"},
+           {"INIT_VALUE", "0u"},
+           {"REDUCE_MAX", "1"}}));
+  string_to_spv(
+      "max_rows_u16",
+      "integer_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"D_TYPE", "uint16_t"},
+           {"ACC_TYPE", "uint"},
+           {"INIT_VALUE", "0u"},
+           {"REDUCE_MAX", "1"}}));
+  string_to_spv(
       "max_rows_i32",
       "integer_rows.comp",
       merge_maps(
@@ -2994,6 +3014,26 @@ void process_shaders() {
            {"D_TYPE", "int"},
            {"ACC_TYPE", "int"},
            {"INIT_VALUE", "-2147483648"},
+           {"REDUCE_MAX", "1"}}));
+  string_to_spv(
+      "max_rows_i8",
+      "integer_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "int8_t"},
+           {"D_TYPE", "int8_t"},
+           {"ACC_TYPE", "int"},
+           {"INIT_VALUE", "-128"},
+           {"REDUCE_MAX", "1"}}));
+  string_to_spv(
+      "max_rows_i16",
+      "integer_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "int16_t"},
+           {"D_TYPE", "int16_t"},
+           {"ACC_TYPE", "int"},
+           {"INIT_VALUE", "-32768"},
            {"REDUCE_MAX", "1"}}));
   string_to_spv(
       "min_rows_u32",
@@ -3006,6 +3046,26 @@ void process_shaders() {
            {"INIT_VALUE", "0xffffffffu"},
            {"REDUCE_MIN", "1"}}));
   string_to_spv(
+      "min_rows_u8",
+      "integer_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint8_t"},
+           {"D_TYPE", "uint8_t"},
+           {"ACC_TYPE", "uint"},
+           {"INIT_VALUE", "0xffu"},
+           {"REDUCE_MIN", "1"}}));
+  string_to_spv(
+      "min_rows_u16",
+      "integer_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"D_TYPE", "uint16_t"},
+           {"ACC_TYPE", "uint"},
+           {"INIT_VALUE", "0xffffu"},
+           {"REDUCE_MIN", "1"}}));
+  string_to_spv(
       "min_rows_i32",
       "integer_rows.comp",
       merge_maps(
@@ -3014,6 +3074,26 @@ void process_shaders() {
            {"D_TYPE", "int"},
            {"ACC_TYPE", "int"},
            {"INIT_VALUE", "2147483647"},
+           {"REDUCE_MIN", "1"}}));
+  string_to_spv(
+      "min_rows_i8",
+      "integer_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "int8_t"},
+           {"D_TYPE", "int8_t"},
+           {"ACC_TYPE", "int"},
+           {"INIT_VALUE", "127"},
+           {"REDUCE_MIN", "1"}}));
+  string_to_spv(
+      "min_rows_i16",
+      "integer_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "int16_t"},
+           {"D_TYPE", "int16_t"},
+           {"ACC_TYPE", "int"},
+           {"INIT_VALUE", "32767"},
            {"REDUCE_MIN", "1"}}));
   string_to_spv("any_rows_u8", "any_rows.comp", base_dict);
   string_to_spv("all_rows_u8", "all_rows.comp", base_dict);

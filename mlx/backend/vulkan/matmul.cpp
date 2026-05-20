@@ -588,6 +588,16 @@ array cast_to_float16_scratch(const array& arr, Stream s, const char* lane) {
   return out;
 }
 
+array cast_to_float32_contiguous(const array& arr, Stream s) {
+  if (arr.dtype() == float32 && is_row_contiguous_zero_offset(arr)) {
+    return arr;
+  }
+  array out(arr.shape(), float32, nullptr, {});
+  out.set_data(allocator::malloc(out.nbytes()));
+  copy_gpu(arr, out, CopyType::General, s);
+  return out;
+}
+
 bool ensure_vulkan_buffer(array& arr, Stream s);
 
 bool try_eval_scores_v_matvec_vulkan(
@@ -2335,7 +2345,27 @@ bool try_eval_gather_mm_vulkan(
     const std::vector<array>& inputs,
     array& out,
     Stream s) {
-  return try_eval_gather_mm_vulkan_impl(inputs, out, s);
+  if (try_eval_gather_mm_vulkan_impl(inputs, out, s)) {
+    return true;
+  }
+  if (inputs.size() != 4 || !is_supported_matmul_dtype(inputs[0].dtype()) ||
+      !is_supported_matmul_dtype(inputs[1].dtype()) ||
+      !is_supported_matmul_dtype(out.dtype()) ||
+      (inputs[0].dtype() == float32 && inputs[1].dtype() == float32 &&
+       out.dtype() == float32)) {
+    return false;
+  }
+
+  array a_f32 = cast_to_float32_contiguous(inputs[0], s);
+  array b_f32 = cast_to_float32_contiguous(inputs[1], s);
+  array out_f32(out.shape(), float32, nullptr, {});
+  if (!try_eval_gather_mm_vulkan_impl(
+          {a_f32, b_f32, inputs[2], inputs[3]}, out_f32, s)) {
+    return false;
+  }
+  out.set_data(allocator::malloc(out.nbytes()));
+  copy_gpu(out_f32, out, CopyType::General, s);
+  return true;
 }
 
 void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {

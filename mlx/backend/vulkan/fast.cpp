@@ -140,8 +140,8 @@ std::string build_from_fp8_shader(Dtype out_dtype) {
     os << "}\n\n";
   }
   const char* out_type = out_dtype == float16 ? "float16_t"
-      : out_dtype == bfloat16              ? "uint16_t"
-                                            : "float";
+      : out_dtype == bfloat16                 ? "uint16_t"
+                                              : "float";
   os << R"(
 layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
 layout(set = 0, binding = 0) readonly buffer Input { uint8_t data[]; } in_buf;
@@ -152,8 +152,15 @@ layout(set = 0, binding = 0) readonly buffer Input { uint8_t data[]; } in_buf;
 
 float from_fp8_e4m3(uint8_t x8) {
   uint x = uint(x8);
-  uint bits = (x & 127u) << 7;
-  float outv = unpackHalf2x16(bits).x * 256.0;
+  uint exponent = (x >> 3u) & 15u;
+  uint mantissa = x & 7u;
+  float outv = 0.0;
+  if (exponent == 0u) {
+    outv = float(mantissa) * 0.001953125;
+  } else {
+    outv = exp2(float(int(exponent) - 7)) *
+        (1.0 + float(mantissa) * 0.125);
+  }
   return (x & 128u) != 0u ? -outv : outv;
 }
 
@@ -173,13 +180,19 @@ void main() {
   return os.str();
 }
 
-bool try_convert_fp8_f32_gpu(const array& input, array& out, bool to_fp8, Stream s) {
+bool try_convert_fp8_f32_gpu(
+    const array& input,
+    array& out,
+    bool to_fp8,
+    Stream s) {
   if (to_fp8) {
     if (input.dtype() != float32 || out.dtype() != uint8) {
       return false;
     }
-  } else if (input.dtype() != uint8 ||
-      (out.dtype() != float32 && out.dtype() != float16 && out.dtype() != bfloat16)) {
+  } else if (
+      input.dtype() != uint8 ||
+      (out.dtype() != float32 && out.dtype() != float16 &&
+       out.dtype() != bfloat16)) {
     return false;
   }
 
@@ -193,8 +206,10 @@ bool try_convert_fp8_f32_gpu(const array& input, array& out, bool to_fp8, Stream
     return true;
   }
 
-  const auto in_offset = static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
-  const auto out_offset = static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
+  const auto in_offset =
+      static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
   const auto total = static_cast<uint64_t>(out.data_size());
   if (in_offset > std::numeric_limits<uint32_t>::max() ||
       out_offset > std::numeric_limits<uint32_t>::max() ||
@@ -215,9 +230,9 @@ bool try_convert_fp8_f32_gpu(const array& input, array& out, bool to_fp8, Stream
 
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       to_fp8 ? "dynamic_to_fp8_f32"
-             : (out.dtype() == bfloat16 ? "dynamic_from_fp8_bf16"
-                  : out.dtype() == float16 ? "dynamic_from_fp8_f16"
-                                           : "dynamic_from_fp8_f32"),
+             : (out.dtype() == bfloat16      ? "dynamic_from_fp8_bf16"
+                    : out.dtype() == float16 ? "dynamic_from_fp8_f16"
+                                             : "dynamic_from_fp8_f32"),
       to_fp8 ? build_to_fp8_f32_shader() : build_from_fp8_shader(out.dtype()),
       2,
       arrays,
@@ -230,7 +245,8 @@ bool try_convert_fp8_f32_gpu(const array& input, array& out, bool to_fp8, Stream
       0,
       sizeof(PushConstants),
       &pc);
-  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
+  vkCmdDispatch(
+      dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
   vulkan::end_command_recording(s.index);
   return true;
 }
@@ -348,8 +364,7 @@ array cast_flash_attention_kv_to_f16(
 array cast_flash_attention_mask_to_f16(const array& x, Stream s) {
   auto data = x.data_shared_ptr();
   if (x.dtype() == float16 && x.offset() == 0 && x.strides().back() == 1 &&
-      data != nullptr &&
-      data->buffer.ptr() != nullptr) {
+      data != nullptr && data->buffer.ptr() != nullptr) {
     return x;
   }
   array out = vulkan::acquire_scratch_array(
@@ -715,8 +730,9 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
       ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
       : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
 
-  if (!use_native_bf16_kv && q_len <= 8u && qk_ratio > 1u && qk_ratio <= tuning.block_rows &&
-      qk_ratio * kv_heads == q_heads && mask_heads <= 1u) {
+  if (!use_native_bf16_kv && q_len <= 8u && qk_ratio > 1u &&
+      qk_ratio <= tuning.block_rows && qk_ratio * kv_heads == q_heads &&
+      mask_heads <= 1u) {
     gqa_ratio = qk_ratio;
     n_rows = gqa_ratio;
     workgroups_y /= gqa_ratio;
@@ -745,8 +761,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
   }
 
   const uint32_t tr = (n_rows + tuning.block_rows - 1u) / tuning.block_rows;
-  const uint32_t total_wgs_no_split =
-      std::max(tr * workgroups_y * batch, 1u);
+  const uint32_t total_wgs_no_split = std::max(tr * workgroups_y * batch, 1u);
   uint32_t shader_core_count = vulkan::VulkanContext::get().shader_core_count();
   if (shader_core_count == 0u) {
     shader_core_count = 16u;
@@ -869,7 +884,8 @@ bool try_dispatch_flash_attention_native_vulkan(
       batch,
       has_mask,
       do_causal,
-      has_mask ? checked_u32_size((*mask).shape(1), "flash_attn mask_heads") : 1u,
+      has_mask ? checked_u32_size((*mask).shape(1), "flash_attn mask_heads")
+               : 1u,
       use_native_bf16_kv,
       q_stride,
       k_stride,
@@ -1162,8 +1178,8 @@ bool try_eval_flash_attention_vulkan(
   auto ensure_flash_attention_kv_layout = [&](array x) {
     auto data = x.data_shared_ptr();
     if (data == nullptr || data->buffer.ptr() == nullptr ||
-        !x.flags().row_contiguous ||
-        x.strides().back() != 1 || x.offset() != 0) {
+        !x.flags().row_contiguous || x.strides().back() != 1 ||
+        x.offset() != 0) {
       x = contiguous_copy_gpu(x, s);
     }
     return x;
@@ -1441,10 +1457,7 @@ array apply_sdpa_mask_vulkan(
     Stream s) {
   if (is_bool_mask) {
     scores = where(
-        mask,
-        scores,
-        array(finfo(scores.dtype()).min, scores.dtype()),
-        s);
+        mask, scores, array(finfo(scores.dtype()).min, scores.dtype()), s);
     scores = ensure_sdpa_rowwise_layout(scores, s);
     scores.set_status(array::Status::evaluated);
     return scores;
@@ -1470,11 +1483,7 @@ void eval_sdpa_binary_vulkan(
   out.set_data(allocator::malloc(out.nbytes()));
   const std::vector<array> tracked_inputs = {lhs, rhs};
   const std::vector<array> tracked_outputs = {out};
-  begin_tracked_manual_op(
-      s,
-      "sdpa.binary",
-      tracked_inputs,
-      tracked_outputs);
+  begin_tracked_manual_op(s, "sdpa.binary", tracked_inputs, tracked_outputs);
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_binary_op(
@@ -1558,21 +1567,19 @@ void eval_sdpa_scale_vulkan(
 void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
   const bool use_f16_variant = in.dtype() == float16 && out.dtype() == float16;
   if (!(use_f16_variant || (in.dtype() == float32 && out.dtype() == float32))) {
-    throw std::runtime_error("SDPA softmax requires float16 or float32 tensors.");
+    throw std::runtime_error(
+        "SDPA softmax requires float16 or float32 tensors.");
   }
 
   array in_work = use_f16_variant ? cast_to_f32_sdpa(in, s) : in;
-  array out_work = use_f16_variant ? array(out.shape(), float32, nullptr, {}) : out;
+  array out_work =
+      use_f16_variant ? array(out.shape(), float32, nullptr, {}) : out;
 
   in_work = ensure_sdpa_rowwise_layout(in_work, s);
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   const std::vector<array> tracked_inputs = {in_work};
   const std::vector<array> tracked_outputs = {out_work};
-  begin_tracked_manual_op(
-      s,
-      "sdpa.softmax",
-      tracked_inputs,
-      tracked_outputs);
+  begin_tracked_manual_op(s, "sdpa.softmax", tracked_inputs, tracked_outputs);
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
@@ -1616,11 +1623,7 @@ void eval_sdpa_logsumexp_vulkan(array in, array& out, Stream s) {
   out.set_data(allocator::malloc(out.nbytes()));
   const std::vector<array> tracked_inputs = {in};
   const std::vector<array> tracked_outputs = {out};
-  begin_tracked_manual_op(
-      s,
-      "sdpa.logsumexp",
-      tracked_inputs,
-      tracked_outputs);
+  begin_tracked_manual_op(s, "sdpa.logsumexp", tracked_inputs, tracked_outputs);
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_sum_rows_op(
@@ -1641,10 +1644,7 @@ void eval_sdpa_softmax_back_vulkan(array grad, array y, array& out, Stream s) {
   const std::vector<array> tracked_inputs = {grad, y};
   const std::vector<array> tracked_outputs = {out};
   begin_tracked_manual_op(
-      s,
-      "sdpa.softmax_back",
-      tracked_inputs,
-      tracked_outputs);
+      s, "sdpa.softmax_back", tracked_inputs, tracked_outputs);
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_softmax_back_op(
@@ -1669,10 +1669,7 @@ void eval_sdpa_repeat_back_vulkan(array in, array& out, Stream s) {
   const std::vector<array> tracked_inputs = {in};
   const std::vector<array> tracked_outputs = {out};
   begin_tracked_manual_op(
-      s,
-      "sdpa.repeat_back",
-      tracked_inputs,
-      tracked_outputs);
+      s, "sdpa.repeat_back", tracked_inputs, tracked_outputs);
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_unary_op(
@@ -1691,11 +1688,7 @@ void eval_sdpa_sum_rows_vulkan(array in, array& out, Stream s) {
   out.set_data(allocator::malloc(out.nbytes()));
   const std::vector<array> tracked_inputs = {in};
   const std::vector<array> tracked_outputs = {out};
-  begin_tracked_manual_op(
-      s,
-      "sdpa.sum_rows",
-      tracked_inputs,
-      tracked_outputs);
+  begin_tracked_manual_op(s, "sdpa.sum_rows", tracked_inputs, tracked_outputs);
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_sum_rows_op(
@@ -1743,18 +1736,15 @@ void eval_sdpa_matmul_vulkan(
     a_work = collapse_sdpa_matmul_view(a_work);
     b_work = collapse_sdpa_matmul_view(b_work);
     out_work = collapse_sdpa_matmul_view(out_work);
-  } else if (out_work.data_shared_ptr() == nullptr ||
-             out_work.data_shared_ptr()->buffer.ptr() == nullptr) {
+  } else if (
+      out_work.data_shared_ptr() == nullptr ||
+      out_work.data_shared_ptr()->buffer.ptr() == nullptr) {
     out_work.set_data(allocator::malloc(out_work.nbytes()));
   }
 
   const std::vector<array> tracked_inputs = {a_work, b_work};
   const std::vector<array> tracked_outputs = {out_work};
-  begin_tracked_manual_op(
-      s,
-      "sdpa.matmul",
-      tracked_inputs,
-      tracked_outputs);
+  begin_tracked_manual_op(s, "sdpa.matmul", tracked_inputs, tracked_outputs);
   try {
     if (!try_eval_matmul_vulkan({a_work, b_work}, out_work, s)) {
       throw std::runtime_error(
@@ -2008,9 +1998,9 @@ bool try_eval_sdpa_heads_vulkan(
     // Prefill (or non-decode) path: original broadcast + materialize logic
     // ==========================================================================
 
-    const bool use_precise_masked_gqa_path =
-        logsumexp_out == nullptr && has_arr_mask && !has_bool_mask &&
-        !do_causal && n_repeats > 1 && q_len > 1;
+    const bool use_precise_masked_gqa_path = logsumexp_out == nullptr &&
+        has_arr_mask && !has_bool_mask && !do_causal && n_repeats > 1 &&
+        q_len > 1;
     if (use_precise_masked_gqa_path) {
       // Additive-mask GQA is more reliable when we reuse the primitive op
       // sequence directly instead of the flattened manual helper path.
@@ -2038,14 +2028,15 @@ bool try_eval_sdpa_heads_vulkan(
       scores = add(scores, mask, s);
       scores = softmax(scores, std::vector<int>{-1}, true, s);
 
-      copy_gpu(flatten(matmul(scores, v, s), 1, 2, s), out, CopyType::General, s);
+      copy_gpu(
+          flatten(matmul(scores, v, s), 1, 2, s), out, CopyType::General, s);
       out.set_status(array::Status::evaluated);
       return true;
     }
 
-    const bool use_lowp_path =
-        logsumexp_out == nullptr && q_in.dtype() == float16 &&
-        k_in.dtype() == float16 && v_in.dtype() == float16 &&
+    const bool use_lowp_path = logsumexp_out == nullptr &&
+        q_in.dtype() == float16 && k_in.dtype() == float16 &&
+        v_in.dtype() == float16 &&
         !(has_arr_mask && n_repeats > 1 && kv_len >= 8192);
     const Dtype compute_dtype = use_lowp_path ? float16 : float32;
 
@@ -2118,8 +2109,8 @@ bool try_eval_sdpa_heads_vulkan(
     }
 
     stage = "softmax";
-      array probs(scores.shape(), compute_dtype, nullptr, {});
-      eval_sdpa_softmax_vulkan(scores, probs, s);
+    array probs(scores.shape(), compute_dtype, nullptr, {});
+    eval_sdpa_softmax_vulkan(scores, probs, s);
 
     stage = "prepare_v";
     array v_work = broadcast_to(
@@ -2521,10 +2512,7 @@ bool ScaledDotProductAttention::use_fallback(
             << " lowp_causal_gqa_prefill=" << lowp_causal_gqa_prefill
             << " lowp_decode_mha=" << lowp_decode_mha;
     trace_use_fallback(
-        "ScaledDotProductAttention",
-        s,
-        "low_precision_guard",
-        details.str());
+        "ScaledDotProductAttention", s, "low_precision_guard", details.str());
     return true;
   }
   return false;
@@ -2571,9 +2559,8 @@ void ScaledDotProductAttention::eval_gpu(
   }
 
   auto s = stream();
-  array* logsumexp_out = output_logsumexp_ && outputs.size() > 1
-      ? &outputs[1]
-      : nullptr;
+  array* logsumexp_out =
+      output_logsumexp_ && outputs.size() > 1 ? &outputs[1] : nullptr;
 
   if (!output_logsumexp_ &&
       try_eval_flash_attention_vulkan(
@@ -2629,10 +2616,7 @@ void ScaledDotProductAttention::eval_gpu(
     }
     if (has_bool_mask) {
       scores = where(
-          mask,
-          scores,
-          array(finfo(scores.dtype()).min, scores.dtype()),
-          s);
+          mask, scores, array(finfo(scores.dtype()).min, scores.dtype()), s);
     } else if (mask.dtype() != scores.dtype()) {
       mask = astype(mask, scores.dtype(), s);
       scores = add(scores, mask, s);
@@ -2981,7 +2965,8 @@ void RMSNormVJP::eval_gpu(
       checked_u32_size(x.shape(x.ndim() - 1), "rms_norm_vjp axis_size");
   if (axis_size == 0 || axis_size > 32u * 512u || x.dtype() != float32 ||
       wg.dtype() != float32 || gx.dtype() != float32) {
-    throw std::runtime_error("RMSNormVJP unsupported dtype or shape on Vulkan.");
+    throw std::runtime_error(
+        "RMSNormVJP unsupported dtype or shape on Vulkan.");
   }
   const uint32_t nrows = checked_u32_size(
       x.data_size() / x.shape(x.ndim() - 1), "rms_norm_vjp nrows");
@@ -3008,8 +2993,8 @@ void RMSNormVJP::eval_gpu(
   array mean_x2 = multiply(sum(square(x, s), -1, true, s), norm, s);
   array scale = rsqrt(add(mean_x2, array(eps_, x.dtype()), s), s);
 
-  array gw_tmp = has_w ? multiply(g, multiply(x, scale, s), s)
-                       : zeros_like(w, s);
+  array gw_tmp =
+      has_w ? multiply(g, multiply(x, scale, s), s) : zeros_like(w, s);
   if (has_w) {
     std::vector<int> axes(g.ndim() - 1);
     std::iota(axes.begin(), axes.end(), 0);
@@ -3024,7 +3009,8 @@ void ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   if (inputs.size() != 1 || outputs.size() != 1) {
-    throw std::runtime_error("[ConvertFP8::eval_gpu] Expected one input and one output.");
+    throw std::runtime_error(
+        "[ConvertFP8::eval_gpu] Expected one input and one output.");
   }
 
   if (try_convert_fp8_f32_gpu(inputs[0], outputs[0], to_fp8_, stream())) {
@@ -3064,7 +3050,8 @@ void ConvertFP8::eval_gpu(
         return;
       }
       default:
-        throw std::runtime_error("[ConvertFP8::eval_gpu] Unsupported input dtype.");
+        throw std::runtime_error(
+            "[ConvertFP8::eval_gpu] Unsupported input dtype.");
     }
   }
 
@@ -3092,7 +3079,8 @@ void ConvertFP8::eval_gpu(
       return;
     }
     default:
-      throw std::runtime_error("[ConvertFP8::eval_gpu] Unsupported output dtype.");
+      throw std::runtime_error(
+          "[ConvertFP8::eval_gpu] Unsupported output dtype.");
   }
 }
 
@@ -3109,7 +3097,8 @@ void Quantize::eval_gpu(
 
   if (dequantize_) {
     if (mode_ != QuantizationMode::Affine) {
-      if ((mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Mxfp8) &&
+      if ((mode_ == QuantizationMode::Mxfp4 ||
+           mode_ == QuantizationMode::Mxfp8) &&
           inputs.size() == 2 && outputs.size() == 1) {
         auto& out = outputs[0];
         array out_f32(out.shape(), float32, nullptr, {});
@@ -3180,8 +3169,14 @@ void Quantize::eval_gpu(
     copy_gpu(out_f32, out, CopyType::General, s);
   } else {
     if (mode_ != QuantizationMode::Affine) {
-      if (mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Mxfp8) {
-        copy_fallback_outputs(fallback_(inputs));
+      if (mode_ == QuantizationMode::Mxfp4 ||
+          mode_ == QuantizationMode::Mxfp8) {
+        auto& s = stream();
+        std::vector<array> fallback_inputs = inputs;
+        if (fallback_inputs[0].dtype() != float32) {
+          fallback_inputs[0] = astype(fallback_inputs[0], float32, s);
+        }
+        copy_fallback_outputs(fallback_(fallback_inputs));
         return;
       }
       if (mode_ == QuantizationMode::Nvfp4 &&

@@ -302,9 +302,17 @@ layout(set = 0, binding = 1) readonly buffer Scales { uint8_t data[]; } scale_bu
 layout(set = 0, binding = 2) buffer Output { float data[]; } out_buf;
 
 float fp8_e4m3_to_fp32(uint8_t x) {
-  uint bits = uint(x & uint8_t(127)) << 7;
-  float result = uintBitsToFloat(bits << 16) * 256.0;
-  return (x & uint8_t(128)) != uint8_t(0) ? -result : result;
+  uint ux = uint(x);
+  uint exponent = (ux >> 3u) & 15u;
+  uint mantissa = ux & 7u;
+  float result = 0.0;
+  if (exponent == 0u) {
+    result = float(mantissa) * 0.001953125;
+  } else {
+    result = exp2(float(int(exponent) - 7)) *
+        (1.0 + float(mantissa) * 0.125);
+  }
+  return (ux & 128u) != 0u ? -result : result;
 }
 
 float e8m0_to_fp32(uint8_t x) {
@@ -969,9 +977,44 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     global_scale_w = inputs[4];
   }
 
+  if (mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Mxfp8) {
+    array x_f32 = ensure_float32_row_contiguous(inputs[0], s);
+    auto x_q = quantize(x_f32, group_size_, bits_, mode, std::nullopt, s);
+    array xhat = dequantize(
+        x_q[0],
+        x_q[1],
+        std::nullopt,
+        group_size_,
+        bits_,
+        mode,
+        std::nullopt,
+        float32,
+        s);
+
+    array what(
+        expanded_quantized_shape(inputs[1], bits_), float32, nullptr, {});
+    if (!vulkan::fp_dequantize_to_float32(
+            inputs[1], inputs[2], what, s, group_size_, bits_)) {
+      throw std::runtime_error(
+          "[QQMatmul::eval_gpu] Failed to dequantize rhs on Vulkan.");
+    }
+
+    array rhs =
+        ensure_row_contiguous_zero_offset(swapaxes_in_eval(what, -1, -2), s);
+    array result(out.shape(), float32, nullptr, {});
+    if (!try_eval_matmul_vulkan({xhat, rhs}, result, s)) {
+      throw std::runtime_error(
+          "[QQMatmul::eval_gpu] Failed to dispatch Vulkan fallback matmul.");
+    }
+
+    out.set_data(allocator::malloc(out.nbytes()));
+    copy_gpu(result, out, CopyType::General, s);
+    return;
+  }
+
   if (mode_ != QuantizationMode::Nvfp4) {
     throw std::runtime_error(
-        "[QQMatmul::eval_gpu] Only nvfp4 mode is implemented on Vulkan.");
+        "[QQMatmul::eval_gpu] Only nvfp4, mxfp4, and mxfp8 modes are implemented on Vulkan.");
   }
 
   if (fused_nvfp4_qqmm_enabled() && inputs[0].ndim() == 2 &&
@@ -1075,10 +1118,6 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (mode_ != QuantizationMode::Affine) {
-    throw std::runtime_error(
-        "[GatherQMM::eval_gpu] Only affine mode is implemented on Vulkan.");
-  }
   if (!is_supported_quantized_bits(bits_)) {
     throw std::runtime_error(
         "[GatherQMM::eval_gpu] Unsupported quantization bits on Vulkan.");
@@ -1092,30 +1131,42 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto& s = stream();
   array x = ensure_row_contiguous_zero_offset(inputs[0], s);
-  const bool native_bf16 = x.dtype() == bfloat16 && out.dtype() == bfloat16 &&
-      inputs[2].dtype() == bfloat16 && inputs[3].dtype() == bfloat16;
+  const bool affine_mode = mode_ == QuantizationMode::Affine;
+  const bool native_bf16 = affine_mode && x.dtype() == bfloat16 &&
+      out.dtype() == bfloat16 && inputs[2].dtype() == bfloat16 &&
+      inputs[3].dtype() == bfloat16;
   if (x.dtype() == bfloat16 && !native_bf16) {
     x = ensure_float32_row_contiguous(x, s);
   }
   array w = ensure_row_contiguous_zero_offset(inputs[1], s);
-  array scales = native_bf16 ? ensure_row_contiguous_zero_offset(inputs[2], s)
-                             : ensure_float32_row_contiguous(inputs[2], s);
-  array biases = native_bf16 ? ensure_row_contiguous_zero_offset(inputs[3], s)
-                             : ensure_float32_row_contiguous(inputs[3], s);
+  array scales = affine_mode
+      ? (native_bf16 ? ensure_row_contiguous_zero_offset(inputs[2], s)
+                     : ensure_float32_row_contiguous(inputs[2], s))
+      : ensure_row_contiguous_zero_offset(inputs[2], s);
+  std::optional<array> biases = affine_mode
+      ? std::make_optional(
+            native_bf16 ? ensure_row_contiguous_zero_offset(inputs[3], s)
+                        : ensure_float32_row_contiguous(inputs[3], s))
+      : std::nullopt;
   array lhs_indices =
       ensure_row_contiguous_zero_offset(inputs[inputs.size() - 2], s);
   array rhs_indices =
       ensure_row_contiguous_zero_offset(inputs[inputs.size() - 1], s);
 
-  if (x.ndim() < 3 || w.ndim() < 3 || scales.ndim() < 3 || biases.ndim() < 3 ||
+  if (x.ndim() < 3 || w.ndim() < 3 || scales.ndim() < 3 ||
+      (affine_mode && biases->ndim() < 3) ||
       lhs_indices.shape() != rhs_indices.shape() ||
       out.ndim() != lhs_indices.ndim() + 2) {
     std::ostringstream msg;
     msg << "[GatherQMM::eval_gpu] Expected rank-compatible x/w/scales/biases, "
         << "matching indices, and output rank indices+2 but got x=" << x.shape()
-        << " w=" << w.shape() << " scales=" << scales.shape()
-        << " biases=" << biases.shape()
-        << " lhs_indices=" << lhs_indices.shape()
+        << " w=" << w.shape() << " scales=" << scales.shape() << " biases=";
+    if (biases.has_value()) {
+      msg << biases->shape();
+    } else {
+      msg << "none";
+    }
+    msg << " lhs_indices=" << lhs_indices.shape()
         << " rhs_indices=" << rhs_indices.shape() << " out=" << out.shape()
         << ".";
     throw std::runtime_error(msg.str());
@@ -1125,18 +1176,34 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         "[GatherQMM::eval_gpu] Expected uint32 gather indices.");
   }
 
-  if (!transpose_) {
+  if (!affine_mode || !transpose_) {
     array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
-    if (!vulkan::affine_dequantize_to_float32(
-            w, scales, biases, w_deq, s, group_size_, bits_)) {
+    if (affine_mode &&
+        !vulkan::affine_dequantize_to_float32(
+            w, scales, *biases, w_deq, s, group_size_, bits_)) {
       throw std::runtime_error(
           "[GatherQMM::eval_gpu] Failed to dequantize weights on Vulkan.");
     }
+    if (mode_ == QuantizationMode::Nvfp4 &&
+        !vulkan::nvfp4_dequantize_to_float32(
+            w, scales, std::nullopt, w_deq, s)) {
+      throw std::runtime_error(
+          "[GatherQMM::eval_gpu] Failed to dequantize FP weights on Vulkan.");
+    }
+    if ((mode_ == QuantizationMode::Mxfp4 ||
+         mode_ == QuantizationMode::Mxfp8) &&
+        !vulkan::fp_dequantize_to_float32(
+            w, scales, w_deq, s, group_size_, bits_)) {
+      throw std::runtime_error(
+          "[GatherQMM::eval_gpu] Failed to dequantize FP weights on Vulkan.");
+    }
 
+    array rhs_f32 = transpose_ ? swapaxes_in_eval(w_deq, -1, -2) : w_deq;
+    rhs_f32 = ensure_row_contiguous_zero_offset(rhs_f32, s);
     array result(out.shape(), float32, nullptr, {});
     if (!try_eval_gather_mm_vulkan(
             {ensure_float32_row_contiguous(x, s),
-             w_deq,
+             rhs_f32,
              lhs_indices,
              rhs_indices},
             result,
@@ -1206,8 +1273,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         static_cast<uint32_t>(scales.strides(-3));
     push_constants.scale_row_stride = static_cast<uint32_t>(scales.strides(-2));
     push_constants.bias_matrix_stride =
-        static_cast<uint32_t>(biases.strides(-3));
-    push_constants.bias_row_stride = static_cast<uint32_t>(biases.strides(-2));
+        static_cast<uint32_t>(biases->strides(-3));
+    push_constants.bias_row_stride = static_cast<uint32_t>(biases->strides(-2));
     push_constants.w_matrix_stride_bytes =
         static_cast<uint32_t>(w.strides(-3) * sizeof(uint32_t));
     push_constants.bits = static_cast<uint32_t>(bits_);
@@ -1218,7 +1285,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     vulkan::dispatch_gather_affine_matmul_op(
         w,
         scales,
-        biases,
+        *biases,
         x,
         lhs_indices,
         rhs_indices,

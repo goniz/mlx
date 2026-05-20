@@ -65,6 +65,15 @@ namespace mlx::core {
 
 namespace {
 
+template <typename Fn>
+array eval_with_optional_f32_promotion(array x, Stream s, Dtype out_dtype, Fn&& fn) {
+  if (out_dtype == float16 || out_dtype == bfloat16) {
+    auto y = fn(astype(x, float32, s), float32);
+    return astype(y, out_dtype, s);
+  }
+  return fn(std::move(x), out_dtype);
+}
+
 std::string build_hadamard_m_shader(int m) {
   auto matrices = hadamard_matrices();
   auto it = matrices.find(m);
@@ -2317,13 +2326,17 @@ void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 // CPU fallbacks for primitives not implemented on Vulkan
-NYI_OP(ArcCosh)
 void ArcSinh::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   auto s = stream();
-  auto x = inputs[0];
-  auto one = array(1.0f, out.dtype());
-  auto y = log(add(x, sqrt(add(multiply(x, x, s), one, s), s), s), s);
+  auto y = eval_with_optional_f32_promotion(
+      inputs[0],
+      s,
+      out.dtype(),
+      [&](array x, Dtype calc_dtype) {
+        auto one = array(1.0f, calc_dtype);
+        return log(add(x, sqrt(add(multiply(x, x, s), one, s), s), s), s);
+      });
   copy_gpu(y, out, CopyType::General, s);
 }
 NYI_OP(ArcTan2)

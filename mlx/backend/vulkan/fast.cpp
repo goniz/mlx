@@ -3099,8 +3099,30 @@ void ConvertFP8::eval_gpu(
 void Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  auto copy_fallback_outputs = [&](std::vector<array> fallback_outputs) {
+    auto& s = stream();
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      outputs[i].set_data(allocator::malloc(outputs[i].nbytes()));
+      copy_gpu(fallback_outputs[i], outputs[i], CopyType::General, s);
+    }
+  };
+
   if (dequantize_) {
     if (mode_ != QuantizationMode::Affine) {
+      if ((mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Mxfp8) &&
+          inputs.size() == 2 && outputs.size() == 1) {
+        auto& out = outputs[0];
+        array out_f32(out.shape(), float32, nullptr, {});
+        if (!vulkan::fp_dequantize_to_float32(
+                inputs[0], inputs[1], out_f32, stream(), group_size_, bits_)) {
+          throw std::runtime_error(
+              "[Quantize::eval_gpu] FP dequantize failed on Vulkan.");
+        }
+
+        out.set_data(allocator::malloc(out.nbytes()));
+        copy_gpu(out_f32, out, CopyType::General, stream());
+        return;
+      }
       if (mode_ == QuantizationMode::Nvfp4 &&
           (inputs.size() == 2 || inputs.size() == 3) && outputs.size() == 1) {
         auto& out = outputs[0];
@@ -3158,6 +3180,10 @@ void Quantize::eval_gpu(
     copy_gpu(out_f32, out, CopyType::General, s);
   } else {
     if (mode_ != QuantizationMode::Affine) {
+      if (mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Mxfp8) {
+        copy_fallback_outputs(fallback_(inputs));
+        return;
+      }
       if (mode_ == QuantizationMode::Nvfp4 &&
           (inputs.size() == 1 || inputs.size() == 2) && outputs.size() == 2) {
         auto& s = stream();

@@ -8,6 +8,7 @@
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/matmul.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
@@ -265,6 +266,122 @@ array nvfp4_quantize_dequantize(
   return reshape(dequant, in.shape(), s);
 }
 
+bool fp_dequantize_to_float32_fallback(
+    const array& w,
+    const array& scales,
+    array& out,
+    Stream s,
+    int group_size,
+    int bits) {
+  if (w.dtype() != uint32 || scales.dtype() != uint8 ||
+      out.dtype() != float32) {
+    return false;
+  }
+  if (group_size != 32 || (bits != 4 && bits != 8)) {
+    return false;
+  }
+
+  array w_work = ensure_row_contiguous_zero_offset(w, s);
+  array scales_work = ensure_row_contiguous_zero_offset(scales, s);
+  if (!is_row_contiguous_zero_offset(w_work) ||
+      !is_row_contiguous_zero_offset(scales_work)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(uint8, float32, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Packed { uint data[]; } packed_buf;
+layout(set = 0, binding = 1) readonly buffer Scales { uint8_t data[]; } scale_buf;
+layout(set = 0, binding = 2) buffer Output { float data[]; } out_buf;
+
+float fp8_e4m3_to_fp32(uint8_t x) {
+  uint bits = uint(x & uint8_t(127)) << 7;
+  float result = uintBitsToFloat(bits << 16) * 256.0;
+  return (x & uint8_t(128)) != uint8_t(0) ? -result : result;
+}
+
+float e8m0_to_fp32(uint8_t x) {
+  uint bits = x == uint8_t(0) ? 0x00400000u : (uint(x) << 23);
+  return uintBitsToFloat(bits);
+}
+
+float fp4_to_float(uint q) {
+  switch (q & 15u) {
+    case 0u: return 0.0;
+    case 1u: return 0.5;
+    case 2u: return 1.0;
+    case 3u: return 1.5;
+    case 4u: return 2.0;
+    case 5u: return 3.0;
+    case 6u: return 4.0;
+    case 7u: return 6.0;
+    case 8u: return -0.0;
+    case 9u: return -0.5;
+    case 10u: return -1.0;
+    case 11u: return -1.5;
+    case 12u: return -2.0;
+    case 13u: return -3.0;
+    case 14u: return -4.0;
+    default: return -6.0;
+  }
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  uint group_idx = idx / 32u;
+  float scale = e8m0_to_fp32(scale_buf.data[group_idx]);
+)";
+  if (bits == 4) {
+    os << R"(
+  uint packed = packed_buf.data[idx >> 3u];
+  uint shift = (idx & 7u) * 4u;
+  out_buf.data[idx] = fp4_to_float((packed >> shift) & 15u) * scale;
+}
+)";
+  } else {
+    os << R"(
+  uint packed = packed_buf.data[idx >> 2u];
+  uint shift = (idx & 3u) * 8u;
+  uint8_t q = uint8_t((packed >> shift) & 255u);
+  out_buf.data[idx] = fp8_e4m3_to_fp32(q) * scale;
+}
+)";
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&w_work, 0},
+      {&scales_work, 1},
+      {&out, 2},
+  };
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t);
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      bits == 4 ? "dynamic_mxfp4_dequant_f32" : "dynamic_mxfp8_dequant_f32",
+      os.str(),
+      3,
+      arrays,
+      kPushConstantSize,
+      s);
+  const uint32_t total_elements = static_cast<uint32_t>(out.size());
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &total_elements);
+  vkCmdDispatch(dispatch.command_buffer, (total_elements + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 } // namespace
 
 namespace vulkan {
@@ -418,6 +535,16 @@ bool nvfp4_dequantize_to_float32(
   return true;
 }
 
+bool fp_dequantize_to_float32(
+    const array& w,
+    const array& scales,
+    array& out,
+    Stream s,
+    int group_size,
+    int bits) {
+  return fp_dequantize_to_float32_fallback(w, scales, out, s, group_size, bits);
+}
+
 bool nvfp4_quantize_from_float32(
     const array& in,
     array& w,
@@ -469,13 +596,14 @@ bool nvfp4_quantize_from_float32(
 } // namespace vulkan
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (mode_ != QuantizationMode::Affine) {
+  if (mode_ == QuantizationMode::Affine) {
+    if (inputs.size() != 4) {
+      throw std::runtime_error(
+          "[QuantizedMatmul::eval_gpu] Expected x, w, scales, biases.");
+    }
+  } else if (inputs.size() != 3) {
     throw std::runtime_error(
-        "[QuantizedMatmul::eval_gpu] Only affine mode is implemented on Vulkan.");
-  }
-  if (inputs.size() != 4) {
-    throw std::runtime_error(
-        "[QuantizedMatmul::eval_gpu] Expected x, w, scales, biases.");
+        "[QuantizedMatmul::eval_gpu] Expected x, w, scales.");
   }
   if (!is_supported_quantized_bits(bits_)) {
     throw std::runtime_error(
@@ -506,8 +634,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   };
   array x = ensure_row_contiguous_zero_offset(inputs[0], s);
   array w = ensure_row_contiguous_zero_offset(inputs[1], s);
-  array scales = ensure_float32_row_contiguous(inputs[2], s);
-  array biases = ensure_float32_row_contiguous(inputs[3], s);
+  array scales = mode_ == QuantizationMode::Affine
+      ? ensure_float32_row_contiguous(inputs[2], s)
+      : inputs[2];
+  std::optional<array> biases = mode_ == QuantizationMode::Affine
+      ? std::make_optional(ensure_float32_row_contiguous(inputs[3], s))
+      : std::nullopt;
 
   const bool vector_lhs = x.ndim() == 1;
   const bool flatten_lhs_batches = x.ndim() > 2 && w.ndim() == 2;
@@ -535,10 +667,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return true;
   }();
 
-  if (enable_fused_decode_qmm && transpose_ && bits_ == 8 &&
-      x_mat.dtype() == bfloat16 && out.dtype() == bfloat16 &&
-      inputs[2].dtype() == bfloat16 && inputs[3].dtype() == bfloat16 &&
-      x_mat.ndim() == 2 && w.ndim() == 2) {
+  if (mode_ == QuantizationMode::Affine && enable_fused_decode_qmm &&
+      transpose_ && bits_ == 8 && x_mat.dtype() == bfloat16 &&
+      out.dtype() == bfloat16 && inputs[2].dtype() == bfloat16 &&
+      inputs[3].dtype() == bfloat16 && x_mat.ndim() == 2 && w.ndim() == 2) {
     array scales_bf16 = ensure_row_contiguous_zero_offset(inputs[2], s);
     array biases_bf16 = ensure_row_contiguous_zero_offset(inputs[3], s);
     if (scales_bf16.ndim() == 2 && biases_bf16.ndim() == 2 &&
@@ -657,12 +789,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       {});
 
   bool fused_dispatched = false;
-  if (enable_fused_decode_qmm && transpose_ && fused_shader.has_value() &&
-      x_mat.ndim() == 2 && w.ndim() == 2 && scales.ndim() == 2 &&
-      biases.ndim() == 2 && is_row_contiguous_zero_offset(x_mat) &&
+  if (mode_ == QuantizationMode::Affine && enable_fused_decode_qmm &&
+      transpose_ && fused_shader.has_value() && x_mat.ndim() == 2 &&
+      w.ndim() == 2 && scales.ndim() == 2 && biases->ndim() == 2 &&
+      is_row_contiguous_zero_offset(x_mat) &&
       is_row_contiguous_zero_offset(w) &&
       is_row_contiguous_zero_offset(scales) &&
-      is_row_contiguous_zero_offset(biases)) {
+      is_row_contiguous_zero_offset(*biases)) {
     const uint32_t rows = static_cast<uint32_t>(out_work.shape(-2));
     const uint32_t cols = static_cast<uint32_t>(out_work.shape(-1));
     const uint32_t k = static_cast<uint32_t>(x_mat.shape(-1));
@@ -692,7 +825,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.scale_row_stride =
               static_cast<uint32_t>(scales.strides(-2));
           push_constants.bias_row_stride =
-              static_cast<uint32_t>(biases.strides(-2));
+              static_cast<uint32_t>(biases->strides(-2));
           push_constants.bits = static_cast<uint32_t>(bits_);
           push_constants.group_size = static_cast<uint32_t>(group_size_);
           push_constants.num_groups = num_groups;
@@ -707,7 +840,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           vulkan::dispatch_fused_affine_matmul_op(
               w,
               scales,
-              biases,
+              *biases,
               x_mat,
               out_work,
               *fused_shader,
@@ -730,10 +863,24 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!fused_dispatched) {
     trace_qmm("dequant_fallback", "reason=fused_conditions_not_met");
     array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
-    if (!vulkan::affine_dequantize_to_float32(
-            w, scales, biases, w_deq, s, group_size_, bits_)) {
+    if (mode_ == QuantizationMode::Affine &&
+        !vulkan::affine_dequantize_to_float32(
+            w, scales, *biases, w_deq, s, group_size_, bits_)) {
       throw std::runtime_error(
           "[QuantizedMatmul::eval_gpu] Failed to dequantize weights on Vulkan.");
+    }
+    if (mode_ == QuantizationMode::Nvfp4 &&
+        !vulkan::nvfp4_dequantize_to_float32(
+            w, inputs[2], std::nullopt, w_deq, s)) {
+      throw std::runtime_error(
+          "[QuantizedMatmul::eval_gpu] Failed to dequantize FP weights on Vulkan.");
+    }
+    if ((mode_ == QuantizationMode::Mxfp4 ||
+         mode_ == QuantizationMode::Mxfp8) &&
+        !vulkan::fp_dequantize_to_float32(
+            w, inputs[2], w_deq, s, group_size_, bits_)) {
+      throw std::runtime_error(
+          "[QuantizedMatmul::eval_gpu] Failed to dequantize FP weights on Vulkan.");
     }
 
     array rhs_f32 = transpose_ ? swapaxes_in_eval(w_deq, -1, -2) : w_deq;
@@ -932,10 +1079,6 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     throw std::runtime_error(
         "[GatherQMM::eval_gpu] Only affine mode is implemented on Vulkan.");
   }
-  if (!transpose_) {
-    throw std::runtime_error(
-        "[GatherQMM::eval_gpu] Only transposed weights are implemented on Vulkan.");
-  }
   if (!is_supported_quantized_bits(bits_)) {
     throw std::runtime_error(
         "[GatherQMM::eval_gpu] Unsupported quantization bits on Vulkan.");
@@ -964,8 +1107,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   array rhs_indices =
       ensure_row_contiguous_zero_offset(inputs[inputs.size() - 1], s);
 
-  if (x.ndim() < 3 || w.ndim() != 3 || scales.ndim() != 3 ||
-      biases.ndim() != 3 || lhs_indices.shape() != rhs_indices.shape() ||
+  if (x.ndim() < 3 || w.ndim() < 3 || scales.ndim() < 3 || biases.ndim() < 3 ||
+      lhs_indices.shape() != rhs_indices.shape() ||
       out.ndim() != lhs_indices.ndim() + 2) {
     std::ostringstream msg;
     msg << "[GatherQMM::eval_gpu] Expected rank-compatible x/w/scales/biases, "
@@ -980,6 +1123,30 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (lhs_indices.dtype() != uint32 || rhs_indices.dtype() != uint32) {
     throw std::runtime_error(
         "[GatherQMM::eval_gpu] Expected uint32 gather indices.");
+  }
+
+  if (!transpose_) {
+    array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
+    if (!vulkan::affine_dequantize_to_float32(
+            w, scales, biases, w_deq, s, group_size_, bits_)) {
+      throw std::runtime_error(
+          "[GatherQMM::eval_gpu] Failed to dequantize weights on Vulkan.");
+    }
+
+    array result(out.shape(), float32, nullptr, {});
+    if (!try_eval_gather_mm_vulkan(
+            {ensure_float32_row_contiguous(x, s),
+             w_deq,
+             lhs_indices,
+             rhs_indices},
+            result,
+            s)) {
+      throw std::runtime_error(
+          "[GatherQMM::eval_gpu] Failed to dispatch Vulkan gather matmul.");
+    }
+    out.set_data(allocator::malloc(out.nbytes()));
+    copy_gpu(result, out, CopyType::General, s);
+    return;
   }
 
   const uint32_t batches = static_cast<uint32_t>(lhs_indices.size());
@@ -1036,13 +1203,13 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     push_constants.out_batch_stride = rows * cols;
     push_constants.out_row_stride = static_cast<uint32_t>(out_work.strides(-2));
     push_constants.scale_matrix_stride =
-        static_cast<uint32_t>(scales.strides(0));
+        static_cast<uint32_t>(scales.strides(-3));
     push_constants.scale_row_stride = static_cast<uint32_t>(scales.strides(-2));
     push_constants.bias_matrix_stride =
-        static_cast<uint32_t>(biases.strides(0));
+        static_cast<uint32_t>(biases.strides(-3));
     push_constants.bias_row_stride = static_cast<uint32_t>(biases.strides(-2));
     push_constants.w_matrix_stride_bytes =
-        static_cast<uint32_t>(w.strides(0) * sizeof(uint32_t));
+        static_cast<uint32_t>(w.strides(-3) * sizeof(uint32_t));
     push_constants.bits = static_cast<uint32_t>(bits_);
     push_constants.group_size = static_cast<uint32_t>(group_size_);
     push_constants.num_groups = num_groups;

@@ -1567,7 +1567,7 @@ build_gather_mm_f32_shader(int index_ndim, int a_batch_ndim, int b_batch_ndim) {
   return os.str();
 }
 
-bool try_eval_gather_mm_vulkan(
+bool try_eval_gather_mm_vulkan_impl(
     const std::vector<array>& inputs,
     array& out,
     Stream s) {
@@ -2329,6 +2329,13 @@ bool try_eval_matmul_vulkan(
     array& out,
     Stream s) {
   return try_eval_matmul_vulkan_impl(inputs, out, s, nullptr);
+}
+
+bool try_eval_gather_mm_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  return try_eval_gather_mm_vulkan_impl(inputs, out, s);
 }
 
 void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {

@@ -31,6 +31,14 @@ bool nvfp4_dequantize_to_float32(
     array& out,
     Stream s);
 
+bool fp_dequantize_to_float32(
+    const array& w,
+    const array& scales,
+    array& out,
+    Stream s,
+    int group_size,
+    int bits);
+
 bool nvfp4_quantize_from_float32(
     const array& in,
     array& w,

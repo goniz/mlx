@@ -145,7 +145,7 @@ void soft_max(uint num_iters) {
 
     max_val = reduce_max(max_val, tid);
 
-    if (isinf(max_val) && max_val < FLOAT_TYPE(0.0f)) {
+    if (p.KY > 0 && isinf(max_val) && max_val < FLOAT_TYPE(0.0f)) {
         [[unroll]] for (uint col0 = 0; col0 < num_iters * BLOCK_SIZE; col0 += BLOCK_SIZE) {
             const uint col = col0 + tid;
             if (col < p.KX) {

@@ -208,6 +208,127 @@ void main() {
   return os.str();
 }
 
+std::string build_complex_log_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input {vec2 data[];} in_buf;
+layout(set = 0, binding = 1) buffer Output {vec2 data[];} out_buf;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  vec2 z = in_buf.data[idx + pc.in_offset];
+  out_buf.data[idx + pc.out_offset] = vec2(log(length(z)), atan(z.y, z.x));
+}
+)";
+  return os.str();
+}
+
+std::string build_f32_unary_expr_shader(const char* expr) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(float32, float32, false);
+  os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer Input {float data[];} in_buf;\n";
+  os << "layout(set = 0, binding = 1) buffer Output {float data[];} out_buf;\n\n";
+  os << R"(
+float asin_poly(float x) {
+  float x2 = x * x;
+  return x + x * x2 * (0.16666666666666666 + x2 * (0.075 + x2 * (0.044642857142857144 + x2 * (0.030381944444444444 + x2 * 0.022372159090909092))));
+}
+float accurate_asin(float x) {
+  float ax = abs(x);
+  float r = ax > 0.5 ? 1.5707963267948966 - 2.0 * asin_poly(sqrt((1.0 - ax) * 0.5)) : asin_poly(ax);
+  return x < 0.0 ? -r : r;
+}
+float accurate_atan(float x) {
+  return accurate_asin(x / sqrt(1.0 + x * x));
+}
+)";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total_elements) return;\n";
+  os << "  float x = in_buf.data[idx + pc.in_offset];\n";
+  os << "  out_buf.data[idx + pc.out_offset] = " << expr << ";\n";
+  os << "}\n";
+  return os.str();
+}
+
+std::string build_complex_log_scaled_shader(const char* scale_expr) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input {vec2 data[];} in_buf;
+layout(set = 0, binding = 1) buffer Output {vec2 data[];} out_buf;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  vec2 z = in_buf.data[idx + pc.in_offset];
+  vec2 outv = vec2(log(length(z)), atan(z.y, z.x));
+  out_buf.data[idx + pc.out_offset] = outv * )" << scale_expr << R"(;
+}
+)";
+  return os.str();
+}
+
+std::string build_complex_log1p_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input {vec2 data[];} in_buf;
+layout(set = 0, binding = 1) buffer Output {vec2 data[];} out_buf;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  vec2 z = in_buf.data[idx + pc.in_offset] + vec2(1.0, 0.0);
+  out_buf.data[idx + pc.out_offset] = vec2(log(length(z)), atan(z.y, z.x));
+}
+)";
+  return os.str();
+}
+
+std::string build_complex_round_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input {vec2 data[];} in_buf;
+layout(set = 0, binding = 1) buffer Output {vec2 data[];} out_buf;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  vec2 z = in_buf.data[idx + pc.in_offset];
+  out_buf.data[idx + pc.out_offset] = vec2(roundEven(z.x), roundEven(z.y));
+}
+)";
+  return os.str();
+}
+
+std::string build_complex_sign_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input {vec2 data[];} in_buf;
+layout(set = 0, binding = 1) buffer Output {vec2 data[];} out_buf;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  vec2 z = in_buf.data[idx + pc.in_offset];
+  float mag = length(z);
+  out_buf.data[idx + pc.out_offset] = mag == 0.0 ? vec2(0.0, 0.0) : z / mag;
+}
+)";
+  return os.str();
+}
+
 std::string build_complex_sin_shader() {
   std::ostringstream os;
   os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
@@ -829,6 +950,61 @@ bool try_eval_complex_abs_vulkan(
   return true;
 }
 
+bool try_eval_dynamic_f32_unary_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    const char* shader_name,
+    const char* expr,
+    Stream s) {
+  if (inputs.size() != 1 || inputs[0].dtype() != float32 || out.dtype() != float32) {
+    return false;
+  }
+  array in = inputs[0];
+  if (!in.flags().row_contiguous || in.offset() != 0 ||
+      !is_supported_unary_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
+  }
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+  const auto in_offset = static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  const auto out_offset = static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
+  const auto total = static_cast<uint64_t>(out.data_size());
+  if (in_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out, 1}};
+  struct PushConstants {
+    uint32_t in_offset;
+    uint32_t out_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(in_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      shader_name,
+      build_f32_unary_expr_shader(expr),
+      2,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 bool try_eval_integer_sign_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -1247,7 +1423,23 @@ void Abs::eval_gpu(const std::vector<array>& inputs, array& out) {
 VULKAN_GENERIC_UNARY_GPU(Ceil, GenericUnaryShaderOp::Ceil)
 VULKAN_GENERIC_UNARY_GPU(Floor, GenericUnaryShaderOp::Floor)
 VULKAN_GENERIC_UNARY_GPU(Negative, GenericUnaryShaderOp::Negative)
-VULKAN_GENERIC_UNARY_GPU(Round, GenericUnaryShaderOp::Round)
+void Round::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype() &&
+      (issubdtype(inputs[0].dtype(), integer) || inputs[0].dtype() == bool_)) {
+    copy_gpu(inputs[0], out, CopyType::General, stream());
+    return;
+  }
+  if (try_eval_complex_unary_shader_vulkan(
+          inputs,
+          out,
+          "dynamic_round_c64",
+          build_complex_round_shader(),
+          stream())) {
+    return;
+  }
+  eval_generic_unary_suffix_vulkan<Round>(
+      inputs, out, GenericUnaryShaderOp::Round, stream());
+}
 VULKAN_GENERIC_UNARY_GPU(Sigmoid, GenericUnaryShaderOp::Sigmoid)
 VULKAN_GENERIC_UNARY_GPU(Tanh, GenericUnaryShaderOp::Tanh)
 
@@ -1260,6 +1452,10 @@ void Sign::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_integer_sign_vulkan(inputs, out, stream())) {
     return;
   }
+  if (try_eval_complex_unary_shader_vulkan(
+          inputs, out, "dynamic_sign_c64", build_complex_sign_shader(), stream())) {
+    return;
+  }
   eval_generic_unary_suffix_vulkan<Sign>(
       inputs, out, GenericUnaryShaderOp::Sign, stream());
 }
@@ -1268,6 +1464,14 @@ void Sign::eval_gpu(const std::vector<array>& inputs, array& out) {
 void ArcCos::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
           inputs, out, "dynamic_acos_c64", build_complex_acos_shader(), stream())) {
+    return;
+  }
+  if (try_eval_dynamic_f32_unary_vulkan(
+          inputs,
+          out,
+          "dynamic_acos_f32_v2",
+          "1.5707963267948966 - accurate_asin(x)",
+          stream())) {
     return;
   }
   throw std::runtime_error(
@@ -1341,6 +1545,28 @@ void Expm1::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == complex64 && out.dtype() == complex64) {
+    const char* shader_name = nullptr;
+    std::string shader_source;
+    switch (state()) {
+      case Log::e:
+        shader_name = "dynamic_log_c64";
+        shader_source = build_complex_log_shader();
+        break;
+      case Log::two:
+        shader_name = "dynamic_log2_c64";
+        shader_source = build_complex_log_scaled_shader("1.4426950408889634");
+        break;
+      case Log::ten:
+        shader_name = "dynamic_log10_c64";
+        shader_source = build_complex_log_scaled_shader("0.4342944819032518");
+        break;
+    }
+    if (try_eval_complex_unary_shader_vulkan(
+            inputs, out, shader_name, shader_source, stream())) {
+      return;
+    }
+  }
   if (state() == Log::e && inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
     auto shader_id = unary_shader_id(UnaryShaderOp::Log, out.dtype());
     if (shader_id.has_value() &&
@@ -1356,6 +1582,14 @@ void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void Log1p::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (try_eval_complex_unary_shader_vulkan(
+          inputs,
+          out,
+          "dynamic_log1p_c64",
+          build_complex_log1p_shader(),
+          stream())) {
+    return;
+  }
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
       out.dtype() == float32) {
     if (try_eval_unary_op_vulkan<Log1p>(
@@ -1392,6 +1626,10 @@ void ArcSin::eval_gpu(const std::vector<array>& inputs, array& out) {
           inputs, out, "dynamic_asin_c64", build_complex_asin_shader(), stream())) {
     return;
   }
+  if (try_eval_dynamic_f32_unary_vulkan(
+          inputs, out, "dynamic_asin_f32_v2", "accurate_asin(x)", stream())) {
+    return;
+  }
   throw std::runtime_error(
       "ArcSin operation failed on Vulkan (unsupported dtype or layout).");
 }
@@ -1399,6 +1637,10 @@ void ArcSin::eval_gpu(const std::vector<array>& inputs, array& out) {
 void ArcTan::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_complex_unary_shader_vulkan(
           inputs, out, "dynamic_atan_c64", build_complex_atan_shader(), stream())) {
+    return;
+  }
+  if (try_eval_dynamic_f32_unary_vulkan(
+          inputs, out, "dynamic_atan_f32_v2", "accurate_atan(x)", stream())) {
     return;
   }
   throw std::runtime_error(

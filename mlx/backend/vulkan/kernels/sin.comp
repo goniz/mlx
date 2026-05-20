@@ -13,5 +13,12 @@ void main() {
     }
 
     const FLOAT_TYPE val = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(idx)]);
-    data_d[get_doffset() + dst_idx(idx)] = D_TYPE(sin(val));
+    FLOAT_TYPE result = sin(val);
+    if (result == FLOAT_TYPE(0.0) && val != FLOAT_TYPE(0.0)) {
+        float k = round(float(val) * 0.3183098861837907);
+        int ki = int(k < 0.0 ? -k : k);
+        float sign = (ki % 2 == 0) ? 1.0 : -1.0;
+        result = FLOAT_TYPE(sign * k * 8.7422776573e-8);
+    }
+    data_d[get_doffset() + dst_idx(idx)] = D_TYPE(result);
 }

@@ -2,6 +2,7 @@
 
 #include "mlx/distributed/primitives.h"
 #include "mlx/backend/common/broadcasting.h"
+#include "mlx/backend/common/hadamard.h"
 #include "mlx/backend/common/slicing.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
@@ -12,6 +13,7 @@
 #include "mlx/backend/vulkan/shader_compiler.h"
 
 #include <algorithm>
+#include <sstream>
 #include <memory>
 #include <utility>
 
@@ -62,6 +64,130 @@ namespace mlx::core {
   }
 
 namespace {
+
+std::string build_hadamard_m_shader(int m) {
+  auto matrices = hadamard_matrices();
+  auto it = matrices.find(m);
+  if (it == matrices.end()) {
+    throw std::runtime_error("Unsupported Hadamard radix.");
+  }
+
+  std::vector<std::string> rows;
+  std::stringstream ss(std::string(it->second));
+  std::string row;
+  while (std::getline(ss, row)) {
+    if (!row.empty()) {
+      rows.push_back(row);
+    }
+  }
+
+  std::ostringstream os;
+  os << "#version 450\n";
+  os << "layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  os << "layout(push_constant) uniform PushConstants { uint total_rows; uint n; float scale; } pc;\n";
+  os << "layout(set = 0, binding = 0) buffer X { float data_x[]; };\n\n";
+  os << "void main() {\n";
+  os << "  uint row = gl_GlobalInvocationID.x;\n";
+  os << "  if (row >= pc.total_rows) return;\n";
+  os << "  uint batch = row / pc.n;\n";
+  os << "  uint col = row - batch * pc.n;\n";
+  os << "  uint base = batch * " << m << "u * pc.n + col;\n";
+  for (int i = 0; i < m; ++i) {
+    os << "  float x" << i << " = data_x[base + " << i << "u * pc.n];\n";
+  }
+  for (int r = 0; r < m; ++r) {
+    os << "  data_x[base + " << r << "u * pc.n] = pc.scale * (";
+    for (int c = 0; c < m; ++c) {
+      if (c > 0) {
+        os << (rows[r][c] == '+' ? " + " : " - ");
+      } else if (rows[r][c] == '-') {
+        os << "-";
+      }
+      os << "x" << c;
+    }
+    os << ");\n";
+  }
+  os << "}\n";
+  return os.str();
+}
+
+void hadamard_barrier(vk::CommandBuffer command_buffer) {
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(
+      command_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
+}
+
+std::string build_complex_real_key_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, float32, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input {vec2 data[];} in_buf;
+layout(set = 0, binding = 1) buffer Output {float data[];} out_buf;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  out_buf.data[idx + pc.out_offset] = in_buf.data[idx + pc.in_offset].x;
+}
+)";
+  return os.str();
+}
+
+void extract_complex_real_key_gpu(const array& in, array& out, Stream s) {
+  if (in.dtype() != complex64 || out.dtype() != float32 || in.size() != out.size()) {
+    throw std::runtime_error("Invalid complex sort key extraction.");
+  }
+
+  auto in_offset = static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  auto out_offset = static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
+  auto total = static_cast<uint64_t>(out.data_size());
+  if (in_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error("Complex sort key extraction size unsupported.");
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out, 1}};
+  struct PushConstants {
+    uint32_t in_offset;
+    uint32_t out_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(in_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_complex_real_key_c64_f32",
+      build_complex_real_key_shader(),
+      2,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+}
 
 template <const uint8_t scalar_size>
 void swap_endianness(uint8_t* data_bytes, size_t N) {
@@ -361,6 +487,17 @@ float safe_real_pow(float x, float y) {
   if (uses_complex_power) {
     os << "  vec2 base = a_buf.data[a_idx];\n";
     os << "  vec2 expv = b_buf.data[b_idx];\n";
+    os << "  if (base.x == 0.0 && base.y == 0.0) {\n";
+    os << "    if (isnan(expv.x) || isnan(expv.y)) {\n";
+    os << "      float nan_val = 0.0 / 0.0;\n";
+    os << "      out_buf.data[idx + pc.out_offset] = vec2(nan_val, nan_val);\n";
+    os << "    } else if (expv.x == 0.0 && expv.y == 0.0) {\n";
+    os << "      out_buf.data[idx + pc.out_offset] = vec2(1.0, 0.0);\n";
+    os << "    } else {\n";
+    os << "      out_buf.data[idx + pc.out_offset] = vec2(0.0, 0.0);\n";
+    os << "    }\n";
+    os << "    return;\n";
+    os << "  }\n";
     os << "  vec2 log_base = vec2(log(length(base)), atan(base.y, base.x));\n";
     os << "  vec2 z = vec2(expv.x * log_base.x - expv.y * log_base.y, expv.x * log_base.y + expv.y * log_base.x);\n";
     os << "  float exp_x = exp(z.x);\n";
@@ -492,11 +629,15 @@ std::string build_equal_shader(
     os << "  bool is_equal = (" << equal_input_expr(a_dtype, "a_buf", "a_idx")
        << ") == (" << equal_input_expr(b_dtype, "b_buf", "b_idx") << ")";
   }
-  if (equal_nan &&
-      (uses_bfloat16 || uses_float16 || a_dtype == float32 ||
-       b_dtype == float32)) {
-    os << " || (isnan(" << equal_input_expr(a_dtype, "a_buf", "a_idx")
-       << ") && isnan(" << equal_input_expr(b_dtype, "b_buf", "b_idx") << "))";
+  if (equal_nan) {
+    if (a_dtype == complex64 && b_dtype == complex64) {
+      os << " || (((isnan(lhs.x) || isnan(lhs.y)) && (isnan(rhs.x) || isnan(rhs.y))))";
+    } else if (
+        uses_bfloat16 || uses_float16 || a_dtype == float32 ||
+        b_dtype == float32) {
+      os << " || (isnan(" << equal_input_expr(a_dtype, "a_buf", "a_idx")
+         << ") && isnan(" << equal_input_expr(b_dtype, "b_buf", "b_idx") << "))";
+    }
   }
   os << ";\n";
   os << "  out_buf.data[idx + pc.out_offset] = is_equal ? uint8_t(1) : uint8_t(0);\n";
@@ -776,6 +917,11 @@ bool try_eval_compare_vulkan(
     return false;
   }
 
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    return true;
+  }
+
   auto materialize_broadcast_input = [&](array& in) {
     if (in.data_size() == 1) {
       if (in.size() != 1) {
@@ -1007,7 +1153,7 @@ bool try_eval_power_vulkan(
     return false;
   }
 
-  const std::string shader_name = "dynamic_power_" +
+  const std::string shader_name = "dynamic_power_v2_" +
       std::to_string(static_cast<int>(a.dtype().val())) + "_" +
       std::to_string(static_cast<int>(b.dtype().val())) + "_" +
       std::to_string(static_cast<int>(out_work.dtype().val()));
@@ -1158,6 +1304,10 @@ bool try_eval_logical_not_vulkan(
   }
 
   array in = inputs[0];
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    return true;
+  }
   if (!is_supported_elementwise_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
@@ -1252,6 +1402,11 @@ bool try_eval_logical_binary_vulkan(
 
   array a = inputs[0];
   array b = inputs[1];
+
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    return true;
+  }
 
   if (!ensure_vulkan_buffer_compare(a, s) ||
       !ensure_vulkan_buffer_compare(b, s)) {
@@ -1385,6 +1540,11 @@ bool try_eval_bitwise_binary_vulkan(
   }
   if (!(issubdtype(out.dtype(), integer) || out.dtype() == bool_)) {
     return false;
+  }
+
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    return true;
   }
 
   if (!ensure_vulkan_buffer_compare(a, s) ||
@@ -2044,14 +2204,18 @@ void eval_argpartition_or_argsort_gpu(
   // Allocate output
   out.set_data(allocator::malloc(out.nbytes()));
 
-  // Convert non-float32 inputs to float32 for the argsort_f32 shader.
+  // Convert non-float32 inputs to float32 keys for the argsort_f32 shader.
   // The indices produced by the sort are type-agnostic (just positions).
-  // Complex types are not supported since their ordering is not well-defined.
   if (issubdtype(in.dtype(), complexfloating)) {
-    throw std::runtime_error(
-        "ArgPartition/ArgSort Vulkan does not support complex inputs.");
-  }
-  if (in.dtype() != float32) {
+    if (!in.flags().row_contiguous || in.offset() != 0 ||
+        !is_supported_unary_layout(in)) {
+      in = contiguous_copy_gpu(in, s);
+    }
+    array in_f32(in.shape(), float32, nullptr, {});
+    in_f32.set_data(allocator::malloc(in_f32.nbytes()));
+    extract_complex_real_key_gpu(in, in_f32, s);
+    in = in_f32;
+  } else if (in.dtype() != float32) {
     array in_f32(in.shape(), float32, nullptr, {});
     copy_gpu(in, in_f32, CopyType::General, s);
     in = in_f32;
@@ -2077,11 +2241,6 @@ void eval_argpartition_or_argsort_gpu(
   }
 
   const uint32_t ncols = static_cast<uint32_t>(in_kernel.shape().back());
-  if (ncols > 262144) {
-    throw std::runtime_error(
-        "ArgPartition/ArgSort Vulkan requires sort axis <= 262144 elements.");
-  }
-
   const int normalized_kth = kth < 0 ? static_cast<int>(ncols) + kth : kth;
   const bool topk_suffix_partition = kth < 0 && normalized_kth >= 0 &&
       normalized_kth >= static_cast<int>(ncols) - 16 && axis == in.ndim() - 1 &&
@@ -2159,11 +2318,109 @@ void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 // CPU fallbacks for primitives not implemented on Vulkan
 NYI_OP(ArcCosh)
-NYI_OP(ArcSinh)
+void ArcSinh::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto s = stream();
+  auto x = inputs[0];
+  auto one = array(1.0f, out.dtype());
+  auto y = log(add(x, sqrt(add(multiply(x, x, s), one, s), s), s), s);
+  copy_gpu(y, out, CopyType::General, s);
+}
 NYI_OP(ArcTan2)
-NYI_OP(ArcTanh)
-NYI_OP(Cosh)
-NYI_OP_STATE(Hadamard)
+void ArcTanh::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto s = stream();
+  auto x = inputs[0];
+  auto one = array(1.0f, out.dtype());
+  auto y = multiply(
+      log(divide(add(one, x, s), subtract(one, x, s), s), s),
+      array(0.5f, out.dtype()),
+      s);
+  copy_gpu(y, out, CopyType::General, s);
+}
+void Cosh::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto s = stream();
+  auto x = inputs[0];
+  auto y = multiply(add(exp(x, s), exp(negative(x, s), s), s), array(0.5f, out.dtype()), s);
+  copy_gpu(y, out, CopyType::General, s);
+}
+void Hadamard::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto s = stream();
+  auto in = inputs[0];
+
+  if (in.dtype() != float32 && in.dtype() != float16 && in.dtype() != bfloat16) {
+    throw std::runtime_error("Hadamard has no Vulkan implementation.");
+  }
+
+  if (!in.flags().row_contiguous || in.offset() != 0) {
+    in = contiguous_copy_gpu(in, s);
+  }
+
+  array work(in.shape(), float32, nullptr, {});
+  copy_gpu(in, work, CopyType::General, s);
+  array scratch(in.shape(), float32, nullptr, {});
+  scratch.set_data(allocator::malloc(scratch.nbytes()));
+
+  auto [n, m] = decompose_hadamard(in.shape(-1));
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+
+  bool work_holds_latest = true;
+  for (uint32_t stage = 1; stage < static_cast<uint32_t>(n); stage <<= 1u) {
+    vulkan::dispatch_hadamard_op(
+        work_holds_latest ? work : scratch,
+        work_holds_latest ? scratch : work,
+        vulkan::StaticShaderId::hadamard_f32,
+        command_buffer,
+        s,
+        static_cast<uint32_t>(n),
+        stage,
+        m == 1 && (stage << 1u) == static_cast<uint32_t>(n) ? scale_ : 1.0f);
+    hadamard_barrier(command_buffer);
+    work_holds_latest = !work_holds_latest;
+  }
+
+  array& latest = work_holds_latest ? work : scratch;
+
+  if (m > 1) {
+    struct PushConstants {
+      uint32_t total_rows;
+      uint32_t n;
+      float scale;
+    } pc{
+        static_cast<uint32_t>(latest.size() / m),
+        static_cast<uint32_t>(n),
+        scale_,
+    };
+    vulkan::DynamicArrayRef arrays[] = {{&latest, 0}};
+    const std::string shader_name =
+        "dynamic_hadamard_m_" + std::to_string(m) + "_f32";
+    auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+        shader_name,
+        build_hadamard_m_shader(m),
+        1,
+        arrays,
+        sizeof(PushConstants),
+        s);
+    vkCmdPushConstants(
+        dispatch.command_buffer,
+        dispatch.pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(PushConstants),
+        &pc);
+    vkCmdDispatch(dispatch.command_buffer, (pc.total_rows + 255u) / 256u, 1, 1);
+  }
+
+  vulkan::end_command_recording(s.index);
+
+  if (out.dtype() == float32) {
+    copy_gpu(latest, out, CopyType::General, s);
+  } else {
+    copy_gpu(latest, out, CopyType::General, s);
+  }
+}
 // Linear algebra operations - throw NYI like Metal backend
 NO_GPU_MULTI(LUF)
 NO_GPU_MULTI(QRF)
@@ -2235,8 +2492,20 @@ void Real::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 }
 
-NYI_OP(Sinh)
-NYI_OP(Tan)
+void Sinh::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto s = stream();
+  auto x = inputs[0];
+  auto y = multiply(subtract(exp(x, s), exp(negative(x, s), s), s), array(0.5f, out.dtype()), s);
+  copy_gpu(y, out, CopyType::General, s);
+}
+
+void Tan::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto s = stream();
+  auto x = inputs[0];
+  copy_gpu(divide(sin(x, s), cos(x, s), s), out, CopyType::General, s);
+}
 // Scatter and ScatterAxis are implemented in scatter.cpp
 
 void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {

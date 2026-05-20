@@ -20,6 +20,7 @@
 #include "mlx/backend/vulkan/matmul.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/quantized.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
@@ -89,6 +90,149 @@ float from_fp8_e4m3_scalar(uint8_t x) {
   float16_t half = bit_cast_scalar<float16_t>(bits);
   float out = static_cast<float>(half) * 256.0f;
   return (x & 128u) ? -out : out;
+}
+
+std::string build_to_fp8_f32_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(float32, uint8, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input { float data[]; } in_buf;
+layout(set = 0, binding = 1) buffer Output { uint8_t data[]; } out_buf;
+
+uint8_t to_fp8_e4m3(float x) {
+  uint f_bits = floatBitsToUint(x);
+  uint sign = f_bits & 0x80000000u;
+  f_bits ^= sign;
+
+  uint f_bits_low = floatBitsToUint(uintBitsToFloat(f_bits) + uintBitsToFloat(141u << 23));
+  uint result_low = f_bits_low - (141u << 23);
+
+  uint mant_odd = (f_bits >> 20) & 1u;
+  uint f_bits_high = f_bits + (((7u - 127u) << 23) + 0x7FFFFu);
+  f_bits_high += mant_odd;
+  uint result_high = f_bits_high >> 20;
+
+  uint result = f_bits < (121u << 23) ? result_low : result_high;
+  if (f_bits >= (543u << 21)) {
+    result = 0x7Eu;
+  }
+  return uint8_t(result | (sign >> 24));
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  out_buf.data[idx + pc.out_offset] = to_fp8_e4m3(in_buf.data[idx + pc.in_offset]);
+}
+)";
+  return os.str();
+}
+
+std::string build_from_fp8_shader(Dtype out_dtype) {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(uint8, out_dtype, false);
+  if (out_dtype == bfloat16) {
+    os << "uint fp32_to_bf16(float f) {\n";
+    os << "  uint u = floatBitsToUint(f);\n";
+    os << "  u = (u + (0x7fffu + ((u >> 16) & 1u))) >> 16;\n";
+    os << "  return u;\n";
+    os << "}\n\n";
+  }
+  const char* out_type = out_dtype == float16 ? "float16_t"
+      : out_dtype == bfloat16              ? "uint16_t"
+                                            : "float";
+  os << R"(
+layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input { uint8_t data[]; } in_buf;
+)";
+  os << "layout(set = 0, binding = 1) buffer Output { " << out_type
+     << " data[]; } out_buf;\n";
+  os << R"(
+
+float from_fp8_e4m3(uint8_t x8) {
+  uint x = uint(x8);
+  uint bits = (x & 127u) << 7;
+  float outv = unpackHalf2x16(bits).x * 256.0;
+  return (x & 128u) != 0u ? -outv : outv;
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+)";
+  if (out_dtype == bfloat16) {
+    os << "  out_buf.data[idx + pc.out_offset] = uint16_t(fp32_to_bf16(from_fp8_e4m3(in_buf.data[idx + pc.in_offset])));\n";
+  } else {
+    os << "  out_buf.data[idx + pc.out_offset] = " << out_type
+       << "(from_fp8_e4m3(in_buf.data[idx + pc.in_offset]));\n";
+  }
+  os << R"(
+}
+)";
+  return os.str();
+}
+
+bool try_convert_fp8_f32_gpu(const array& input, array& out, bool to_fp8, Stream s) {
+  if (to_fp8) {
+    if (input.dtype() != float32 || out.dtype() != uint8) {
+      return false;
+    }
+  } else if (input.dtype() != uint8 ||
+      (out.dtype() != float32 && out.dtype() != float16 && out.dtype() != bfloat16)) {
+    return false;
+  }
+
+  array in = input;
+  if (!in.flags().row_contiguous || in.offset() != 0 || in.has_primitive()) {
+    in = contiguous_copy_gpu(in, s);
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  const auto in_offset = static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  const auto out_offset = static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
+  const auto total = static_cast<uint64_t>(out.data_size());
+  if (in_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max() ||
+      total > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&out, 1}};
+  struct PushConstants {
+    uint32_t in_offset;
+    uint32_t out_offset;
+    uint32_t total_elements;
+  } pc{
+      static_cast<uint32_t>(in_offset),
+      static_cast<uint32_t>(out_offset),
+      static_cast<uint32_t>(total),
+  };
+
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      to_fp8 ? "dynamic_to_fp8_f32"
+             : (out.dtype() == bfloat16 ? "dynamic_from_fp8_bf16"
+                  : out.dtype() == float16 ? "dynamic_from_fp8_f16"
+                                           : "dynamic_from_fp8_f32"),
+      to_fp8 ? build_to_fp8_f32_shader() : build_from_fp8_shader(out.dtype()),
+      2,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
 }
 
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
@@ -571,7 +715,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
       ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
       : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
 
-  if (q_len <= 8u && qk_ratio > 1u && qk_ratio <= tuning.block_rows &&
+  if (!use_native_bf16_kv && q_len <= 8u && qk_ratio > 1u && qk_ratio <= tuning.block_rows &&
       qk_ratio * kv_heads == q_heads && mask_heads <= 1u) {
     gqa_ratio = qk_ratio;
     n_rows = gqa_ratio;
@@ -2881,6 +3025,10 @@ void ConvertFP8::eval_gpu(
     std::vector<array>& outputs) {
   if (inputs.size() != 1 || outputs.size() != 1) {
     throw std::runtime_error("[ConvertFP8::eval_gpu] Expected one input and one output.");
+  }
+
+  if (try_convert_fp8_f32_gpu(inputs[0], outputs[0], to_fp8_, stream())) {
+    return;
   }
 
   auto in = ensure_host_readable_row_contiguous(inputs[0], stream());

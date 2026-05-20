@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 
 #include <cstring>
@@ -11,6 +12,86 @@
 namespace mlx::core {
 
 namespace {
+
+std::string build_sum_rows_i64_shader() {
+  std::ostringstream os;
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
+  os << "#extension GL_KHR_memory_scope_semantics : enable\n";
+  os << "#pragma use_vulkan_memory_model\n\n";
+  os << R"(
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PushConstants {
+  uint n_cols;
+  uint n_rows;
+} pc;
+layout(set = 0, binding = 0) readonly buffer Input { int64_t data[]; } in_buf;
+layout(set = 0, binding = 1) buffer Output { int64_t data[]; } out_buf;
+shared int64_t vals[256];
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint row = gl_WorkGroupID.x;
+  if (row >= pc.n_rows) return;
+
+  int64_t acc = int64_t(0);
+  uint base = row * pc.n_cols;
+  for (uint col = tid; col < pc.n_cols; col += 256u) {
+    acc += in_buf.data[base + col];
+  }
+  vals[tid] = acc;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      vals[tid] += vals[tid + s];
+    }
+    barrier();
+  }
+  if (tid == 0u) {
+    out_buf.data[row] = vals[0];
+  }
+}
+)";
+  return os.str();
+}
+
+bool try_dispatch_sum_rows_i64(const array& in, array& out, Stream s) {
+  if (in.dtype() != int64 || out.dtype() != int64 || in.ndim() == 0 ||
+      in.shape(-1) == 0 || in.size() != out.size() * in.shape(-1)) {
+    return false;
+  }
+  array in_kernel = in;
+  if (!in_kernel.flags().row_contiguous || in_kernel.offset() != 0 ||
+      in_kernel.strides(-1) != 1 || !is_supported_unary_layout(in_kernel)) {
+    in_kernel = contiguous_copy_gpu(in_kernel, s);
+  }
+  const uint32_t n_cols = checked_u32_size(in_kernel.shape(-1), "sum_rows_i64 n_cols");
+  const uint32_t n_rows = checked_u32_size(out.size(), "sum_rows_i64 n_rows");
+  if (n_rows == 0) {
+    return true;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  vulkan::DynamicArrayRef arrays[] = {{&in_kernel, 0}, {&out, 1}};
+  const std::array<uint32_t, 2> pc = {n_cols, n_rows};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_sum_rows_i64",
+      build_sum_rows_i64_shader(),
+      2,
+      arrays,
+      static_cast<uint32_t>(pc.size() * sizeof(uint32_t)),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      static_cast<uint32_t>(pc.size() * sizeof(uint32_t)),
+      pc.data());
+  vkCmdDispatch(dispatch.command_buffer, n_rows, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
 
 array stage_zero_offset_row_contiguous(const array& in, Stream s) {
   array staged(in.shape(), in.dtype(), nullptr, {});
@@ -103,9 +184,10 @@ bool try_eval_reduce_sum_rows_vulkan(
   const bool bool_min_max = (max_reduce || min_reduce) && bool_io;
   const bool integer_sum_prod = (sum_reduce || prod_reduce) &&
       ((in.dtype() == uint8 && out.dtype() == uint32) ||
-       (in.dtype() == uint16 && out.dtype() == uint32) ||
-       (in.dtype() == uint32 && out.dtype() == uint32) ||
-       (in.dtype() == int32 && out.dtype() == int32));
+        (in.dtype() == uint16 && out.dtype() == uint32) ||
+        (in.dtype() == uint32 && out.dtype() == uint32) ||
+        (in.dtype() == int32 && out.dtype() == int32) ||
+        (sum_reduce && in.dtype() == int64 && out.dtype() == int64));
   const bool integer_min_max = (max_reduce || min_reduce) &&
       ((in.dtype() == uint32 && out.dtype() == uint32) ||
        (in.dtype() == int32 && out.dtype() == int32));
@@ -356,6 +438,18 @@ bool try_eval_reduce_sum_rows_vulkan(
       }
     } else {
       try {
+        if (sum_reduce && in_kernel.dtype() == int64 && out_work.dtype() == int64) {
+          if (!try_dispatch_sum_rows_i64(in_kernel, out_work, s)) {
+            return false;
+          }
+          if (staged_output) {
+            copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);
+          }
+          reduced = (axis == reduced.ndim() - 1)
+              ? kernel_out
+              : swapaxes_in_eval(kernel_out, axis, reduced.ndim() - 1);
+          continue;
+        }
         auto command_buffer = vulkan::begin_command_recording(s.index);
         const auto shader_id = integer_shader ? *integer_shader
             : sum_reduce   ? vulkan::StaticShaderId::sum_rows_f32

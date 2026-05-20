@@ -302,6 +302,13 @@ struct GenericPushConstants {
   float param4;
 };
 
+struct HadamardPushConstants {
+  uint32_t total_elements;
+  uint32_t n;
+  uint32_t stage;
+  float scale;
+};
+
 struct ArangePushConstants {
   uint32_t KX;
   uint32_t KY;
@@ -757,6 +764,16 @@ void dispatch_sum_rows_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float weight = 1.0f);
+
+void dispatch_hadamard_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t n,
+    uint32_t stage,
+    float scale);
 
 void dispatch_argmax_op(
     const array& in,

@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint total_pairs;
+    uint n;
+    uint stage;
+    float scale;
+} p;
+
+layout(binding = 0) readonly buffer XIn { float data_x_in[]; };
+layout(binding = 1) buffer XOut { float data_x_out[]; };
+
+void main() {
+    uint pair_idx = gl_GlobalInvocationID.x;
+    if (pair_idx >= p.total_pairs) {
+        return;
+    }
+
+    uint half_n = p.n >> 1;
+    uint chunk = pair_idx / half_n;
+    uint i = pair_idx - chunk * half_n;
+    uint k = i & (p.stage - 1u);
+    uint j = ((i - k) << 1u) + k;
+    uint base = chunk * p.n;
+    uint idx0 = base + j;
+    uint idx1 = idx0 + p.stage;
+
+    float x = data_x_in[idx0];
+    float y = data_x_in[idx1];
+    float out0 = x + y;
+    float out1 = x - y;
+
+    if ((p.stage << 1u) == p.n) {
+        out0 *= p.scale;
+        out1 *= p.scale;
+    }
+
+    data_x_out[idx0] = out0;
+    data_x_out[idx1] = out1;
+}

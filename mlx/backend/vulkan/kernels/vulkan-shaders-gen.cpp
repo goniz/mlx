@@ -2682,6 +2682,8 @@ void process_shaders() {
        {"DATA_A_BF16", "1"},
        {"DATA_D_BF16", "1"}});
 
+  string_to_spv("hadamard_f32", "hadamard.comp", {});
+
   string_to_spv(
       "soft_max_f32",
       "soft_max.comp",

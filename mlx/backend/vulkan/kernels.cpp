@@ -373,6 +373,7 @@ enum class KernelSpecId {
   Ternary,
   Unary,
   GenericUnary,
+  Hadamard,
   Arange,
   SumRows,
   Argmax,
@@ -432,7 +433,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 39> kKernelSpecs = {
+const std::array<KernelSpec, 40> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -453,6 +454,10 @@ const std::array<KernelSpec, 39> kKernelSpecs = {
         {0, 1},
         sizeof(GenericPushConstants),
         DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1},
+        sizeof(HadamardPushConstants),
+        DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0},
         sizeof(ArangePushConstants),
@@ -2501,6 +2506,36 @@ void dispatch_sum_rows_op(
       {block_size});
 }
 
+void dispatch_hadamard_op(
+    const array& in,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t n,
+    uint32_t stage,
+    float scale) {
+  if (in.size() == 0) {
+    return;
+  }
+
+  if (n == 0 || (n & 1u) != 0 || stage == 0 || stage >= n) {
+    throw std::runtime_error("[vulkan::kernels] Invalid Hadamard stage.");
+  }
+
+  const uint32_t total_pairs = checked_u32(in.size() / 2, "hadamard total pairs");
+  HadamardPushConstants push_constants{total_pairs, n, stage, scale};
+  const std::array<BoundArray, 2> bound_arrays = {{{&in, "src0"}, {&out, "dst"}}};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Hadamard,
+      bound_arrays,
+      push_constants,
+      total_pairs,
+      cmd_buffer,
+      s);
+}
+
 void dispatch_argmax_op(
     const array& in,
     array& out,
@@ -2557,12 +2592,6 @@ void dispatch_argsort_op(
 
   const uint32_t ncols =
       checked_u32(in.shape(in.ndim() - 1), "argsort column count");
-  constexpr uint32_t kMaxLargeArgsortCols = 262144u;
-  if (ncols > kMaxLargeArgsortCols) {
-    throw std::runtime_error(
-        "[vulkan::kernels] Argsort requires ncols <= 262144.");
-  }
-
   const uint32_t nrows = checked_u32(out.size() / ncols, "argsort row count");
 
   constexpr uint32_t signed_min_as_u32 = 1u << 31;

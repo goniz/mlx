@@ -678,8 +678,12 @@ std::string build_divmod_shader(Dtype dtype) {
   os << "  if (idx >= pc.total_elements) return;\n";
   os << "  " << type_name << " x = a_buf.data[idx + pc.a_offset];\n";
   os << "  " << type_name << " y = b_buf.data[idx + pc.b_offset];\n";
-  if (dtype == float32) {
-    os << "  " << type_name << " q = trunc(x / y);\n";
+  if (dtype == float16) {
+    os << "  float q = floor(float(x) / float(y));\n";
+    os << "  q_buf.data[idx + pc.q_offset] = float16_t(q);\n";
+    os << "  r_buf.data[idx + pc.r_offset] = float16_t(float(x) - float(y) * q);\n";
+  } else if (dtype == float32) {
+    os << "  " << type_name << " q = floor(x / y);\n";
     os << "  q_buf.data[idx + pc.q_offset] = q;\n";
     os << "  r_buf.data[idx + pc.r_offset] = x - y * q;\n";
   } else {
@@ -706,12 +710,12 @@ bool try_eval_divmod_vulkan(
   auto& quotient = outputs[0];
   auto& remainder = outputs[1];
   const bool float_case =
-      a.dtype() == float32 && b.dtype() == float32 &&
-      quotient.dtype() == float32 && remainder.dtype() == float32;
+      (a.dtype() == float16 || a.dtype() == float32) && a.dtype() == b.dtype() &&
+      a.dtype() == quotient.dtype() && a.dtype() == remainder.dtype();
   const bool int_case = a.dtype() == b.dtype() && a.dtype() == quotient.dtype() &&
       a.dtype() == remainder.dtype() &&
-      (a.dtype() == int32 || a.dtype() == uint32 || a.dtype() == int64 ||
-       a.dtype() == uint64);
+      (a.dtype() == int16 || a.dtype() == uint16 || a.dtype() == int32 ||
+       a.dtype() == uint32 || a.dtype() == int64 || a.dtype() == uint64);
   if ((!float_case && !int_case) ||
       quotient.shape() != remainder.shape()) {
     return false;
@@ -795,7 +799,7 @@ bool try_eval_divmod_vulkan(
   vulkan::DynamicArrayRef arrays[] = {
       {&a, 0}, {&b, 1}, {&quotient_work, 2}, {&remainder_work, 3}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 5;
-  const std::string shader_name = "dynamic_divmod_" +
+  const std::string shader_name = "dynamic_divmod_v2_" +
       std::to_string(static_cast<int>(a.dtype().val()));
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name,

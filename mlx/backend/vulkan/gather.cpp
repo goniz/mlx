@@ -69,6 +69,193 @@ checked_shape_product(const array& arr, int begin, int end, const char* label) {
   return product;
 }
 
+std::string build_complex_gather_axis_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << R"(
+layout(push_constant) uniform PushConstants {
+  uint size_pre;
+  uint size_axis;
+  uint size_post;
+  uint idx_axis_size;
+  uint total_elements;
+} pc;
+layout(set = 0, binding = 0) readonly buffer Src { vec2 data[]; } src_buf;
+layout(set = 0, binding = 1) readonly buffer Idx { uint data[]; } idx_buf;
+layout(set = 0, binding = 2) buffer Out { vec2 data[]; } out_buf;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  uint post = idx % pc.size_post;
+  uint axis_pos = (idx / pc.size_post) % pc.idx_axis_size;
+  uint pre = idx / (pc.idx_axis_size * pc.size_post);
+  uint src_axis = idx_buf.data[idx];
+  out_buf.data[idx] = src_buf.data[(pre * pc.size_axis + src_axis) * pc.size_post + post];
+}
+)";
+  return os.str();
+}
+
+std::string build_i64_gather_axis_shader(Dtype index_dtype) {
+  std::ostringstream os;
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n\n";
+  os << R"(
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PushConstants {
+  uint size_pre;
+  uint size_axis;
+  uint size_post;
+  uint idx_axis_size;
+  uint total_elements;
+} pc;
+layout(set = 0, binding = 0) readonly buffer Src { int64_t data[]; } src_buf;
+)";
+  os << "layout(set = 0, binding = 1) readonly buffer Idx { "
+     << (index_dtype == int64 ? "int64_t" : "uint") << " data[]; } idx_buf;\n";
+  os << R"(
+layout(set = 0, binding = 2) buffer Out { int64_t data[]; } out_buf;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+  uint post = idx % pc.size_post;
+  uint axis_pos = (idx / pc.size_post) % pc.idx_axis_size;
+  uint pre = idx / (pc.idx_axis_size * pc.size_post);
+  uint src_axis = uint(idx_buf.data[idx]);
+  out_buf.data[idx] = src_buf.data[(pre * pc.size_axis + src_axis) * pc.size_post + post];
+}
+)";
+  return os.str();
+}
+
+bool try_eval_complex_gather_axis_vulkan(
+    array src,
+    array idx,
+    array& out,
+    int axis,
+    Stream s) {
+  if (src.dtype() != complex64 || idx.dtype() != uint32 || out.dtype() != complex64) {
+    return false;
+  }
+
+  src = ensure_row_contiguous(src, s);
+  idx = ensure_row_contiguous(idx, s);
+
+  const uint32_t size_pre =
+      checked_shape_product(src, 0, axis, "complex_gather_axis size_pre");
+  const uint32_t size_axis =
+      checked_u32_size(src.shape(axis), "complex_gather_axis size_axis");
+  const uint32_t size_post = checked_shape_product(
+      src, axis + 1, src.ndim(), "complex_gather_axis size_post");
+  const uint32_t idx_axis_size =
+      checked_u32_size(idx.shape(axis), "complex_gather_axis idx_axis_size");
+  const uint32_t total = checked_u32_size(out.size(), "complex_gather_axis size");
+
+  auto [out_work, staged_output] = make_output_work(out);
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {{&src, 0}, {&idx, 1}, {&out_work, 2}};
+  struct PushConstants {
+    uint32_t size_pre;
+    uint32_t size_axis;
+    uint32_t size_post;
+    uint32_t idx_axis_size;
+    uint32_t total_elements;
+  } pc{size_pre, size_axis, size_post, idx_axis_size, total};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_gather_axis_c64_u32",
+      build_complex_gather_axis_shader(),
+      3,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+  }
+  return true;
+}
+
+bool try_eval_i64_gather_axis_vulkan(
+    array src,
+    array idx,
+    array& out,
+    int axis,
+    Stream s) {
+  if (src.dtype() != int64 || (idx.dtype() != uint32 && idx.dtype() != int64) ||
+      out.dtype() != int64) {
+    return false;
+  }
+
+  src = ensure_row_contiguous(src, s);
+  idx = ensure_row_contiguous(idx, s);
+
+  const uint32_t size_pre =
+      checked_shape_product(src, 0, axis, "i64_gather_axis size_pre");
+  const uint32_t size_axis =
+      checked_u32_size(src.shape(axis), "i64_gather_axis size_axis");
+  const uint32_t size_post =
+      checked_shape_product(src, axis + 1, src.ndim(), "i64_gather_axis size_post");
+  const uint32_t idx_axis_size =
+      checked_u32_size(idx.shape(axis), "i64_gather_axis idx_axis_size");
+  const uint32_t total = checked_u32_size(out.size(), "i64_gather_axis size");
+
+  auto [out_work, staged_output] = make_output_work(out);
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {{&src, 0}, {&idx, 1}, {&out_work, 2}};
+  struct PushConstants {
+    uint32_t size_pre;
+    uint32_t size_axis;
+    uint32_t size_post;
+    uint32_t idx_axis_size;
+    uint32_t total_elements;
+  } pc{size_pre, size_axis, size_post, idx_axis_size, total};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      idx.dtype() == int64 ? "dynamic_gather_axis_i64_i64"
+                           : "dynamic_gather_axis_i64_u32",
+      build_i64_gather_axis_shader(idx.dtype()),
+      3,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+
+  if (staged_output) {
+    copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+  }
+  return true;
+}
+
 std::optional<int64_t> scalar_index_value(const array& idx) {
   if (idx.ndim() != 0) {
     return std::nullopt;
@@ -898,6 +1085,13 @@ bool try_eval_gather_axis_vulkan(
   if (axis < 0 || axis >= src.ndim()) {
     trace_vulkan_unsupported("GatherAxis", "axis is out of range");
     return false;
+  }
+
+  if (try_eval_complex_gather_axis_vulkan(src, idx, out, axis, s)) {
+    return true;
+  }
+  if (try_eval_i64_gather_axis_vulkan(src, idx, out, axis, s)) {
+    return true;
   }
 
   const auto shader_id = gather_axis_shader_id(src.dtype(), idx.dtype());

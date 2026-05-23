@@ -235,8 +235,9 @@ ConvPipelineConfig select_conv2d_pipeline(
     config.shmem_pad =
         ctx.architecture() == vulkan::GpuArchitecture::AmdCdna ? 1u : 4u;
 
-    if (ctx.coopmat_flash_attention_f32acc_supported() && crs >= 64 &&
-        cout >= 64) {
+    // The CM1 conv2d shader produces incorrect values on AMD for larger
+    // channel/filter tiles. Keep the standard direct shader until it is fixed.
+    if (false) {
       config.shmem_pad = 0u;
       config.shader_id = weight_dtype == float16
           ? vulkan::StaticShaderId::conv2d_f16_f32_cm1
@@ -273,6 +274,41 @@ array make_tracked_contiguous_copy(
   return out;
 }
 
+bool has_supported_general_direct_layout(const array& arr) {
+  if (arr.offset() < 0 ||
+      arr.offset() % static_cast<int64_t>(arr.itemsize()) != 0) {
+    return false;
+  }
+  return std::all_of(
+      arr.strides().begin(), arr.strides().end(), [](auto stride) {
+        return stride >= 0;
+      });
+}
+
+bool supports_general_direct_push_constants(size_t size) {
+  return size <= vulkan::VulkanContext::get()
+                     .physical_device()
+                     .getProperties()
+                     .limits.maxPushConstantsSize;
+}
+
+uint32_t checked_u32_element_offset(const array& arr, const char* name) {
+  return checked_u32_size(
+      arr.offset() / static_cast<int64_t>(arr.itemsize()), name);
+}
+
+bool try_eval_conv2d_general_direct_vulkan(
+    const array& in,
+    const array& wt,
+    array& out,
+    const std::vector<int>& kernel_strides,
+    const std::vector<int>& padding_lo,
+    const std::vector<int>& kernel_dilation,
+    const std::vector<int>& input_dilation,
+    int groups,
+    bool flip,
+    Stream s);
+
 bool try_eval_conv2d_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -299,8 +335,10 @@ bool try_eval_conv2d_vulkan(
 
   const auto& in = inputs[0];
   const auto& wt = inputs[1];
-  if (in.dtype() != float32 || out.dtype() != float32 ||
-      (wt.dtype() != float32 && wt.dtype() != float16)) {
+  if ((in.dtype() != float32 && in.dtype() != float16 &&
+       in.dtype() != bfloat16) ||
+      (wt.dtype() != float32 && wt.dtype() != float16 &&
+       wt.dtype() != bfloat16)) {
     return false;
   }
 
@@ -320,11 +358,27 @@ bool try_eval_conv2d_vulkan(
     return false;
   }
 
-  const bool supports_direct_kernel = groups == 1 && !flip &&
-      input_dilation[0] == 1 && input_dilation[1] == 1 &&
+  const bool supports_direct_kernel = in.dtype() == float32 &&
+      out.dtype() == float32 &&
+      (wt.dtype() == float32 || wt.dtype() == float16) && groups == 1 &&
+      !flip && input_dilation[0] == 1 && input_dilation[1] == 1 &&
       padding_lo == padding_hi;
 
   if (!supports_direct_kernel) {
+    if (try_eval_conv2d_general_direct_vulkan(
+            in,
+            wt,
+            out,
+            kernel_strides,
+            padding_lo,
+            kernel_dilation,
+            input_dilation,
+            groups,
+            flip,
+            s)) {
+      return true;
+    }
+
     auto in_work = in;
     if (input_dilation[0] != 1) {
       auto expanded = expand_dims(in_work, 2, s);
@@ -394,7 +448,6 @@ bool try_eval_conv2d_vulkan(
               (wt_shape[2] - 1) * wt_strides[2]),
           s);
     }
-
     auto padded =
         pad(in_work,
             std::vector<std::pair<int, int>>{
@@ -785,6 +838,406 @@ struct Conv1dPushConstants {
   uint32_t flip;
 };
 
+struct Conv2dGeneralPushConstants {
+  uint32_t total;
+  uint32_t batch;
+  uint32_t in_h;
+  uint32_t in_w;
+  uint32_t in_channels;
+  uint32_t out_h;
+  uint32_t out_w;
+  uint32_t out_channels;
+  uint32_t kernel_h;
+  uint32_t kernel_w;
+  uint32_t channels_per_group;
+  uint32_t out_channels_per_group;
+  uint32_t groups;
+  uint32_t in_offset;
+  uint32_t wt_offset;
+  uint32_t out_offset;
+  uint32_t in_s0;
+  uint32_t in_s1;
+  uint32_t in_s2;
+  uint32_t in_s3;
+  uint32_t wt_s0;
+  uint32_t wt_s1;
+  uint32_t wt_s2;
+  uint32_t wt_s3;
+  uint32_t out_s0;
+  uint32_t out_s1;
+  uint32_t out_s2;
+  uint32_t out_s3;
+  int32_t stride_h;
+  int32_t stride_w;
+  int32_t pad_h;
+  int32_t pad_w;
+  int32_t dilation_h;
+  int32_t dilation_w;
+  int32_t input_dilation_h;
+  int32_t input_dilation_w;
+  uint32_t flip;
+};
+
+struct Conv3dGeneralPushConstants {
+  uint32_t total, batch, in_d, in_h, in_w, in_channels;
+  uint32_t out_d, out_h, out_w, out_channels;
+  uint32_t kernel_d, kernel_h, kernel_w;
+  uint32_t channels_per_group, out_channels_per_group, groups;
+  uint32_t in_offset, wt_offset, out_offset;
+  uint32_t in_s0, in_s1, in_s2, in_s3, in_s4;
+  uint32_t wt_s0, wt_s1, wt_s2, wt_s3, wt_s4;
+  uint32_t out_s0, out_s1, out_s2, out_s3, out_s4;
+  int32_t stride_d, stride_h, stride_w;
+  int32_t pad_d, pad_h, pad_w;
+  int32_t dilation_d, dilation_h, dilation_w;
+  int32_t input_dilation_d, input_dilation_h, input_dilation_w;
+  uint32_t flip;
+};
+
+std::string build_conv2d_general_shader() {
+  return R"(
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer InBuf { float data[]; } in_buf;
+layout(binding = 1) readonly buffer WtBuf { float data[]; } wt_buf;
+layout(binding = 2) writeonly buffer OutBuf { float data[]; } out_buf;
+layout(push_constant) uniform Push {
+  uint total;
+  uint batch;
+  uint in_h;
+  uint in_w;
+  uint in_channels;
+  uint out_h;
+  uint out_w;
+  uint out_channels;
+  uint kernel_h;
+  uint kernel_w;
+  uint channels_per_group;
+  uint out_channels_per_group;
+  uint groups;
+  uint in_offset;
+  uint wt_offset;
+  uint out_offset;
+  uint in_s0;
+  uint in_s1;
+  uint in_s2;
+  uint in_s3;
+  uint wt_s0;
+  uint wt_s1;
+  uint wt_s2;
+  uint wt_s3;
+  uint out_s0;
+  uint out_s1;
+  uint out_s2;
+  uint out_s3;
+  int stride_h;
+  int stride_w;
+  int pad_h;
+  int pad_w;
+  int dilation_h;
+  int dilation_w;
+  int input_dilation_h;
+  int input_dilation_w;
+  uint flip;
+} p;
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= p.total) return;
+  uint oc = idx % p.out_channels;
+  uint t = idx / p.out_channels;
+  uint ow = t % p.out_w;
+  t /= p.out_w;
+  uint oh = t % p.out_h;
+  uint n = t / p.out_h;
+  uint g = oc / p.out_channels_per_group;
+  float acc = 0.0;
+  for (uint kh = 0; kh < p.kernel_h; ++kh) {
+    int dh = int(oh) * p.stride_h + int(kh) * p.dilation_h - p.pad_h;
+    if (dh < 0 || dh % p.input_dilation_h != 0) continue;
+    uint ih = uint(dh / p.input_dilation_h);
+    if (ih >= p.in_h) continue;
+    uint wkh = p.flip != 0 ? (p.kernel_h - 1 - kh) : kh;
+    for (uint kw = 0; kw < p.kernel_w; ++kw) {
+      int dw = int(ow) * p.stride_w + int(kw) * p.dilation_w - p.pad_w;
+      if (dw < 0 || dw % p.input_dilation_w != 0) continue;
+      uint iw = uint(dw / p.input_dilation_w);
+      if (iw >= p.in_w) continue;
+      uint wkw = p.flip != 0 ? (p.kernel_w - 1 - kw) : kw;
+      for (uint cg = 0; cg < p.channels_per_group; ++cg) {
+        uint ic = g * p.channels_per_group + cg;
+        uint in_idx = p.in_offset + n * p.in_s0 + ih * p.in_s1 + iw * p.in_s2 + ic * p.in_s3;
+        uint wt_idx = p.wt_offset + oc * p.wt_s0 + wkh * p.wt_s1 + wkw * p.wt_s2 + cg * p.wt_s3;
+        acc += in_buf.data[in_idx] * wt_buf.data[wt_idx];
+      }
+    }
+  }
+  uint out_idx = p.out_offset + n * p.out_s0 + oh * p.out_s1 + ow * p.out_s2 + oc * p.out_s3;
+  out_buf.data[out_idx] = acc;
+}
+)";
+}
+
+bool try_eval_conv2d_general_direct_vulkan(
+    const array& in,
+    const array& wt,
+    array& out,
+    const std::vector<int>& kernel_strides,
+    const std::vector<int>& padding_lo,
+    const std::vector<int>& kernel_dilation,
+    const std::vector<int>& input_dilation,
+    int groups,
+    bool flip,
+    Stream s) {
+  if (in.dtype() != float32 || wt.dtype() != float32 ||
+      out.dtype() != float32) {
+    return false;
+  }
+  if (!supports_general_direct_push_constants(
+          sizeof(Conv2dGeneralPushConstants))) {
+    return false;
+  }
+  if (groups != 1 || !in.flags().row_contiguous || in.offset() != 0 ||
+      !has_supported_general_direct_layout(in) ||
+      !has_supported_general_direct_layout(wt) ||
+      !has_supported_general_direct_layout(out)) {
+    return false;
+  }
+
+  out.set_data(vulkan::allocator().malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  Conv2dGeneralPushConstants pc{};
+  pc.total = checked_u32_size(out.size(), "conv2d total");
+  pc.batch = checked_u32_size(in.shape(0), "conv2d batch");
+  pc.in_h = checked_u32_size(in.shape(1), "conv2d input height");
+  pc.in_w = checked_u32_size(in.shape(2), "conv2d input width");
+  pc.in_channels = checked_u32_size(in.shape(3), "conv2d input channels");
+  pc.out_h = checked_u32_size(out.shape(1), "conv2d output height");
+  pc.out_w = checked_u32_size(out.shape(2), "conv2d output width");
+  pc.out_channels = checked_u32_size(out.shape(3), "conv2d output channels");
+  pc.kernel_h = checked_u32_size(wt.shape(1), "conv2d kernel height");
+  pc.kernel_w = checked_u32_size(wt.shape(2), "conv2d kernel width");
+  pc.channels_per_group =
+      checked_u32_size(wt.shape(3), "conv2d channels/group");
+  pc.out_channels_per_group =
+      checked_u32_size(out.shape(3) / groups, "conv2d output channels/group");
+  pc.groups = checked_u32_size(groups, "conv2d groups");
+  pc.in_offset = checked_u32_element_offset(in, "conv2d input offset");
+  pc.wt_offset = checked_u32_element_offset(wt, "conv2d weight offset");
+  pc.out_offset = checked_u32_element_offset(out, "conv2d output offset");
+  pc.in_s0 = checked_u32_size(in.strides(0), "conv2d input stride 0");
+  pc.in_s1 = checked_u32_size(in.strides(1), "conv2d input stride 1");
+  pc.in_s2 = checked_u32_size(in.strides(2), "conv2d input stride 2");
+  pc.in_s3 = checked_u32_size(in.strides(3), "conv2d input stride 3");
+  pc.wt_s0 = checked_u32_size(wt.strides(0), "conv2d weight stride 0");
+  pc.wt_s1 = checked_u32_size(wt.strides(1), "conv2d weight stride 1");
+  pc.wt_s2 = checked_u32_size(wt.strides(2), "conv2d weight stride 2");
+  pc.wt_s3 = checked_u32_size(wt.strides(3), "conv2d weight stride 3");
+  pc.out_s0 = checked_u32_size(out.strides(0), "conv2d output stride 0");
+  pc.out_s1 = checked_u32_size(out.strides(1), "conv2d output stride 1");
+  pc.out_s2 = checked_u32_size(out.strides(2), "conv2d output stride 2");
+  pc.out_s3 = checked_u32_size(out.strides(3), "conv2d output stride 3");
+  pc.stride_h = kernel_strides[0];
+  pc.stride_w = kernel_strides[1];
+  pc.pad_h = padding_lo[0];
+  pc.pad_w = padding_lo[1];
+  pc.dilation_h = kernel_dilation[0];
+  pc.dilation_w = kernel_dilation[1];
+  pc.input_dilation_h = input_dilation[0];
+  pc.input_dilation_w = input_dilation[1];
+  pc.flip = flip ? 1u : 0u;
+
+  auto shader_name = std::string("dynamic_conv2d_general_f32");
+  auto glsl_source = build_conv2d_general_shader();
+  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&wt, 1}, {&out, 2}};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      shader_name,
+      glsl_source,
+      3,
+      arrays,
+      sizeof(Conv2dGeneralPushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(Conv2dGeneralPushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
+std::string build_conv3d_general_shader() {
+  return R"(
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer InBuf { float data[]; } in_buf;
+layout(binding = 1) readonly buffer WtBuf { float data[]; } wt_buf;
+layout(binding = 2) writeonly buffer OutBuf { float data[]; } out_buf;
+layout(push_constant) uniform Push {
+  uint total; uint batch; uint in_d; uint in_h; uint in_w; uint in_channels;
+  uint out_d; uint out_h; uint out_w; uint out_channels;
+  uint kernel_d; uint kernel_h; uint kernel_w;
+  uint channels_per_group; uint out_channels_per_group; uint groups;
+  uint in_offset; uint wt_offset; uint out_offset;
+  uint in_s0; uint in_s1; uint in_s2; uint in_s3; uint in_s4;
+  uint wt_s0; uint wt_s1; uint wt_s2; uint wt_s3; uint wt_s4;
+  uint out_s0; uint out_s1; uint out_s2; uint out_s3; uint out_s4;
+  int stride_d; int stride_h; int stride_w;
+  int pad_d; int pad_h; int pad_w;
+  int dilation_d; int dilation_h; int dilation_w;
+  int input_dilation_d; int input_dilation_h; int input_dilation_w;
+  uint flip;
+} p;
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= p.total) return;
+  uint oc = idx % p.out_channels;
+  uint t = idx / p.out_channels;
+  uint ow = t % p.out_w; t /= p.out_w;
+  uint oh = t % p.out_h; t /= p.out_h;
+  uint od = t % p.out_d;
+  uint n = t / p.out_d;
+  uint g = oc / p.out_channels_per_group;
+  float acc = 0.0;
+  for (uint kd = 0; kd < p.kernel_d; ++kd) {
+    int dd = int(od) * p.stride_d + int(kd) * p.dilation_d - p.pad_d;
+    if (dd < 0 || dd % p.input_dilation_d != 0) continue;
+    uint id = uint(dd / p.input_dilation_d);
+    if (id >= p.in_d) continue;
+    uint wkd = p.flip != 0 ? (p.kernel_d - 1 - kd) : kd;
+    for (uint kh = 0; kh < p.kernel_h; ++kh) {
+      int dh = int(oh) * p.stride_h + int(kh) * p.dilation_h - p.pad_h;
+      if (dh < 0 || dh % p.input_dilation_h != 0) continue;
+      uint ih = uint(dh / p.input_dilation_h);
+      if (ih >= p.in_h) continue;
+      uint wkh = p.flip != 0 ? (p.kernel_h - 1 - kh) : kh;
+      for (uint kw = 0; kw < p.kernel_w; ++kw) {
+        int dw = int(ow) * p.stride_w + int(kw) * p.dilation_w - p.pad_w;
+        if (dw < 0 || dw % p.input_dilation_w != 0) continue;
+        uint iw = uint(dw / p.input_dilation_w);
+        if (iw >= p.in_w) continue;
+        uint wkw = p.flip != 0 ? (p.kernel_w - 1 - kw) : kw;
+        for (uint cg = 0; cg < p.channels_per_group; ++cg) {
+          uint ic = g * p.channels_per_group + cg;
+          uint in_idx = p.in_offset + n*p.in_s0 + id*p.in_s1 + ih*p.in_s2 + iw*p.in_s3 + ic*p.in_s4;
+          uint wt_idx = p.wt_offset + oc*p.wt_s0 + wkd*p.wt_s1 + wkh*p.wt_s2 + wkw*p.wt_s3 + cg*p.wt_s4;
+          acc += in_buf.data[in_idx] * wt_buf.data[wt_idx];
+        }
+      }
+    }
+  }
+  uint out_idx = p.out_offset + n*p.out_s0 + od*p.out_s1 + oh*p.out_s2 + ow*p.out_s3 + oc*p.out_s4;
+  out_buf.data[out_idx] = acc;
+}
+)";
+}
+
+bool try_eval_conv3d_general_direct_vulkan(
+    const array& in,
+    const array& wt,
+    array& out,
+    const std::vector<int>& kernel_strides,
+    const std::vector<int>& padding_lo,
+    const std::vector<int>& kernel_dilation,
+    const std::vector<int>& input_dilation,
+    int groups,
+    bool flip,
+    Stream s) {
+  if (in.dtype() != float32 || wt.dtype() != float32 ||
+      out.dtype() != float32) {
+    return false;
+  }
+  if (!supports_general_direct_push_constants(
+          sizeof(Conv3dGeneralPushConstants))) {
+    return false;
+  }
+  if (groups != 1 || !in.flags().row_contiguous || in.offset() != 0 ||
+      !has_supported_general_direct_layout(in) ||
+      !has_supported_general_direct_layout(wt) ||
+      !has_supported_general_direct_layout(out)) {
+    return false;
+  }
+  out.set_data(vulkan::allocator().malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+  Conv3dGeneralPushConstants pc{};
+  pc.total = checked_u32_size(out.size(), "conv3d total");
+  pc.batch = checked_u32_size(in.shape(0), "conv3d batch");
+  pc.in_d = checked_u32_size(in.shape(1), "conv3d input depth");
+  pc.in_h = checked_u32_size(in.shape(2), "conv3d input height");
+  pc.in_w = checked_u32_size(in.shape(3), "conv3d input width");
+  pc.in_channels = checked_u32_size(in.shape(4), "conv3d input channels");
+  pc.out_d = checked_u32_size(out.shape(1), "conv3d output depth");
+  pc.out_h = checked_u32_size(out.shape(2), "conv3d output height");
+  pc.out_w = checked_u32_size(out.shape(3), "conv3d output width");
+  pc.out_channels = checked_u32_size(out.shape(4), "conv3d output channels");
+  pc.kernel_d = checked_u32_size(wt.shape(1), "conv3d kernel depth");
+  pc.kernel_h = checked_u32_size(wt.shape(2), "conv3d kernel height");
+  pc.kernel_w = checked_u32_size(wt.shape(3), "conv3d kernel width");
+  pc.channels_per_group =
+      checked_u32_size(wt.shape(4), "conv3d channels/group");
+  pc.out_channels_per_group =
+      checked_u32_size(out.shape(4) / groups, "conv3d output channels/group");
+  pc.groups = checked_u32_size(groups, "conv3d groups");
+  pc.in_offset = checked_u32_element_offset(in, "conv3d input offset");
+  pc.wt_offset = checked_u32_element_offset(wt, "conv3d weight offset");
+  pc.out_offset = checked_u32_element_offset(out, "conv3d output offset");
+  pc.in_s0 = checked_u32_size(in.strides(0), "conv3d input stride 0");
+  pc.in_s1 = checked_u32_size(in.strides(1), "conv3d input stride 1");
+  pc.in_s2 = checked_u32_size(in.strides(2), "conv3d input stride 2");
+  pc.in_s3 = checked_u32_size(in.strides(3), "conv3d input stride 3");
+  pc.in_s4 = checked_u32_size(in.strides(4), "conv3d input stride 4");
+  pc.wt_s0 = checked_u32_size(wt.strides(0), "conv3d weight stride 0");
+  pc.wt_s1 = checked_u32_size(wt.strides(1), "conv3d weight stride 1");
+  pc.wt_s2 = checked_u32_size(wt.strides(2), "conv3d weight stride 2");
+  pc.wt_s3 = checked_u32_size(wt.strides(3), "conv3d weight stride 3");
+  pc.wt_s4 = checked_u32_size(wt.strides(4), "conv3d weight stride 4");
+  pc.out_s0 = checked_u32_size(out.strides(0), "conv3d output stride 0");
+  pc.out_s1 = checked_u32_size(out.strides(1), "conv3d output stride 1");
+  pc.out_s2 = checked_u32_size(out.strides(2), "conv3d output stride 2");
+  pc.out_s3 = checked_u32_size(out.strides(3), "conv3d output stride 3");
+  pc.out_s4 = checked_u32_size(out.strides(4), "conv3d output stride 4");
+  pc.stride_d = kernel_strides[0];
+  pc.stride_h = kernel_strides[1];
+  pc.stride_w = kernel_strides[2];
+  pc.pad_d = padding_lo[0];
+  pc.pad_h = padding_lo[1];
+  pc.pad_w = padding_lo[2];
+  pc.dilation_d = kernel_dilation[0];
+  pc.dilation_h = kernel_dilation[1];
+  pc.dilation_w = kernel_dilation[2];
+  pc.input_dilation_d = input_dilation[0];
+  pc.input_dilation_h = input_dilation[1];
+  pc.input_dilation_w = input_dilation[2];
+  pc.flip = flip ? 1u : 0u;
+  auto shader_name = std::string("dynamic_conv3d_general_f32");
+  auto glsl_source = build_conv3d_general_shader();
+  vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&wt, 1}, {&out, 2}};
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      shader_name,
+      glsl_source,
+      3,
+      arrays,
+      sizeof(Conv3dGeneralPushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(Conv3dGeneralPushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 bool try_eval_conv1d_direct_vulkan(
     array in,
     array wt,
@@ -1010,6 +1463,20 @@ bool try_eval_conv3d_vulkan(
     return false;
   }
 
+  if (try_eval_conv3d_general_direct_vulkan(
+          in,
+          wt,
+          out,
+          kernel_strides,
+          padding_lo,
+          kernel_dilation,
+          input_dilation,
+          groups,
+          flip,
+          s)) {
+    return true;
+  }
+
   auto in_work = in;
   if (input_dilation[0] != 1) {
     auto expanded = expand_dims(in_work, 2, s);
@@ -1125,7 +1592,6 @@ bool try_eval_conv3d_vulkan(
             (wt_shape[3] - 1) * wt_strides[3]),
         s);
   }
-
   auto padded =
       pad(in_work,
           std::vector<std::pair<int, int>>{

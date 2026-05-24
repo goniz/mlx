@@ -1907,7 +1907,15 @@ bool try_eval_sdpa_heads_vulkan(
       std::optional<array> mask_work;
       if (inputs.size() > 3) {
         stage = "prepare_mask_decode";
-        array mask = cast_to_f32_sdpa(inputs[3], s);
+        array mask_raw = inputs[3];
+        if (has_bool_mask) {
+          mask_raw = where(
+              mask_raw,
+              array(0.0f, float32),
+              array(finfo(float32).min, float32),
+              s);
+        }
+        array mask = cast_to_f32_sdpa(mask_raw, s);
         if (mask.ndim() == 4 && mask.shape(1) == 1) {
           mask = broadcast_to(mask, score_head_shape, s);
         }

@@ -572,9 +572,12 @@ std::string build_equal_shader(
     std::ostringstream os;
     os << vulkan::emit_dynamic_shader_preamble(bool_, bool_, false);
     os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
-    os << "layout(set = 0, binding = 0) readonly buffer InputA {uint8_t data[];} a_buf;\n";
-    os << "layout(set = 0, binding = 1) readonly buffer InputB {uint8_t data[];} b_buf;\n";
-    os << "layout(set = 0, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
+    os << vulkan::storage_buffer_layout_for_dtype(bool_, 0)
+       << " readonly buffer InputA {uint8_t data[];} a_buf;\n";
+    os << vulkan::storage_buffer_layout_for_dtype(bool_, 1)
+       << " readonly buffer InputB {uint8_t data[];} b_buf;\n";
+    os << vulkan::storage_buffer_layout_for_dtype(bool_, 2)
+       << " buffer Output {uint8_t data[];} out_buf;\n\n";
     os << "void main() {\n";
     os << "  uint idx = gl_GlobalInvocationID.x;\n";
     os << "  if (idx >= pc.total_elements) return;\n";
@@ -615,11 +618,14 @@ std::string build_equal_shader(
   }
 
   os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(scalar, binding = 0) readonly buffer InputA {"
+  os << vulkan::storage_buffer_layout_for_dtype(a_dtype, 0)
+     << " readonly buffer InputA {"
      << vulkan::dtype_to_glsl_storage_type(a_dtype) << " data[];} a_buf;\n";
-  os << "layout(scalar, binding = 1) readonly buffer InputB {"
+  os << vulkan::storage_buffer_layout_for_dtype(b_dtype, 1)
+     << " readonly buffer InputB {"
      << vulkan::dtype_to_glsl_storage_type(b_dtype) << " data[];} b_buf;\n";
-  os << "layout(scalar, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
+  os << vulkan::storage_buffer_layout_for_dtype(bool_, 2)
+     << " buffer Output {uint8_t data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
   os << "  if (linear_idx >= pc.total_elements) return;\n";
@@ -705,11 +711,14 @@ std::string build_compare_shader(
   }
 
   os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(scalar, binding = 0) readonly buffer InputA {"
+  os << vulkan::storage_buffer_layout_for_dtype(a_dtype, 0)
+     << " readonly buffer InputA {"
      << vulkan::dtype_to_glsl_storage_type(a_dtype) << " data[];} a_buf;\n";
-  os << "layout(scalar, binding = 1) readonly buffer InputB {"
+  os << vulkan::storage_buffer_layout_for_dtype(b_dtype, 1)
+     << " readonly buffer InputB {"
      << vulkan::dtype_to_glsl_storage_type(b_dtype) << " data[];} b_buf;\n";
-  os << "layout(scalar, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
+  os << vulkan::storage_buffer_layout_for_dtype(bool_, 2)
+     << " buffer Output {uint8_t data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
@@ -1275,8 +1284,10 @@ std::string build_logical_not_shader() {
   std::ostringstream os;
   os << vulkan::emit_dynamic_shader_preamble(bool_, bool_, false);
   os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer Input {uint8_t data[];} in_buf;\n";
-  os << "layout(set = 0, binding = 1) buffer Output {uint8_t data[];} out_buf;\n\n";
+  os << vulkan::storage_buffer_layout_for_dtype(bool_, 0)
+     << " readonly buffer Input {uint8_t data[];} in_buf;\n";
+  os << vulkan::storage_buffer_layout_for_dtype(bool_, 1)
+     << " buffer Output {uint8_t data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
@@ -1289,9 +1300,12 @@ std::string build_logical_binary_shader(const char* expr) {
   std::ostringstream os;
   os << vulkan::emit_dynamic_shader_preamble(bool_, bool_, false);
   os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer InputA {uint8_t data[];} a_buf;\n";
-  os << "layout(set = 0, binding = 1) readonly buffer InputB {uint8_t data[];} b_buf;\n";
-  os << "layout(set = 0, binding = 2) buffer Output {uint8_t data[];} out_buf;\n\n";
+  os << vulkan::storage_buffer_layout_for_dtype(bool_, 0)
+     << " readonly buffer InputA {uint8_t data[];} a_buf;\n";
+  os << vulkan::storage_buffer_layout_for_dtype(bool_, 1)
+     << " readonly buffer InputB {uint8_t data[];} b_buf;\n";
+  os << vulkan::storage_buffer_layout_for_dtype(bool_, 2)
+     << " buffer Output {uint8_t data[];} out_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
@@ -1787,7 +1801,8 @@ std::string build_select_dynamic_shader(Dtype dtype) {
   os << vulkan::emit_dynamic_shader_preamble(
       bool_, dtype, dtype == int64 || dtype == uint64);
   os << "layout(push_constant) uniform PushConstants { uint cond_offset; uint x_offset; uint y_offset; uint out_offset; uint total_elements; uint out_ne0; uint out_ne1; uint out_ne2; uint out_ne3; uint cond_s0; uint cond_s1; uint cond_s2; uint cond_s3; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer Condition {uint8_t data[];} cond_buf;\n";
+  os << vulkan::storage_buffer_layout_for_dtype(bool_, 0)
+     << " readonly buffer Condition {uint8_t data[];} cond_buf;\n";
   os << "layout(set = 0, binding = 1) readonly buffer InputX {"
      << vulkan::dtype_to_glsl_storage_type(dtype) << " data[];} x_buf;\n";
   os << "layout(set = 0, binding = 2) readonly buffer InputY {"

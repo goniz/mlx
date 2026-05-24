@@ -93,51 +93,11 @@ std::string join_primitive_names(const std::vector<array>& arrays) {
 }
 
 std::string dtype_to_glsl_storage(Dtype d) {
-  switch (d) {
-    case float32:
-      return "float";
-    case float16:
-      return "float16_t";
-    case bfloat16:
-      return "uint16_t";
-    case complex64:
-      return "vec2";
-    case int32:
-      return "int";
-    case uint32:
-      return "uint";
-    case int64:
-      return "int64_t";
-    case uint64:
-      return "uint64_t";
-    case int16:
-      return "int16_t";
-    case uint16:
-      return "uint16_t";
-    case int8:
-      return "int8_t";
-    case uint8:
-      return "uint8_t";
-    case bool_:
-      return "uint8_t";
-    default:
-      throw std::runtime_error(
-          fmt::format(
-              "Unsupported dtype for Vulkan compiled: {}", dtype_to_string(d)));
-  }
+  return vulkan::dtype_to_glsl_storage_type(d);
 }
 
 std::string dtype_to_glsl_compute(Dtype d) {
-  switch (d) {
-    case bfloat16:
-      return "float";
-    case complex64:
-      return "vec2";
-    case bool_:
-      return "bool";
-    default:
-      return dtype_to_glsl_storage(d);
-  }
+  return vulkan::dtype_to_glsl_compute_type(d);
 }
 
 bool has_dtype(const std::vector<array>& arrays, Dtype dtype) {
@@ -1082,116 +1042,96 @@ void Compiled::eval_gpu(
               << "\n";
   }
 
-  std::vector<uint32_t> spirv;
   if (!existing_shader) {
-    const auto compile_start = std::chrono::steady_clock::now();
+    manager.get_or_register_dynamic_shader(kernel_name, [&]() {
+      const auto compile_start = std::chrono::steady_clock::now();
 
-    // Generate GLSL source
-    std::string glsl_source;
-    uint32_t params_binding = 0;
-    for (size_t i = 0; i < inputs_.size(); ++i) {
-      if (!is_constant_(i)) {
-        params_binding++;
+      // Generate GLSL source
+      std::string glsl_source;
+      uint32_t params_binding = 0;
+      for (size_t i = 0; i < inputs_.size(); ++i) {
+        if (!is_constant_(i)) {
+          params_binding++;
+        }
       }
-    }
-    params_binding += static_cast<uint32_t>(outputs_.size());
-    build_glsl_kernel(
-        glsl_source,
-        kernel_name,
-        inputs_,
-        outputs_,
-        tape_,
-        is_constant_,
-        constant_ids_,
-        contiguous,
-        static_cast<int>(shape.size()),
-        work_per_thread,
-        params_binding);
+      params_binding += static_cast<uint32_t>(outputs_.size());
+      build_glsl_kernel(
+          glsl_source,
+          kernel_name,
+          inputs_,
+          outputs_,
+          tape_,
+          is_constant_,
+          constant_ids_,
+          contiguous,
+          static_cast<int>(shape.size()),
+          work_per_thread,
+          params_binding);
 
-    if (trace_compiled_glsl_enabled()) {
-      std::cerr << "=== Vulkan compiled GLSL: " << kernel_name << " ===\n"
-                << glsl_source << "\n=== End GLSL ===\n";
-    }
+      if (trace_compiled_glsl_enabled()) {
+        std::cerr << "=== Vulkan compiled GLSL: " << kernel_name << " ===\n"
+                  << glsl_source << "\n=== End GLSL ===\n";
+      }
 
-    if (trace_compiled_compile_flow_enabled()) {
+      if (trace_compiled_compile_flow_enabled()) {
+        const auto glsl_built_at = std::chrono::steady_clock::now();
+        const auto glsl_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                glsl_built_at - compile_start)
+                .count();
+        std::cerr << "[vulkan-compiled-flow] glsl_generated: " << kernel_name
+                  << " glsl_bytes=" << glsl_source.size() << " ms=" << glsl_ms
+                  << "\n";
+      }
+
       const auto glsl_built_at = std::chrono::steady_clock::now();
-      const auto glsl_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              glsl_built_at - compile_start)
-              .count();
-      std::cerr << "[vulkan-compiled-flow] glsl_generated: " << kernel_name
-                << " glsl_bytes=" << glsl_source.size() << " ms=" << glsl_ms
-                << "\n";
-    }
+      std::vector<uint32_t> spirv;
 
-    const auto glsl_built_at = std::chrono::steady_clock::now();
+      // Compile to SPIR-V
+      try {
+        spirv = vulkan::compile_glsl_to_spirv(glsl_source, kernel_name);
+      } catch (const std::exception& e) {
+        std::cerr << "=== FAILED GLSL for: " << kernel_name
+                  << " ===" << std::endl;
+        std::cerr << glsl_source << std::endl;
+        std::cerr << "=== End GLSL ===" << std::endl;
+        throw;
+      }
 
-    // Compile to SPIR-V
-    try {
-      spirv = vulkan::compile_glsl_to_spirv(glsl_source, kernel_name);
-    } catch (const std::exception& e) {
-      std::cerr << "=== FAILED GLSL for: " << kernel_name
-                << " ===" << std::endl;
-      std::cerr << glsl_source << std::endl;
-      std::cerr << "=== End GLSL ===" << std::endl;
-      throw;
-    }
+      const auto spirv_compiled_at = std::chrono::steady_clock::now();
 
-    const auto spirv_compiled_at = std::chrono::steady_clock::now();
+      if (trace_compiled_compile_flow_enabled()) {
+        const auto spirv_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                spirv_compiled_at - glsl_built_at)
+                .count();
+        std::cerr << "[vulkan-compiled-flow] spirv_compiled: " << kernel_name
+                  << " spirv_words=" << spirv.size() << " ms=" << spirv_ms
+                  << "\n";
+      }
 
-    if (trace_compiled_compile_flow_enabled()) {
-      const auto spirv_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              spirv_compiled_at - glsl_built_at)
-              .count();
-      std::cerr << "[vulkan-compiled-flow] spirv_compiled: " << kernel_name
-                << " spirv_words=" << spirv.size() << " ms=" << spirv_ms
-                << "\n";
-    }
-
-    // Register the shader
-    manager.register_shader(
-        kernel_name, spirv.data(), spirv.size() * sizeof(uint32_t));
-
-    if (trace_compiled_compile_flow_enabled()) {
-      const auto registered_at = std::chrono::steady_clock::now();
-      const auto register_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              registered_at - spirv_compiled_at)
-              .count();
-      const auto total_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              registered_at - compile_start)
-              .count();
-      std::cerr << "[vulkan-compiled-flow] registered: " << kernel_name
-                << " register_ms=" << register_ms << " total_ms=" << total_ms
-                << "\n";
-    }
-
-    if (trace_compiled_timing_enabled()) {
-      const auto registered_at = std::chrono::steady_clock::now();
-      const auto glsl_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              glsl_built_at - compile_start)
-              .count();
-      const auto spirv_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              spirv_compiled_at - glsl_built_at)
-              .count();
-      const auto register_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              registered_at - spirv_compiled_at)
-              .count();
-      const auto total_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              registered_at - compile_start)
-              .count();
-      std::cerr << "[vulkan-compiled-timing] kernel=" << kernel_name
-                << " glsl_ms=" << glsl_ms << " spirv_ms=" << spirv_ms
-                << " register_ms=" << register_ms << " total_ms=" << total_ms
-                << " tape_size=" << tape_.size() << " contiguous=" << contiguous
-                << " large=" << large << "\n";
-    }
+      if (trace_compiled_timing_enabled()) {
+        const auto ready_at = std::chrono::steady_clock::now();
+        const auto glsl_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                glsl_built_at - compile_start)
+                .count();
+        const auto spirv_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                spirv_compiled_at - glsl_built_at)
+                .count();
+        const auto total_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                ready_at - compile_start)
+                .count();
+        std::cerr << "[vulkan-compiled-timing] kernel=" << kernel_name
+                  << " glsl_ms=" << glsl_ms << " spirv_ms=" << spirv_ms
+                  << " total_ms=" << total_ms << " tape_size=" << tape_.size()
+                  << " contiguous=" << contiguous << " large=" << large
+                  << "\n";
+      }
+      return spirv;
+    });
   }
 
   // Allocate outputs with buffer donation

@@ -98,7 +98,10 @@ std::string build_to_fp8_f32_shader() {
   os << R"(
 layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
 layout(set = 0, binding = 0) readonly buffer Input { float data[]; } in_buf;
-layout(set = 0, binding = 1) buffer Output { uint8_t data[]; } out_buf;
+)";
+  os << vulkan::storage_buffer_layout_for_dtype(uint8, 1)
+     << " buffer Output { uint8_t data[]; } out_buf;\n";
+  os << R"(
 
 uint8_t to_fp8_e4m3(float x) {
   uint f_bits = floatBitsToUint(x);
@@ -144,8 +147,9 @@ std::string build_from_fp8_shader(Dtype out_dtype) {
                                               : "float";
   os << R"(
 layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;
-layout(set = 0, binding = 0) readonly buffer Input { uint8_t data[]; } in_buf;
 )";
+  os << vulkan::storage_buffer_layout_for_dtype(uint8, 0)
+     << " readonly buffer Input { uint8_t data[]; } in_buf;\n";
   os << "layout(set = 0, binding = 1) buffer Output { " << out_type
      << " data[]; } out_buf;\n";
   os << R"(

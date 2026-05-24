@@ -33,8 +33,11 @@ namespace vulkan = mlx::core::vulkan;
 
 using vulkan::cast_expr_for_dtype;
 using vulkan::dtype_to_glsl_storage_type;
+using vulkan::emit_bf16_conversion_helpers;
 using vulkan::emit_dynamic_shader_preamble;
 using vulkan::is_vulkan_storage_array;
+using vulkan::needs_bf16_conversion_helpers;
+using vulkan::storage_buffer_layout_for_dtype;
 using vulkan::zero_literal_for_dtype;
 
 constexpr size_t kMinTransferQueueCopyBytes = 256 * 1024;
@@ -45,10 +48,6 @@ bool has_vulkan_storage(const array& arr) {
 }
 
 std::string copy_dtype_suffix(Dtype dtype);
-bool needs_bf16_helpers(Dtype in_dtype, Dtype out_dtype);
-std::string emit_bf16_conversion_helpers();
-std::string
-bf16_cast_expr(const std::string& expr, Dtype in_dtype, Dtype out_dtype);
 
 bool has_row_contiguous_strides(const mlx::core::array& arr) {
   if (arr.ndim() == 0) {
@@ -200,6 +199,35 @@ void validate_dynamic_offset_array(
   }
 }
 
+bool index_bounds_fit_u32(
+    int64_t base,
+    const Shape& shape,
+    const Strides& strides) {
+  if (base < 0 || base > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  uint64_t max_index = static_cast<uint64_t>(base);
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (strides[i] < 0) {
+      return false;
+    }
+    if (shape[i] <= 1) {
+      continue;
+    }
+    const uint64_t extent = static_cast<uint64_t>(shape[i] - 1);
+    const uint64_t stride = static_cast<uint64_t>(strides[i]);
+    if (stride != 0 && extent > std::numeric_limits<uint64_t>::max() / stride) {
+      return false;
+    }
+    const uint64_t term = extent * stride;
+    if (term > std::numeric_limits<uint32_t>::max() - max_index) {
+      return false;
+    }
+    max_index += term;
+  }
+  return true;
+}
+
 std::string build_dynamic_offset_shader(
     Dtype dtype,
     int64_t indices_base_offset,
@@ -231,7 +259,8 @@ std::string build_dynamic_general_copy_shader(
     const Strides& i_strides,
     const Strides& o_strides,
     bool has_dynamic_i_offset,
-    bool has_dynamic_o_offset) {
+    bool has_dynamic_o_offset,
+    bool use_u32_indices) {
   auto glsl_i64_literal = [](int64_t value) {
     if (value < 0) {
       return std::string("(-") + std::to_string(static_cast<uint64_t>(-value)) +
@@ -240,20 +269,27 @@ std::string build_dynamic_general_copy_shader(
     return std::to_string(static_cast<uint64_t>(value)) + "l";
   };
   std::ostringstream os;
-  os << emit_dynamic_shader_preamble(in_dtype, out_dtype, true);
-  if (needs_bf16_helpers(in_dtype, out_dtype)) {
+  os << emit_dynamic_shader_preamble(in_dtype, out_dtype, !use_u32_indices);
+  if (needs_bf16_conversion_helpers(in_dtype, out_dtype)) {
     os << emit_bf16_conversion_helpers();
   }
   os << "layout(push_constant) uniform PushConstants {\n";
   os << "  uint total_elements;\n";
-  os << "  int64_t input_base;\n";
-  os << "  int64_t output_base;\n";
-  os << "  int64_t dynamic_i_base;\n";
-  os << "  int64_t dynamic_o_base;\n";
+  if (use_u32_indices) {
+    os << "  uint input_base;\n";
+    os << "  uint output_base;\n";
+  } else {
+    os << "  int64_t input_base;\n";
+    os << "  int64_t output_base;\n";
+    os << "  int64_t dynamic_i_base;\n";
+    os << "  int64_t dynamic_o_base;\n";
+  }
   os << "} pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
+  os << storage_buffer_layout_for_dtype(in_dtype, 0)
+     << " readonly buffer InputBuffer {"
      << dtype_to_glsl_storage_type(in_dtype) << " data[];} input_buf;\n";
-  os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
+  os << storage_buffer_layout_for_dtype(out_dtype, 1)
+     << " buffer OutputBuffer {"
      << dtype_to_glsl_storage_type(out_dtype) << " data[];} output_buf;\n";
   if (has_dynamic_i_offset) {
     os << "layout(set = 0, binding = 2) readonly buffer DynamicInputOffset {int64_t data[];} dynamic_i_offset_buf;\n";
@@ -266,8 +302,10 @@ std::string build_dynamic_general_copy_shader(
   os << "  if (linear_idx >= pc.total_elements) {\n";
   os << "    return;\n";
   os << "  }\n";
-  os << "  int64_t input_index = pc.input_base;\n";
-  os << "  int64_t output_index = pc.output_base;\n";
+  os << "  " << (use_u32_indices ? "uint" : "int64_t")
+     << " input_index = pc.input_base;\n";
+  os << "  " << (use_u32_indices ? "uint" : "int64_t")
+     << " output_index = pc.output_base;\n";
   if (has_dynamic_i_offset) {
     os << "  input_index += dynamic_i_offset_buf.data[uint(pc.dynamic_i_base)];\n";
   }
@@ -281,29 +319,40 @@ std::string build_dynamic_general_copy_shader(
       os << "    uint coord = remaining % " << static_cast<uint32_t>(shape[dim])
          << "u;\n";
       os << "    remaining /= " << static_cast<uint32_t>(shape[dim]) << "u;\n";
-      os << "    input_index += int64_t(coord) * "
-         << glsl_i64_literal(i_strides[dim]) << ";\n";
-      os << "    output_index += int64_t(coord) * "
-         << glsl_i64_literal(o_strides[dim]) << ";\n";
+      if (use_u32_indices) {
+        os << "    input_index += coord * "
+           << static_cast<uint32_t>(i_strides[dim]) << "u;\n";
+        os << "    output_index += coord * "
+           << static_cast<uint32_t>(o_strides[dim]) << "u;\n";
+      } else {
+        os << "    input_index += int64_t(coord) * "
+           << glsl_i64_literal(i_strides[dim]) << ";\n";
+        os << "    output_index += int64_t(coord) * "
+           << glsl_i64_literal(o_strides[dim]) << ";\n";
+      }
       os << "  }\n";
     }
   }
+  const std::string input_index_expr =
+      use_u32_indices ? "input_index" : "uint(input_index)";
+  const std::string output_index_expr =
+      use_u32_indices ? "output_index" : "uint(output_index)";
   std::string cast_expr;
-  if (needs_bf16_helpers(in_dtype, out_dtype)) {
-    cast_expr = bf16_cast_expr(
-        "input_buf.data[uint(input_index)]", in_dtype, out_dtype);
+  if (needs_bf16_conversion_helpers(in_dtype, out_dtype)) {
+    cast_expr = cast_expr_for_dtype(
+        "input_buf.data[" + input_index_expr + "]", in_dtype, out_dtype);
   } else if (
       in_dtype == mlx::core::complex64 && out_dtype == mlx::core::float32) {
-    cast_expr = "input_buf.data[input_index].x";
+    cast_expr = "input_buf.data[" + input_index_expr + "].x";
   } else if (
       in_dtype == mlx::core::float32 && out_dtype == mlx::core::complex64) {
-    cast_expr =
-        "vec2(" + std::string("input_buf.data[uint(input_index)]") + ", 0.0)";
+    cast_expr = "vec2(input_buf.data[" + input_index_expr + "], 0.0)";
   } else {
     cast_expr = cast_expr_for_dtype(
-        "input_buf.data[uint(input_index)]", in_dtype, out_dtype);
+        "input_buf.data[" + input_index_expr + "]", in_dtype, out_dtype);
   }
-  os << "  output_buf.data[uint(output_index)] = " << cast_expr << ";\n";
+  os << "  output_buf.data[" << output_index_expr << "] = " << cast_expr
+     << ";\n";
   os << "}\n";
   return os.str();
 }
@@ -397,9 +446,16 @@ bool dispatch_dynamic_general_copy(
       dynamic_i_offset.has_value() ? element_offset(*dynamic_i_offset) : 0;
   const int64_t dynamic_o_base_offset =
       dynamic_o_offset.has_value() ? element_offset(*dynamic_o_offset) : 0;
+  const int64_t input_base = in_base_offset + i_offset;
+  const int64_t output_base = out_base_offset + o_offset;
+  const bool use_u32_indices = !dynamic_i_offset.has_value() &&
+      !dynamic_o_offset.has_value() &&
+      index_bounds_fit_u32(input_base, shape, i_strides) &&
+      index_bounds_fit_u32(output_base, shape, o_strides);
 
   std::ostringstream layout_key;
   layout_key << static_cast<int>(in.dtype().val()) << ':'
+             << use_u32_indices << ':'
              << dynamic_i_offset.has_value() << ':'
              << dynamic_o_offset.has_value() << ':';
   append_layout_key(layout_key, shape);
@@ -419,7 +475,8 @@ bool dispatch_dynamic_general_copy(
       i_strides,
       o_strides,
       dynamic_i_offset.has_value(),
-      dynamic_o_offset.has_value());
+      dynamic_o_offset.has_value(),
+      use_u32_indices);
 
   std::vector<vulkan::DynamicArrayRef> arrays;
   arrays.push_back({&in, 0});
@@ -431,36 +488,56 @@ bool dispatch_dynamic_general_copy(
     arrays.push_back({&*dynamic_o_offset, 3});
   }
 
-  struct PushConstants {
+  struct PushConstants32 {
+    uint32_t total_elements;
+    uint32_t input_base;
+    uint32_t output_base;
+  };
+  struct PushConstants64 {
     uint32_t total_elements;
     int64_t input_base;
     int64_t output_base;
     int64_t dynamic_i_base;
     int64_t dynamic_o_base;
   };
-  constexpr uint32_t kPushConstantSize = sizeof(PushConstants);
+  const uint32_t push_constant_size = use_u32_indices
+      ? static_cast<uint32_t>(sizeof(PushConstants32))
+      : static_cast<uint32_t>(sizeof(PushConstants64));
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name,
       glsl_source,
       static_cast<uint32_t>(arrays.size()),
       arrays.data(),
-      kPushConstantSize,
+      push_constant_size,
       s);
 
-  PushConstants pc{};
-  pc.total_elements = static_cast<uint32_t>(total_elements);
-  pc.input_base = in_base_offset + i_offset;
-  pc.output_base = out_base_offset + o_offset;
-  pc.dynamic_i_base = dynamic_i_base_offset;
-  pc.dynamic_o_base = dynamic_o_base_offset;
-
-  vkCmdPushConstants(
-      dispatch.command_buffer,
-      dispatch.pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      kPushConstantSize,
-      &pc);
+  if (use_u32_indices) {
+    PushConstants32 pc{};
+    pc.total_elements = static_cast<uint32_t>(total_elements);
+    pc.input_base = static_cast<uint32_t>(input_base);
+    pc.output_base = static_cast<uint32_t>(output_base);
+    vkCmdPushConstants(
+        dispatch.command_buffer,
+        dispatch.pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        push_constant_size,
+        &pc);
+  } else {
+    PushConstants64 pc{};
+    pc.total_elements = static_cast<uint32_t>(total_elements);
+    pc.input_base = input_base;
+    pc.output_base = output_base;
+    pc.dynamic_i_base = dynamic_i_base_offset;
+    pc.dynamic_o_base = dynamic_o_base_offset;
+    vkCmdPushConstants(
+        dispatch.command_buffer,
+        dispatch.pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        push_constant_size,
+        &pc);
+  }
 
   const uint32_t workgroups = std::max<uint32_t>(
       (static_cast<uint32_t>(total_elements) + 255u) / 256u, 1u);
@@ -492,21 +569,23 @@ bool dispatch_dynamic_scalar_fill(
 
   std::ostringstream os;
   os << emit_dynamic_shader_preamble(in.dtype(), out.dtype(), false);
-  if (needs_bf16_helpers(in.dtype(), out.dtype())) {
+  if (needs_bf16_conversion_helpers(in.dtype(), out.dtype())) {
     os << emit_bf16_conversion_helpers();
   }
   os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
+  os << storage_buffer_layout_for_dtype(in.dtype(), 0)
+     << " readonly buffer InputBuffer {"
      << dtype_to_glsl_storage_type(in.dtype()) << " data[];} input_buf;\n";
-  os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
+  os << storage_buffer_layout_for_dtype(out.dtype(), 1)
+     << " buffer OutputBuffer {"
      << dtype_to_glsl_storage_type(out.dtype()) << " data[];} output_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
   std::string cast_expr;
-  if (needs_bf16_helpers(in.dtype(), out.dtype())) {
-    cast_expr =
-        bf16_cast_expr("input_buf.data[pc.in_offset]", in.dtype(), out.dtype());
+  if (needs_bf16_conversion_helpers(in.dtype(), out.dtype())) {
+    cast_expr = cast_expr_for_dtype(
+        "input_buf.data[pc.in_offset]", in.dtype(), out.dtype());
   } else if (
       in.dtype() == mlx::core::complex64 && out.dtype() == mlx::core::float32) {
     cast_expr = "input_buf.data[pc.in_offset].x";
@@ -558,65 +637,20 @@ bool dispatch_dynamic_scalar_fill(
   return true;
 }
 
-bool needs_bf16_helpers(Dtype in_dtype, Dtype out_dtype) {
-  return in_dtype == mlx::core::bfloat16 || out_dtype == mlx::core::bfloat16;
-}
-
-std::string emit_bf16_conversion_helpers() {
-  std::ostringstream os;
-  os << "uint fp32_to_bf16(float f) {\n";
-  os << "  uint u = floatBitsToUint(f);\n";
-  os << "  u = (u + (0x7fffu + ((u >> 16) & 1u))) >> 16;\n";
-  os << "  return u;\n";
-  os << "}\n\n";
-  os << "float bf16_to_fp32(uint u) {\n";
-  os << "  return uintBitsToFloat(u << 16);\n";
-  os << "}\n\n";
-  return os.str();
-}
-
-std::string
-bf16_cast_expr(const std::string& expr, Dtype in_dtype, Dtype out_dtype) {
-  const bool in_is_bf16 = in_dtype == mlx::core::bfloat16;
-  const bool out_is_bf16 = out_dtype == mlx::core::bfloat16;
-
-  if (in_is_bf16 && out_is_bf16) {
-    return expr;
-  }
-
-  if (in_is_bf16 && !out_is_bf16) {
-    std::string as_float = "bf16_to_fp32(uint(" + expr + "))";
-    if (out_dtype == mlx::core::bool_) {
-      return "(" + as_float + " != 0.0 ? uint8_t(1) : uint8_t(0))";
-    }
-    return dtype_to_glsl_storage_type(out_dtype) + "(" + as_float + ")";
-  }
-
-  if (!in_is_bf16 && out_is_bf16) {
-    std::string intermediate;
-    if (in_dtype == mlx::core::bool_) {
-      intermediate = "float(" + expr + ")";
-    } else {
-      intermediate = "float(" + expr + ")";
-    }
-    return "uint16_t(fp32_to_bf16(" + intermediate + "))";
-  }
-
-  return {};
-}
-
 std::string build_dynamic_vector_cast_shader(Dtype in_dtype, Dtype out_dtype) {
   std::ostringstream os;
   os << emit_dynamic_shader_preamble(in_dtype, out_dtype, false);
 
-  if (needs_bf16_helpers(in_dtype, out_dtype)) {
+  if (needs_bf16_conversion_helpers(in_dtype, out_dtype)) {
     os << emit_bf16_conversion_helpers();
   }
 
   os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer InputBuffer {"
+  os << storage_buffer_layout_for_dtype(in_dtype, 0)
+     << " readonly buffer InputBuffer {"
      << dtype_to_glsl_storage_type(in_dtype) << " data[];} input_buf;\n";
-  os << "layout(set = 0, binding = 1) buffer OutputBuffer {"
+  os << storage_buffer_layout_for_dtype(out_dtype, 1)
+     << " buffer OutputBuffer {"
      << dtype_to_glsl_storage_type(out_dtype) << " data[];} output_buf;\n\n";
   os << "void main() {\n";
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
@@ -626,14 +660,8 @@ std::string build_dynamic_vector_cast_shader(Dtype in_dtype, Dtype out_dtype) {
   os << "  uint input_index = linear_idx + pc.in_offset;\n";
   os << "  uint output_index = linear_idx + pc.out_offset;\n";
 
-  std::string cast_expr;
-  if (needs_bf16_helpers(in_dtype, out_dtype)) {
-    cast_expr =
-        bf16_cast_expr("input_buf.data[input_index]", in_dtype, out_dtype);
-  } else {
-    cast_expr =
-        cast_expr_for_dtype("input_buf.data[input_index]", in_dtype, out_dtype);
-  }
+  std::string cast_expr =
+      cast_expr_for_dtype("input_buf.data[input_index]", in_dtype, out_dtype);
 
   os << "  output_buf.data[output_index] = " << cast_expr << ";\n";
   os << "}\n";

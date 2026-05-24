@@ -298,7 +298,10 @@ bool fp_dequantize_to_float32_fallback(
   os << R"(
 layout(push_constant) uniform PushConstants { uint total_elements; } pc;
 layout(set = 0, binding = 0) readonly buffer Packed { uint data[]; } packed_buf;
-layout(set = 0, binding = 1) readonly buffer Scales { uint8_t data[]; } scale_buf;
+)";
+  os << vulkan::storage_buffer_layout_for_dtype(uint8, 1)
+     << " readonly buffer Scales { uint8_t data[]; } scale_buf;\n";
+  os << R"(
 layout(set = 0, binding = 2) buffer Output { float data[]; } out_buf;
 
 float fp8_e4m3_to_fp32(uint8_t x) {
@@ -449,17 +452,9 @@ bool fp_gather_qmm_fused(
   pc.bits = static_cast<uint32_t>(bits);
 
   std::ostringstream os;
-  os << "#version 450\n";
-  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
-  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
-  os << "#extension GL_EXT_shader_8bit_storage : require\n";
-  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
-  os << "#extension GL_EXT_shader_16bit_storage : require\n";
-  if (vulkan::uses_float16_extension(x.dtype()) ||
-      vulkan::uses_float16_extension(out.dtype())) {
-    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
-  }
-  os << "\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  vulkan::DynamicShaderPreambleOptions preamble_options;
+  preamble_options.dtypes = {uint8, x.dtype(), out.dtype()};
+  os << vulkan::emit_dynamic_shader_preamble(preamble_options);
   os << "#define X_TYPE " << vulkan::dtype_to_glsl_storage_type(x.dtype())
      << "\n";
   os << "#define OUT_TYPE " << vulkan::dtype_to_glsl_storage_type(out.dtype())
@@ -492,7 +487,10 @@ layout(push_constant) uniform PushConstants {
   uint bits;
 } p;
 layout(set = 0, binding = 0) readonly buffer W { uint data[]; } w;
-layout(set = 0, binding = 1) readonly buffer Scales { uint8_t data[]; } scales;
+)";
+  os << vulkan::storage_buffer_layout_for_dtype(uint8, 1)
+     << " readonly buffer Scales { uint8_t data[]; } scales;\n";
+  os << R"(
 layout(set = 0, binding = 2) readonly buffer X { X_TYPE data[]; } x;
 layout(set = 0, binding = 3) readonly buffer LhsIndices { uint data[]; } lhs;
 layout(set = 0, binding = 4) readonly buffer RhsIndices { uint data[]; } rhs;
@@ -636,9 +634,13 @@ void main() {
       {&rhs_indices, 4},
       {&out, 5},
   };
+  const std::string shader_name =
+      std::string(bits == 4 ? "dynamic_gather_mxfp4_qmm"
+                            : "dynamic_gather_mxfp8_qmm") +
+      "_x" + std::to_string(static_cast<int>(x.dtype().val())) + "_o" +
+      std::to_string(static_cast<int>(out.dtype().val()));
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      bits == 4 ? "dynamic_gather_mxfp4_qmm_f32"
-                : "dynamic_gather_mxfp8_qmm_f32",
+      shader_name,
       os.str(),
       6,
       arrays,

@@ -176,7 +176,59 @@ std::optional<vulkan::StaticShaderId> matvec_shader_name(
 
 std::vector<vulkan::StaticShaderId> matvec_shader_candidates(
     Dtype matrix_dtype,
-    Dtype vec_dtype) {
+    Dtype vec_dtype,
+    Dtype out_dtype = float32) {
+  if (matrix_dtype == bfloat16 && vec_dtype == float16 &&
+      out_dtype == bfloat16 &&
+      vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+    if (prefer_subgroup_matvec()) {
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_bf16_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_bf16_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_bf16,
+      };
+    }
+    return {
+        vulkan::StaticShaderId::mul_mat_vec_bf16_f16_bf16,
+        vulkan::StaticShaderId::mul_mat_vec_bf16_f16_bf16_subgroup,
+        vulkan::StaticShaderId::mul_mat_vec_bf16_f16_bf16_subgroup_no_shmem,
+    };
+  }
+  if (matrix_dtype == bfloat16 && vec_dtype == bfloat16 &&
+      vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+    if (out_dtype == bfloat16) {
+      if (prefer_subgroup_matvec()) {
+        return {
+            vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16_subgroup,
+            vulkan::StaticShaderId::
+                mul_mat_vec_bf16_bf16_bf16_subgroup_no_shmem,
+            vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16,
+        };
+      }
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16_subgroup,
+          vulkan::StaticShaderId::
+              mul_mat_vec_bf16_bf16_bf16_subgroup_no_shmem,
+      };
+    }
+    if (out_dtype == float32) {
+      if (prefer_subgroup_matvec()) {
+        return {
+            vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32_subgroup,
+            vulkan::StaticShaderId::
+                mul_mat_vec_bf16_bf16_f32_subgroup_no_shmem,
+            vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32,
+        };
+      }
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32_subgroup_no_shmem,
+      };
+    }
+  }
+
   auto base = matvec_shader_name(matrix_dtype, vec_dtype);
   if (!base.has_value()) {
     return {};
@@ -890,19 +942,26 @@ bool try_eval_matvec_vulkan(
   }
 
   Dtype vec_shader_dtype = vec.dtype();
-  if (vec_shader_dtype == bfloat16) {
+  const bool can_use_bf16_vec = matrix.dtype() == bfloat16 &&
+      vec_shader_dtype == bfloat16 &&
+      vulkan::VulkanContext::get().shader_bfloat16_supported();
+  if (vec_shader_dtype == bfloat16 && !can_use_bf16_vec) {
     vec = cast_to_float16_scratch(vec, s, kMatvecVectorCastScratchLane);
     vec_shader_dtype = float16;
   }
 
   auto shader_candidates =
-      matvec_shader_candidates(matrix.dtype(), vec_shader_dtype);
+      matvec_shader_candidates(matrix.dtype(), vec_shader_dtype, out.dtype());
   if (shader_candidates.empty()) {
     return false;
   }
 
   const bool needs_out_copy =
-      out.dtype() != float32 || !is_row_contiguous_zero_offset(out);
+      !is_row_contiguous_zero_offset(out) ||
+      (out.dtype() != float32 &&
+       !(matrix.dtype() == bfloat16 &&
+         (vec_shader_dtype == float16 || vec_shader_dtype == bfloat16) &&
+         out.dtype() == bfloat16));
   array out_work = out;
   if (needs_out_copy) {
     out_work = vulkan::acquire_scratch_array(
@@ -937,6 +996,17 @@ bool try_eval_matvec_vulkan(
       }
     }
     if (dispatched) {
+      if (matmul_debug_enabled()) {
+        std::cerr << "[vulkan::matvec] shader="
+                  << vulkan::static_shader_name(shader_id)
+                  << " matrix_shape=" << matrix.shape()
+                  << " matrix_dtype=" << matrix.dtype()
+                  << " vec_shape=" << vec.shape()
+                  << " vec_dtype=" << vec.dtype()
+                  << " out_shape=" << out.shape() << " out_dtype="
+                  << out.dtype() << " needs_out_copy=" << needs_out_copy
+                  << "\n";
+      }
       if (needs_out_copy) {
         vulkan::mark_scratch_array_written(s, kMatvecOutScratchLane);
         copy_gpu(out_work, out, CopyType::General, s);

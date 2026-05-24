@@ -819,6 +819,169 @@ bool fp_dequantize_to_float32(
   return fp_dequantize_to_float32_fallback(w, scales, out, s, group_size, bits);
 }
 
+bool fp_quantize_dequantize_to_float32(
+    const array& in,
+    array& out,
+    Stream s,
+    int group_size,
+    int bits) {
+  if (in.dtype() != float32 || out.dtype() != float32) {
+    return false;
+  }
+  if (group_size != 32 || (bits != 4 && bits != 8)) {
+    return false;
+  }
+  if (in.shape() != out.shape() || (in.size() % group_size) != 0) {
+    return false;
+  }
+
+  array in_work = ensure_row_contiguous_zero_offset(in, s);
+  if (!is_row_contiguous_zero_offset(in_work)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(float32, float32, false);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint total_elements; } pc;
+layout(set = 0, binding = 0) readonly buffer Input { float data[]; } in_buf;
+layout(set = 0, binding = 1) buffer Output { float data[]; } out_buf;
+
+uint to_fp8_e4m3(float x) {
+  uint f_bits = floatBitsToUint(x);
+  uint sign = f_bits & 0x80000000u;
+  f_bits ^= sign;
+
+  uint f_bits_low = floatBitsToUint(uintBitsToFloat(f_bits) + uintBitsToFloat(141u << 23));
+  uint result_low = f_bits_low - (141u << 23);
+
+  uint mant_odd = (f_bits >> 20) & 1u;
+  uint f_bits_high = f_bits + (((7u - 127u) << 23) + 0x7FFFFu);
+  f_bits_high += mant_odd;
+  uint result_high = f_bits_high >> 20;
+
+  uint result = f_bits < (121u << 23) ? result_low : result_high;
+  if (f_bits >= (543u << 21)) {
+    result = 0x7Eu;
+  }
+  return result | (sign >> 24);
+}
+
+float fp8_e4m3_to_fp32(uint x) {
+  uint exponent = (x >> 3u) & 15u;
+  uint mantissa = x & 7u;
+  float result = 0.0;
+  if (exponent == 0u) {
+    result = float(mantissa) * 0.001953125;
+  } else {
+    result = exp2(float(int(exponent) - 7)) *
+        (1.0 + float(mantissa) * 0.125);
+  }
+  return (x & 128u) != 0u ? -result : result;
+}
+
+float fp4_to_float(uint q) {
+  switch (q & 15u) {
+    case 0u: return 0.0;
+    case 1u: return 0.5;
+    case 2u: return 1.0;
+    case 3u: return 1.5;
+    case 4u: return 2.0;
+    case 5u: return 3.0;
+    case 6u: return 4.0;
+    case 7u: return 6.0;
+    case 8u: return -0.0;
+    case 9u: return -0.5;
+    case 10u: return -1.0;
+    case 11u: return -1.5;
+    case 12u: return -2.0;
+    case 13u: return -3.0;
+    case 14u: return -4.0;
+    default: return -6.0;
+  }
+}
+
+uint fp32_to_fp4_e2m1(float x) {
+  uint sign_bit = (floatBitsToUint(x) & 0x80000000u) != 0u ? 8u : 0u;
+  x = abs(x);
+
+  uint bits;
+  if (x > 5.0) {
+    bits = 7u;
+  } else if (x >= 3.5) {
+    bits = 6u;
+  } else if (x > 2.5) {
+    bits = 5u;
+  } else if (x >= 1.75) {
+    bits = 4u;
+  } else if (x > 1.25) {
+    bits = 3u;
+  } else if (x >= 0.75) {
+    bits = 2u;
+  } else if (x > 0.25) {
+    bits = 1u;
+  } else {
+    bits = 0u;
+  }
+  return bits | sign_bit;
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= pc.total_elements) return;
+
+  uint group_base = (idx / 32u) * 32u;
+  float max_abs = 0.0;
+  for (uint i = 0u; i < 32u; ++i) {
+    max_abs = max(max_abs, abs(in_buf.data[group_base + i]));
+  }
+)";
+  if (bits == 4) {
+    os << R"(
+  float scale = max_abs == 0.0 ? 1.0 : exp2(round(log2(max_abs / 6.0)));
+  float normalized = in_buf.data[idx] / scale;
+  out_buf.data[idx] = scale * fp4_to_float(fp32_to_fp4_e2m1(normalized));
+}
+)";
+  } else {
+    os << R"(
+  float scale = max_abs == 0.0 ? 1.0 : exp2(round(log2(max_abs / 448.0)));
+  float normalized = in_buf.data[idx] / scale;
+  out_buf.data[idx] = scale * fp8_e4m3_to_fp32(to_fp8_e4m3(normalized));
+}
+)";
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&in_work, 0},
+      {&out, 1},
+  };
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t);
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      bits == 4 ? "dynamic_mxfp4_qdq_f32" : "dynamic_mxfp8_qdq_f32",
+      os.str(),
+      2,
+      arrays,
+      kPushConstantSize,
+      s);
+  const uint32_t total_elements = static_cast<uint32_t>(out.size());
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &total_elements);
+  vkCmdDispatch(dispatch.command_buffer, (total_elements + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 bool nvfp4_quantize_from_float32(
     const array& in,
     array& w,
@@ -1245,17 +1408,12 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   if (mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Mxfp8) {
     array x_f32 = ensure_float32_row_contiguous(inputs[0], s);
-    auto x_q = quantize(x_f32, group_size_, bits_, mode, std::nullopt, s);
-    array xhat = dequantize(
-        x_q[0],
-        x_q[1],
-        std::nullopt,
-        group_size_,
-        bits_,
-        mode,
-        std::nullopt,
-        float32,
-        s);
+    array xhat(x_f32.shape(), float32, nullptr, {});
+    if (!vulkan::fp_quantize_dequantize_to_float32(
+            x_f32, xhat, s, group_size_, bits_)) {
+      throw std::runtime_error(
+          "[QQMatmul::eval_gpu] Failed to quantize-dequantize lhs on Vulkan.");
+    }
 
     array what(
         expanded_quantized_shape(inputs[1], bits_), float32, nullptr, {});
@@ -1273,6 +1431,10 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           "[QQMatmul::eval_gpu] Failed to dispatch Vulkan fallback matmul.");
     }
 
+    if (result.dtype() == out.dtype()) {
+      out.copy_shared_buffer(result);
+      return;
+    }
     out.set_data(allocator::malloc(out.nbytes()));
     copy_gpu(result, out, CopyType::General, s);
     return;
@@ -1337,6 +1499,10 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
             {cols, rows, 1u});
         vulkan::end_command_recording(s.index);
       }
+      if (out_work.dtype() == out.dtype()) {
+        out.copy_shared_buffer(out_work);
+        return;
+      }
       out.set_data(allocator::malloc(out.nbytes()));
       copy_gpu(out_work, out, CopyType::General, s);
       return;
@@ -1379,6 +1545,10 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         "[QQMatmul::eval_gpu] Failed to dispatch Vulkan fallback matmul.");
   }
 
+  if (result.dtype() == out.dtype()) {
+    out.copy_shared_buffer(result);
+    return;
+  }
   out.set_data(allocator::malloc(out.nbytes()));
   copy_gpu(result, out, CopyType::General, s);
 }

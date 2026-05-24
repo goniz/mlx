@@ -3,7 +3,9 @@
 #pragma once
 
 #include <vulkan/vulkan.hpp>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -107,6 +109,11 @@ class KernelManager {
   ShaderModule* get_shader(StaticShaderId id);
   ShaderModule* get_shader(const std::string& name);
 
+  // Get an existing dynamic shader or serialize first-time registration.
+  ShaderModule* get_or_register_dynamic_shader(
+      const std::string& name,
+      const std::function<std::vector<uint32_t>()>& compile_spirv);
+
   // Register a dynamic shader from SPIR-V data.
   void
   register_shader(const std::string& name, const void* data, size_t size_bytes);
@@ -173,6 +180,7 @@ class KernelManager {
       const void* data,
       size_t size_bytes);
   vk::ShaderModule compile_shader(const std::vector<uint32_t>& spirv);
+  ShaderModule* get_dynamic_shader(const std::string& name);
   static DescriptorBindingKey make_descriptor_binding_key(
       const vk::DescriptorSetLayoutBinding& binding);
   void purge_descriptor_sets_for_layouts(
@@ -191,6 +199,17 @@ class KernelManager {
   std::mutex static_registry_mutex_;
   std::mutex shader_cache_mutex_;
   std::mutex pipeline_cache_mutex_;
+
+  struct DynamicShaderRegistration {
+    bool compiling{true};
+    std::condition_variable cv;
+  };
+
+  std::mutex dynamic_shader_registration_mutex_;
+  std::unordered_map<
+      std::string,
+      std::shared_ptr<DynamicShaderRegistration>>
+      dynamic_shader_registrations_;
 
   struct DescriptorSetRecord {
     vk::DescriptorSet set;

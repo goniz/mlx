@@ -1164,6 +1164,76 @@ void KernelManager::register_shader(
   shader->module = VK_NULL_HANDLE;
 }
 
+ShaderModule* KernelManager::get_dynamic_shader(const std::string& name) {
+  std::lock_guard<std::mutex> lock(shader_cache_mutex_);
+  auto it = dynamic_shaders_.find(name);
+  if (it == dynamic_shaders_.end()) {
+    return nullptr;
+  }
+  return it->second.get();
+}
+
+ShaderModule* KernelManager::get_or_register_dynamic_shader(
+    const std::string& name,
+    const std::function<std::vector<uint32_t>()>& compile_spirv) {
+  if (auto* shader = get_dynamic_shader(name)) {
+    return shader;
+  }
+
+  std::shared_ptr<DynamicShaderRegistration> registration;
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(dynamic_shader_registration_mutex_);
+      auto it = dynamic_shader_registrations_.find(name);
+      if (it == dynamic_shader_registrations_.end()) {
+        registration = std::make_shared<DynamicShaderRegistration>();
+        dynamic_shader_registrations_.emplace(name, registration);
+        break;
+      }
+      registration = it->second;
+      registration->cv.wait(lock, [&registration]() {
+        return !registration->compiling;
+      });
+    }
+    if (auto* shader = get_dynamic_shader(name)) {
+      return shader;
+    }
+  }
+
+  auto finish_registration = [&]() {
+    {
+      std::lock_guard<std::mutex> lock(dynamic_shader_registration_mutex_);
+      registration->compiling = false;
+      auto it = dynamic_shader_registrations_.find(name);
+      if (it != dynamic_shader_registrations_.end() &&
+          it->second == registration) {
+        dynamic_shader_registrations_.erase(it);
+      }
+    }
+    registration->cv.notify_all();
+  };
+
+  try {
+    if (auto* shader = get_dynamic_shader(name)) {
+      finish_registration();
+      return shader;
+    }
+
+    auto spirv = compile_spirv();
+    register_shader(name, spirv.data(), spirv.size() * sizeof(uint32_t));
+  } catch (...) {
+    finish_registration();
+    throw;
+  }
+
+  finish_registration();
+  auto* shader = get_dynamic_shader(name);
+  if (shader == nullptr) {
+    throw std::runtime_error("Failed to register dynamic shader: " + name);
+  }
+  return shader;
+}
+
 void KernelManager::ensure_static_registry_initialized() {
   if (static_registry_initialized_) {
     return;
@@ -2098,6 +2168,20 @@ void KernelManager::purge_descriptor_sets_for_layouts(
 
 void KernelManager::cleanup() {
   reclaim_all_descriptor_sets();
+  std::vector<std::shared_ptr<DynamicShaderRegistration>> registrations;
+  {
+    std::lock_guard<std::mutex> lock(dynamic_shader_registration_mutex_);
+    registrations.reserve(dynamic_shader_registrations_.size());
+    for (auto& entry : dynamic_shader_registrations_) {
+      auto& registration = entry.second;
+      registration->compiling = false;
+      registrations.push_back(registration);
+    }
+    dynamic_shader_registrations_.clear();
+  }
+  for (auto& registration : registrations) {
+    registration->cv.notify_all();
+  }
   {
     std::lock_guard<std::mutex> pipeline_lock(pipeline_cache_mutex_);
     pipelines_.clear();
@@ -4113,13 +4197,9 @@ void ensure_dynamic_shader_registered(
     const std::string& shader_name,
     const std::string& glsl_source) {
   auto& manager = KernelManager::get();
-  if (manager.get_shader(shader_name) != nullptr) {
-    return;
-  }
-
-  auto spirv = compile_glsl_to_spirv(glsl_source, shader_name);
-  manager.register_shader(
-      shader_name, spirv.data(), spirv.size() * sizeof(uint32_t));
+  manager.get_or_register_dynamic_shader(shader_name, [&]() {
+    return compile_glsl_to_spirv(glsl_source, shader_name);
+  });
 }
 
 bool is_vulkan_storage_array(const array& arr) {

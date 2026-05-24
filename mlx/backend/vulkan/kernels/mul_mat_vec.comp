@@ -16,6 +16,15 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 uint a_offset, b_offset, d_offset, y_offset;
 
+FLOAT_TYPE load_b_scalar(uint idx)
+{
+#ifdef B_IS_BF16
+    return FLOAT_TYPE(bf16_to_fp32(data_b[idx]));
+#else
+    return FLOAT_TYPE(data_b[idx]);
+#endif
+}
+
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i, bool lastiter)
 {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -42,9 +51,9 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const bool OOB = lastiter && (iybs + iqs + y_offset >= p.ncols);
 
         FLOAT_TYPE b0 = 0, b1 = 0;
-        b0 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]);
+        b0 = load_b_scalar(j*p.batch_stride_b + b_offset + iybs + iqs);
         if (!OOB) {
-            b1 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]);
+            b1 = load_b_scalar(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset);
         }
 #endif
         uint ibi = first_row*p.ncols;

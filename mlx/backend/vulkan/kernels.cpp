@@ -21,6 +21,18 @@ namespace mlx::core::vulkan {
 
 constexpr uint32_t kMaxMulMatVecCols = 8;
 
+uint32_t matvec_rows_per_workgroup() {
+  static const uint32_t value = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_MATVEC_ROWS_PER_WG");
+        env != nullptr) {
+      return std::clamp<uint32_t>(
+          static_cast<uint32_t>(std::strtoul(env, nullptr, 10)), 1u, 8u);
+    }
+    return 1u;
+  }();
+  return value;
+}
+
 namespace {
 
 constexpr char kSoftmaxLargeMaxScratchLane[] = "softmax.large.tmp_max";
@@ -3461,8 +3473,12 @@ void dispatch_mul_mat_vec_op(
   }};
 
   constexpr uint32_t kMaxWorkgroupsX = 65535u;
-  const uint32_t groups_z = (nrows + kMaxWorkgroupsX - 1u) / kMaxWorkgroupsX;
-  const uint32_t groups_x = (nrows + groups_z - 1u) / groups_z;
+  const uint32_t rows_per_workgroup = matvec_rows_per_workgroup();
+  const uint32_t row_groups =
+      (nrows + rows_per_workgroup - 1u) / rows_per_workgroup;
+  const uint32_t groups_z =
+      (row_groups + kMaxWorkgroupsX - 1u) / kMaxWorkgroupsX;
+  const uint32_t groups_x = (row_groups + groups_z - 1u) / groups_z;
 
   const bool force_single_column_dispatch =
       VulkanContext::get().architecture() == GpuArchitecture::AmdRdna;
@@ -3477,7 +3493,7 @@ void dispatch_mul_mat_vec_op(
     const std::array<uint32_t, 3> grid = {groups_x, 1u, groups_z};
     const std::vector<uint32_t> specialization_constants = {
         32u,
-        1u,
+        rows_per_workgroup,
         num_cols,
     };
 

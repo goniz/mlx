@@ -300,6 +300,18 @@ bool trace_flash_attention_debug_enabled() {
   return enabled;
 }
 
+uint32_t flash_attention_max_split_k() {
+  static const uint32_t value = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_MAX_SPLIT_K");
+        env != nullptr) {
+      return std::max<uint32_t>(
+          1u, static_cast<uint32_t>(std::strtoul(env, nullptr, 10)));
+    }
+    return 8u;
+  }();
+  return value;
+}
+
 void trace_flash_attention_debug(const std::string& msg) {
   if (!trace_flash_attention_debug_enabled()) {
     return;
@@ -734,8 +746,10 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
       ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
       : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
 
-  if (!use_native_bf16_kv && q_len <= 8u && qk_ratio > 1u &&
-      qk_ratio <= tuning.block_rows && qk_ratio * kv_heads == q_heads &&
+  const uint32_t gqa_block_rows =
+      q_len == 1u ? std::max(tuning.block_rows, qk_ratio) : tuning.block_rows;
+  if (q_len <= 8u && qk_ratio > 1u && qk_ratio <= gqa_block_rows &&
+      qk_ratio * kv_heads == q_heads &&
       mask_heads <= 1u) {
     gqa_ratio = qk_ratio;
     n_rows = gqa_ratio;
@@ -778,7 +792,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
   uint32_t split_k = total_wgs_no_split < target_workgroups
       ? (target_workgroups + total_wgs_no_split - 1u) / total_wgs_no_split
       : 1u;
-  split_k = std::min(split_k, 8u);
+  split_k = std::min(split_k, flash_attention_max_split_k());
   if (has_mask && split_k > 1u) {
     split_k = std::min(split_k, 4u);
   }
@@ -1168,7 +1182,7 @@ bool try_eval_flash_attention_vulkan(
       vulkan::VulkanContext::get().shader_bfloat16_supported() &&
       k.dtype() == bfloat16 && v.dtype() == bfloat16 &&
       ((do_causal && q_len > 1 && q_len == kv_len) ||
-       (do_causal && q_len == 1));
+       q_len == 1);
 
   if (batch == 0 || q_heads == 0 || q_len == 0 || hsk == 0 || kv_heads == 0 ||
       kv_len == 0 || hsv == 0 || hsk % 4 != 0 || hsv % 4 != 0 ||
@@ -1183,8 +1197,7 @@ bool try_eval_flash_attention_vulkan(
   auto ensure_flash_attention_kv_layout = [&](array x) {
     auto data = x.data_shared_ptr();
     if (data == nullptr || data->buffer.ptr() == nullptr ||
-        !x.flags().row_contiguous || x.strides().back() != 1 ||
-        x.offset() != 0) {
+        x.strides().back() != 1 || x.offset() != 0) {
       x = contiguous_copy_gpu(x, s);
     }
     return x;
@@ -1812,7 +1825,7 @@ bool try_eval_sdpa_heads_vulkan(
     vulkan::record_primitive_for_stream(s, "sdpa_manual_heads");
     vulkan::ScopedPrimitiveTracking tracking_scope(s, inputs, tracked_outputs);
 
-    if (false && is_decode && k_in.dtype() != float32 &&
+    if (is_decode && k_in.dtype() != float32 &&
         v_in.dtype() != float32) {
       // --- Decode GQA path: avoid broadcast copies on K/V
       // ----------------------- Use NC matvec with f16 matrix + f32 vector, no

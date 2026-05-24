@@ -91,10 +91,10 @@ uint32_t min_deferred_ops_before_inflight_submit() {
         const int parsed = std::stoi(env);
         return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
       } catch (...) {
-        return 4u;
+        return 16u;
       }
     }
-    return 4u;
+    return 16u;
   }();
   return value;
 }
@@ -107,10 +107,10 @@ uint32_t max_adaptive_deferred_ops() {
         const int parsed = std::stoi(env);
         return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
       } catch (...) {
-        return 64u;
+        return 128u;
       }
     }
-    return 64u;
+    return 128u;
   }();
   return value;
 }
@@ -123,10 +123,10 @@ uint32_t max_inflight_submissions() {
         const int parsed = std::stoi(env);
         return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
       } catch (...) {
-        return 2u;
+        return 16u;
       }
     }
-    return 2u;
+    return 16u;
   }();
   return value;
 }

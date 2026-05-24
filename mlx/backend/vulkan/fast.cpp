@@ -1147,7 +1147,8 @@ bool try_eval_flash_attention_vulkan(
 
   // Keep low-precision prefill on the manual path for now, but allow the
   // native flash kernel on decode shapes where generation throughput matters
-  // most and the path was originally introduced.
+  // most and the path was originally introduced. GPT-OSS prefill uses bf16 K/V
+  // and is handled by the native bf16 path below.
   if (is_lowp_attention && q_len > 1) {
     return false;
   }
@@ -1225,14 +1226,14 @@ bool try_eval_flash_attention_vulkan(
     return false;
   }
 
-  array out_storage = vulkan::acquire_scratch_array(
-      s,
-      kFlashAttnOutScratchLane,
-      {out.shape(0), out.shape(2), out.shape(1), out.shape(3)},
-      float32);
-
   try {
     const bool use_causal_shader = do_causal && q_len > 1;
+
+    array out_storage = vulkan::acquire_scratch_array(
+        s,
+        kFlashAttnOutScratchLane,
+        {out.shape(0), out.shape(2), out.shape(1), out.shape(3)},
+        float32);
 
     if (!try_dispatch_flash_attention_native_vulkan(
             q,
@@ -2491,9 +2492,14 @@ bool ScaledDotProductAttention::use_fallback(
   }
   const bool lowp_attention =
       q.dtype() != float32 || k.dtype() != float32 || v.dtype() != float32;
+  const bool bf16_attention =
+      q.dtype() == bfloat16 && k.dtype() == bfloat16 && v.dtype() == bfloat16;
   const bool fp16_attention =
       q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16;
-  const bool lowp_masked = lowp_attention && has_arr_mask;
+  const bool bf16_masked_gqa_prefill = bf16_attention && has_arr_mask &&
+      q.shape(2) > 1 && q.shape(1) != k.shape(1);
+  const bool lowp_masked =
+      lowp_attention && has_arr_mask && !bf16_masked_gqa_prefill;
   const bool lowp_causal_gqa_prefill =
       fp16_attention && do_causal && q.shape(2) > 1 && q.shape(1) != k.shape(1);
   const bool lowp_decode_mha =

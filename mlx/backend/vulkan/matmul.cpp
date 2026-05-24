@@ -1589,19 +1589,20 @@ bool try_eval_gather_mm_vulkan_impl(
   array b = inputs[1];
   array lhs_indices = inputs[2];
   array rhs_indices = inputs[3];
+  constexpr int kMaxGatherBatchDims = 4;
   if (a.dtype() != float32 || b.dtype() != float32 || out.dtype() != float32 ||
       lhs_indices.dtype() != uint32 || rhs_indices.dtype() != uint32 ||
-      a.ndim() < 2 || b.ndim() < 2 || out.ndim() < 2 || a.ndim() > 4 ||
-      b.ndim() > 4 || out.ndim() > 4 || lhs_indices.ndim() > 2 ||
-      rhs_indices.ndim() > 2) {
+      a.ndim() < 2 || b.ndim() < 2 || out.ndim() < 2 ||
+      a.ndim() - 2 > kMaxGatherBatchDims ||
+      b.ndim() - 2 > kMaxGatherBatchDims ||
+      lhs_indices.ndim() > kMaxGatherBatchDims ||
+      rhs_indices.ndim() > kMaxGatherBatchDims ||
+      out.ndim() != lhs_indices.ndim() + 2) {
     return false;
   }
   if (a.shape(-1) != b.shape(-2) || out.shape(-2) != a.shape(-2) ||
       out.shape(-1) != b.shape(-1) ||
       lhs_indices.shape() != rhs_indices.shape()) {
-    return false;
-  }
-  if (out.ndim() != lhs_indices.ndim() + 2) {
     return false;
   }
   for (int i = 0; i < lhs_indices.ndim(); ++i) {

@@ -390,6 +390,272 @@ void main() {
   return true;
 }
 
+bool fp_gather_qmm_fused(
+    const array& w,
+    const array& scales,
+    const array& x,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    Stream s,
+    int bits) {
+  if (w.dtype() != uint32 || scales.dtype() != uint8 ||
+      !is_supported_quantized_output_dtype(x.dtype()) ||
+      lhs_indices.dtype() != uint32 || rhs_indices.dtype() != uint32 ||
+      !is_supported_quantized_output_dtype(out.dtype()) ||
+      (bits != 4 && bits != 8)) {
+    return false;
+  }
+  if (!is_row_contiguous_zero_offset(w) ||
+      !is_row_contiguous_zero_offset(scales) ||
+      !is_row_contiguous_zero_offset(x) ||
+      !is_row_contiguous_zero_offset(lhs_indices) ||
+      !is_row_contiguous_zero_offset(rhs_indices)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  struct PushConstants {
+    uint32_t total;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t K;
+    uint32_t packed_row_words;
+    uint32_t x_batch_stride;
+    uint32_t x_row_stride;
+    uint32_t out_batch_stride;
+    uint32_t out_row_stride;
+    uint32_t scale_matrix_stride;
+    uint32_t scale_row_stride;
+    uint32_t w_matrix_stride_words;
+    uint32_t bits;
+  } pc{};
+  pc.total = static_cast<uint32_t>(out.size());
+  pc.rows = static_cast<uint32_t>(out.shape(-2));
+  pc.cols = static_cast<uint32_t>(out.shape(-1));
+  pc.K = static_cast<uint32_t>(x.shape(-1));
+  pc.packed_row_words = static_cast<uint32_t>(w.strides(-2));
+  pc.x_batch_stride = static_cast<uint32_t>(x.shape(-2) * x.shape(-1));
+  pc.x_row_stride = static_cast<uint32_t>(x.strides(-2));
+  pc.out_batch_stride = pc.rows * pc.cols;
+  pc.out_row_stride = static_cast<uint32_t>(out.strides(-2));
+  pc.scale_matrix_stride = static_cast<uint32_t>(scales.strides(-3));
+  pc.scale_row_stride = static_cast<uint32_t>(scales.strides(-2));
+  pc.w_matrix_stride_words = static_cast<uint32_t>(w.strides(-3));
+  pc.bits = static_cast<uint32_t>(bits);
+
+  std::ostringstream os;
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
+  os << "#extension GL_EXT_shader_8bit_storage : require\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+  os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  if (vulkan::uses_float16_extension(x.dtype()) ||
+      vulkan::uses_float16_extension(out.dtype())) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+  }
+  os << "\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  os << "#define X_TYPE " << vulkan::dtype_to_glsl_storage_type(x.dtype())
+     << "\n";
+  os << "#define OUT_TYPE " << vulkan::dtype_to_glsl_storage_type(out.dtype())
+     << "\n";
+  if (bits == 4) {
+    os << "#define FP_BITS_4 1\n";
+  } else {
+    os << "#define FP_BITS_8 1\n";
+  }
+  if (x.dtype() == bfloat16) {
+    os << "#define X_BF16 1\n";
+  }
+  if (out.dtype() == bfloat16) {
+    os << "#define OUT_BF16 1\n";
+  }
+  os << R"(
+layout(push_constant) uniform PushConstants {
+  uint total;
+  uint rows;
+  uint cols;
+  uint K;
+  uint packed_row_words;
+  uint x_batch_stride;
+  uint x_row_stride;
+  uint out_batch_stride;
+  uint out_row_stride;
+  uint scale_matrix_stride;
+  uint scale_row_stride;
+  uint w_matrix_stride_words;
+  uint bits;
+} p;
+layout(set = 0, binding = 0) readonly buffer W { uint data[]; } w;
+layout(set = 0, binding = 1) readonly buffer Scales { uint8_t data[]; } scales;
+layout(set = 0, binding = 2) readonly buffer X { X_TYPE data[]; } x;
+layout(set = 0, binding = 3) readonly buffer LhsIndices { uint data[]; } lhs;
+layout(set = 0, binding = 4) readonly buffer RhsIndices { uint data[]; } rhs;
+layout(set = 0, binding = 5) buffer Output { OUT_TYPE data[]; } out_buf;
+
+float bf16_to_fp32(uint v) {
+  return uintBitsToFloat(v << 16u);
+}
+
+uint fp32_to_bf16(float v) {
+  uint u = floatBitsToUint(v);
+  return (u >> 16u) + (((u & 0xFFFFu) + 0x7FFFu) >> 16u);
+}
+
+float load_x(uint idx) {
+#if defined(X_BF16)
+  return bf16_to_fp32(uint(x.data[idx]));
+#else
+  return float(x.data[idx]);
+#endif
+}
+
+void store_out(uint idx, float v) {
+#if defined(OUT_BF16)
+  out_buf.data[idx] = uint16_t(fp32_to_bf16(v));
+#else
+  out_buf.data[idx] = OUT_TYPE(v);
+#endif
+}
+
+float fp8_e4m3_to_fp32(uint8_t v) {
+  uint ux = uint(v);
+  uint exponent = (ux >> 3u) & 15u;
+  uint mantissa = ux & 7u;
+  float result = exponent == 0u
+      ? float(mantissa) * 0.001953125
+      : exp2(float(int(exponent) - 7)) * (1.0 + float(mantissa) * 0.125);
+  return (ux & 128u) != 0u ? -result : result;
+}
+
+float e8m0_to_fp32(uint8_t v) {
+  uint bits = v == uint8_t(0) ? 0x00400000u : (uint(v) << 23);
+  return uintBitsToFloat(bits);
+}
+
+float fp4_to_float(uint q) {
+  switch (q & 15u) {
+    case 0u: return 0.0;
+    case 1u: return 0.5;
+    case 2u: return 1.0;
+    case 3u: return 1.5;
+    case 4u: return 2.0;
+    case 5u: return 3.0;
+    case 6u: return 4.0;
+    case 7u: return 6.0;
+    case 8u: return -0.0;
+    case 9u: return -0.5;
+    case 10u: return -1.0;
+    case 11u: return -1.5;
+    case 12u: return -2.0;
+    case 13u: return -3.0;
+    case 14u: return -4.0;
+    default: return -6.0;
+  }
+}
+
+float read_weight(uint row_base, uint k, float scale) {
+#if defined(FP_BITS_4)
+  uint packed = w.data[row_base + (k >> 3u)];
+  uint q = (packed >> ((k & 7u) * 4u)) & 15u;
+  return fp4_to_float(q) * scale;
+#else
+  uint packed = w.data[row_base + (k >> 2u)];
+  uint8_t q = uint8_t((packed >> ((k & 3u) * 8u)) & 255u);
+  return fp8_e4m3_to_fp32(q) * scale;
+#endif
+}
+
+void accumulate_word_fp4(inout float acc, uint x_row_base, uint w_row_base, uint word, float scale) {
+  uint packed = w.data[w_row_base + word];
+  uint k_base = word << 3u;
+  if (k_base + 7u < p.K) {
+    acc = fma(load_x(x_row_base + k_base + 0u), fp4_to_float((packed >>  0u) & 15u) * scale, acc);
+    acc = fma(load_x(x_row_base + k_base + 1u), fp4_to_float((packed >>  4u) & 15u) * scale, acc);
+    acc = fma(load_x(x_row_base + k_base + 2u), fp4_to_float((packed >>  8u) & 15u) * scale, acc);
+    acc = fma(load_x(x_row_base + k_base + 3u), fp4_to_float((packed >> 12u) & 15u) * scale, acc);
+    acc = fma(load_x(x_row_base + k_base + 4u), fp4_to_float((packed >> 16u) & 15u) * scale, acc);
+    acc = fma(load_x(x_row_base + k_base + 5u), fp4_to_float((packed >> 20u) & 15u) * scale, acc);
+    acc = fma(load_x(x_row_base + k_base + 6u), fp4_to_float((packed >> 24u) & 15u) * scale, acc);
+    acc = fma(load_x(x_row_base + k_base + 7u), fp4_to_float((packed >> 28u) & 15u) * scale, acc);
+  } else {
+    for (uint lane = 0u; lane < 8u && k_base + lane < p.K; ++lane) {
+      acc = fma(load_x(x_row_base + k_base + lane), fp4_to_float((packed >> (lane * 4u)) & 15u) * scale, acc);
+    }
+  }
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= p.total) return;
+
+  uint matrix_size = p.rows * p.cols;
+  uint batch = idx / matrix_size;
+  uint within = idx - batch * matrix_size;
+  uint row = within / p.cols;
+  uint col = within - row * p.cols;
+
+  uint lhs_batch = lhs.data[batch];
+  uint rhs_batch = rhs.data[batch];
+  uint w_row_base = rhs_batch * p.w_matrix_stride_words + col * p.packed_row_words;
+  uint scale_row_base = rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
+  uint x_row_base = lhs_batch * p.x_batch_stride + row * p.x_row_stride;
+
+  float acc = 0.0;
+  uint num_groups = (p.K + 31u) >> 5u;
+  for (uint group = 0u; group < num_groups; ++group) {
+    float scale = e8m0_to_fp32(scales.data[scale_row_base + group]);
+#if defined(FP_BITS_4)
+    uint word_start = group << 2u;
+    accumulate_word_fp4(acc, x_row_base, w_row_base, word_start + 0u, scale);
+    accumulate_word_fp4(acc, x_row_base, w_row_base, word_start + 1u, scale);
+    accumulate_word_fp4(acc, x_row_base, w_row_base, word_start + 2u, scale);
+    accumulate_word_fp4(acc, x_row_base, w_row_base, word_start + 3u, scale);
+#else
+    uint group_start = group << 5u;
+    uint group_end = min(group_start + 32u, p.K);
+    for (uint k = group_start; k < group_end; ++k) {
+      acc = fma(load_x(x_row_base + k), read_weight(w_row_base, k, scale), acc);
+    }
+#endif
+  }
+  store_out(batch * p.out_batch_stride + row * p.out_row_stride + col, acc);
+}
+)";
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&w, 0},
+      {&scales, 1},
+      {&x, 2},
+      {&lhs_indices, 3},
+      {&rhs_indices, 4},
+      {&out, 5},
+  };
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      bits == 4 ? "dynamic_gather_mxfp4_qmm_f32"
+                : "dynamic_gather_mxfp8_qmm_f32",
+      os.str(),
+      6,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 } // namespace
 
 namespace vulkan {
@@ -1174,6 +1440,31 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (lhs_indices.dtype() != uint32 || rhs_indices.dtype() != uint32) {
     throw std::runtime_error(
         "[GatherQMM::eval_gpu] Expected uint32 gather indices.");
+  }
+
+  if ((mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Mxfp8) &&
+      transpose_) {
+    array x_work = ensure_row_contiguous_zero_offset(x, s);
+    const uint32_t rows = static_cast<uint32_t>(out.shape(-2));
+    const uint32_t cols = static_cast<uint32_t>(out.shape(-1));
+    const uint32_t k = static_cast<uint32_t>(x_work.shape(-1));
+    const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
+    if (rows != static_cast<uint32_t>(x_work.shape(-2)) ||
+        cols != static_cast<uint32_t>(w.shape(-2)) ||
+        static_cast<uint32_t>(w.shape(-1) * 32 / bits_) != k ||
+        num_groups !=
+            static_cast<uint32_t>((k + group_size_ - 1) / group_size_) ||
+        group_size_ != 32) {
+      throw std::runtime_error(
+          "[GatherQMM::eval_gpu] Incompatible gather FP qmm shapes.");
+    }
+
+    if (!fp_gather_qmm_fused(
+            w, scales, x_work, lhs_indices, rhs_indices, out, s, bits_)) {
+      throw std::runtime_error(
+          "[GatherQMM::eval_gpu] Failed to dispatch Vulkan gather FP matmul.");
+    }
+    return;
   }
 
   if (!affine_mode || !transpose_) {

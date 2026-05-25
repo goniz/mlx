@@ -33,6 +33,21 @@ uint32_t matvec_rows_per_workgroup() {
   return value;
 }
 
+uint32_t max_compute_work_group_invocations() {
+  static const uint32_t value = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_MAX_WG_INVOCATIONS");
+        env != nullptr) {
+      return static_cast<uint32_t>(std::strtoul(env, nullptr, 10));
+    }
+    return VulkanContext::get()
+        .physical_device()
+        .getProperties()
+        .limits
+        .maxComputeWorkGroupInvocations;
+  }();
+  return value;
+}
+
 namespace {
 
 constexpr char kSoftmaxLargeMaxScratchLane[] = "softmax.large.tmp_max";
@@ -2582,10 +2597,13 @@ void dispatch_sum_rows_op(
 
   const auto push_constants = make_sum_rows_push_constants(in, out, weight);
   const auto row_count = checked_u32(out.size(), "sum_rows output rows");
-  const uint32_t block_size = push_constants.n_cols <= 32u ? 32u
-      : push_constants.n_cols <= 64u                       ? 64u
-      : push_constants.n_cols >= 4096u                     ? 1024u
-                                                           : 128u;
+  const uint32_t max_invocations = max_compute_work_group_invocations();
+  const uint32_t block_size = std::min(
+      push_constants.n_cols <= 32u ? 32u
+          : push_constants.n_cols <= 64u                       ? 64u
+          : push_constants.n_cols >= 4096u                     ? 1024u
+                                                               : 128u,
+      max_invocations);
 
   const std::array<BoundArray, 2> bound_arrays = {{
       {&in, "src0"},
@@ -2651,8 +2669,10 @@ void dispatch_argmax_op(
   const uint32_t row_width =
       checked_u32(in.shape(in.ndim() - 1), "argmax reduction width");
   const uint32_t row_count = checked_u32(out.size(), "argmax row count");
-  const uint32_t block_size =
-      row_width >= 4096u ? 1024u : (row_width <= 32u ? 32u : 128u);
+  const uint32_t max_invocations = max_compute_work_group_invocations();
+  const uint32_t block_size = std::min(
+      row_width >= 4096u ? 1024u : (row_width <= 32u ? 32u : 128u),
+      max_invocations);
   auto push_constants =
       make_generic_push_constants(row_width, 0.0f, 0.0f, 0.0f, 0.0f);
   push_constants.KY = row_count;

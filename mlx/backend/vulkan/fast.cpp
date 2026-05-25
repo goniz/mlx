@@ -2527,10 +2527,13 @@ bool ScaledDotProductAttention::use_fallback(
       lowp_attention && has_arr_mask && !bf16_masked_gqa_prefill;
   const bool lowp_causal_gqa_prefill =
       fp16_attention && do_causal && q.shape(2) > 1 && q.shape(1) != k.shape(1);
+  const bool bf16_causal_gqa_prefill =
+      bf16_attention && do_causal && q.shape(2) > 1 && q.shape(1) != k.shape(1);
   const bool lowp_decode_mha =
       lowp_attention && q.shape(2) == 1 && q.shape(1) == k.shape(1);
   if (!output_logsumexp &&
-      (lowp_masked || lowp_causal_gqa_prefill || lowp_decode_mha)) {
+      (lowp_masked || lowp_causal_gqa_prefill || lowp_decode_mha ||
+       bf16_causal_gqa_prefill)) {
     std::ostringstream details;
     details << "q_shape=" << q.shape() << " k_shape=" << k.shape()
             << " v_shape=" << v.shape() << " q_dtype=" << q.dtype()

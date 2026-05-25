@@ -1101,9 +1101,17 @@ bool try_eval_binary_op_vulkan(
 
   bool a_materialized = false;
   bool b_materialized = false;
-  auto materialize_broadcast_input = [&](array& in, bool& was_materialized) {
+  auto materialize_broadcast_input =
+      [&](array& in, bool& was_materialized, bool allow_scalar_view) {
     if (in.shape() == out.shape()) {
       if (in.data_size() == 1 && in.size() != 1) {
+        if (allow_scalar_view) {
+          array view(out.shape(), in.dtype(), nullptr, {});
+          broadcast(in, view);
+          in = view;
+          was_materialized = true;
+          return true;
+        }
         if (in.has_primitive()) {
           ensure_materialized_scalar_input(in);
         }
@@ -1118,6 +1126,13 @@ bool try_eval_binary_op_vulkan(
       return false;
     }
     if (in.data_size() == 1) {
+      if (allow_scalar_view) {
+        array view(out.shape(), in.dtype(), nullptr, {});
+        broadcast(in, view);
+        in = view;
+        was_materialized = true;
+        return true;
+      }
       array broadcast_arr(
           out.shape(),
           in.dtype(),
@@ -1140,8 +1155,13 @@ bool try_eval_binary_op_vulkan(
     return true;
   };
 
-  if ((!use_scalar_vector_fast_path && !materialize_broadcast_input(a, a_materialized)) ||
-      (!use_scalar_vector_fast_path && !materialize_broadcast_input(b, b_materialized))) {
+  const bool allow_subtract_scalar_rhs_view =
+      std::is_same_v<Primitive, Subtract> && b.data_size() == 1;
+  if ((!use_scalar_vector_fast_path &&
+       !materialize_broadcast_input(a, a_materialized, false)) ||
+      (!use_scalar_vector_fast_path &&
+       !materialize_broadcast_input(
+           b, b_materialized, allow_subtract_scalar_rhs_view))) {
     trace_binary_unsupported("broadcast_materialization_failed", a, b);
     return false;
   }

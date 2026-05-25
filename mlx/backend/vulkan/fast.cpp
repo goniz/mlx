@@ -748,7 +748,9 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
 
   const uint32_t gqa_block_rows =
       q_len == 1u ? std::max(tuning.block_rows, qk_ratio) : tuning.block_rows;
-  if (q_len <= 8u && qk_ratio > 1u && qk_ratio <= gqa_block_rows &&
+  // Pack GQA heads into rows only for decode; doing this for short prefill
+  // conflates sequence rows and corrupts small-prompt attention.
+  if (q_len == 1u && qk_ratio > 1u && qk_ratio <= gqa_block_rows &&
       qk_ratio * kv_heads == q_heads &&
       mask_heads <= 1u) {
     gqa_ratio = qk_ratio;
@@ -2517,33 +2519,12 @@ bool ScaledDotProductAttention::use_fallback(
   }
   const bool lowp_attention =
       q.dtype() != float32 || k.dtype() != float32 || v.dtype() != float32;
-  const bool bf16_attention =
-      q.dtype() == bfloat16 && k.dtype() == bfloat16 && v.dtype() == bfloat16;
-  const bool fp16_attention =
-      q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16;
-  const bool bf16_masked_gqa_prefill = bf16_attention && has_arr_mask &&
-      q.shape(2) > 1 && q.shape(1) != k.shape(1);
-  const bool lowp_masked =
-      lowp_attention && has_arr_mask && !bf16_masked_gqa_prefill;
-  const bool lowp_causal_gqa_prefill =
-      fp16_attention && do_causal && q.shape(2) > 1 && q.shape(1) != k.shape(1);
   const bool lowp_decode_mha =
       lowp_attention && q.shape(2) == 1 && q.shape(1) == k.shape(1);
-  if (!output_logsumexp &&
-      (lowp_masked || lowp_causal_gqa_prefill || lowp_decode_mha)) {
-    std::ostringstream details;
-    details << "q_shape=" << q.shape() << " k_shape=" << k.shape()
-            << " v_shape=" << v.shape() << " q_dtype=" << q.dtype()
-            << " k_dtype=" << k.dtype() << " v_dtype=" << v.dtype()
-            << " has_mask=" << has_mask << " has_arr_mask=" << has_arr_mask
-            << " do_causal=" << do_causal
-            << " output_logsumexp=" << output_logsumexp
-            << " fp16_attention=" << fp16_attention
-            << " lowp_masked=" << lowp_masked
-            << " lowp_causal_gqa_prefill=" << lowp_causal_gqa_prefill
-            << " lowp_decode_mha=" << lowp_decode_mha;
+  if (!output_logsumexp && lowp_decode_mha) {
     trace_use_fallback(
-        "ScaledDotProductAttention", s, "low_precision_guard", details.str());
+        "ScaledDotProductAttention", s, "low_precision_guard",
+        "lowp_decode_mha");
     return true;
   }
   return false;

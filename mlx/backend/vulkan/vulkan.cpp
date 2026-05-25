@@ -525,11 +525,17 @@ void VulkanContext::init() {
 
     vk::InstanceCreateFlags instance_create_flags{};
     std::vector<const char*> instance_extensions;
-#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
-    instance_create_flags |=
-        vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
-    instance_extensions.push_back(
-        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#if defined(__APPLE__) && defined(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)
+    const auto available_instance_extensions =
+        vk::enumerateInstanceExtensionProperties();
+    if (has_device_extension(
+            available_instance_extensions,
+            VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+      instance_create_flags |=
+          vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
+      instance_extensions.push_back(
+          VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    }
 #endif
 
     vk::InstanceCreateInfo create_info(

@@ -64,16 +64,34 @@ if(Vulkan_FOUND)
     list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DMLX_VULKAN_BFLOAT16_GLSLC_SUPPORT)
   endif()
 
-  # Find shaderc for shader generation (required)
-  include(FindShaderc REQUIRED)
-  if(APPLE)
-    find_library(SHADERC_SHARED_LIBRARY NAMES shaderc_shared)
-    if(SHADERC_SHARED_LIBRARY)
-      set(SHADERC_LIBRARY ${SHADERC_SHARED_LIBRARY})
-      set_target_properties(Shaderc::shaderc_combined PROPERTIES
-        IMPORTED_LOCATION "${SHADERC_SHARED_LIBRARY}"
-      )
+  # Find shaderc for shader generation. Prefer the static combined
+  # archive; fall back to the shared library only if the archive is unavailable.
+  include(FindShaderc)
+  if(NOT Shaderc_FOUND)
+    find_path(SHADERC_INCLUDE_DIR NAMES shaderc/shaderc.hpp)
+    find_library(SHADERC_SHARED_LIBRARY NAMES shaderc_shared shaderc)
+    if(NOT SHADERC_INCLUDE_DIR OR NOT SHADERC_SHARED_LIBRARY)
+      message(FATAL_ERROR "shaderc not found. Install shaderc or set SHADERC_ROOT to the installation directory.")
     endif()
+    set(SHADERC_LIBRARY ${SHADERC_SHARED_LIBRARY})
+    add_library(Shaderc::shaderc_combined UNKNOWN IMPORTED)
+    set_target_properties(Shaderc::shaderc_combined PROPERTIES
+      IMPORTED_LOCATION "${SHADERC_SHARED_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${SHADERC_INCLUDE_DIR}"
+    )
+  endif()
+
+  set(SHADERC_LINK_LIBRARIES Shaderc::shaderc_combined)
+  if(SHADERC_LIBRARY MATCHES "\\.(a|lib)$")
+    foreach(_shaderc_dep
+        ${GLSLANG_LIBRARY}
+        ${GLSLANG_SPIRV_LIBRARY}
+        ${SPIRV_TOOLS_OPT_LIBRARY}
+        ${SPIRV_TOOLS_LIBRARY})
+      if(_shaderc_dep)
+        list(APPEND SHADERC_LINK_LIBRARIES ${_shaderc_dep})
+      endif()
+    endforeach()
   endif()
   message(STATUS "shaderc found for shader generation: ${SHADERC_LIBRARY}")
 
@@ -84,8 +102,8 @@ if(Vulkan_FOUND)
   set_target_properties(vulkan-shaders-gen PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
   )
-  target_link_libraries(vulkan-shaders-gen PRIVATE 
-    Shaderc::shaderc_combined
+  target_link_libraries(vulkan-shaders-gen PRIVATE
+    ${SHADERC_LINK_LIBRARIES}
   )
   target_compile_features(vulkan-shaders-gen PRIVATE cxx_std_17)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -171,9 +189,9 @@ if(Vulkan_FOUND)
   )
   
   target_include_directories(mlx PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-  target_link_libraries(mlx PRIVATE 
+  target_link_libraries(mlx PRIVATE
     Vulkan::Vulkan
-    Shaderc::shaderc_combined
+    ${SHADERC_LINK_LIBRARIES}
   )
   add_dependencies(mlx vulkan_shaders_target)
   

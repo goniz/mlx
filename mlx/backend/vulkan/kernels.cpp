@@ -2584,6 +2584,7 @@ void dispatch_sum_rows_op(
   const auto row_count = checked_u32(out.size(), "sum_rows output rows");
   const uint32_t block_size = push_constants.n_cols <= 32u ? 32u
       : push_constants.n_cols <= 64u                       ? 64u
+      : push_constants.n_cols >= 4096u                     ? 1024u
                                                            : 128u;
 
   const std::array<BoundArray, 2> bound_arrays = {{
@@ -2650,6 +2651,8 @@ void dispatch_argmax_op(
   const uint32_t row_width =
       checked_u32(in.shape(in.ndim() - 1), "argmax reduction width");
   const uint32_t row_count = checked_u32(out.size(), "argmax row count");
+  const uint32_t block_size =
+      row_width >= 4096u ? 1024u : (row_width <= 32u ? 32u : 128u);
   auto push_constants =
       make_generic_push_constants(row_width, 0.0f, 0.0f, 0.0f, 0.0f);
   push_constants.KY = row_count;
@@ -2667,7 +2670,7 @@ void dispatch_argmax_op(
       cmd_buffer,
       s,
       std::nullopt,
-      {32u});
+      {block_size});
 }
 
 void dispatch_argsort_op(
@@ -3484,6 +3487,7 @@ void dispatch_mul_mat_vec_op(
       VulkanContext::get().architecture() == GpuArchitecture::AmdRdna;
   const uint32_t col_chunk =
       force_single_column_dispatch ? 1u : kMaxMulMatVecCols;
+  const uint32_t block_size = nrows >= 65536u ? 128u : 32u;
 
   for (uint32_t base_work_group_y = 0; base_work_group_y < batch_rows;
        base_work_group_y += col_chunk) {
@@ -3492,7 +3496,7 @@ void dispatch_mul_mat_vec_op(
         std::min(col_chunk, batch_rows - base_work_group_y);
     const std::array<uint32_t, 3> grid = {groups_x, 1u, groups_z};
     const std::vector<uint32_t> specialization_constants = {
-        32u,
+        block_size,
         rows_per_workgroup,
         num_cols,
     };

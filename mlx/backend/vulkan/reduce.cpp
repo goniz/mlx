@@ -795,12 +795,13 @@ bool try_eval_arg_reduce_vulkan(
   }
 
   array in = inputs[0];
-  const bool f32_input = in.dtype() == float32;
+  const bool supported_input =
+      in.dtype() == float32 || in.dtype() == float16 || in.dtype() == bfloat16;
   if (in.ndim() == 0 || in.dtype() == float64 || out.dtype() != uint32) {
     return false;
   }
 
-  if (!f32_input) {
+  if (!supported_input) {
     array in_f32(in.shape(), float32, nullptr, {});
     copy_gpu(in, in_f32, CopyType::General, s);
     in = in_f32;
@@ -859,9 +860,17 @@ bool try_eval_arg_reduce_vulkan(
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    const auto shader_id = reduce_type == ArgReduce::ArgMin
-        ? vulkan::StaticShaderId::argmin_f32
-        : vulkan::StaticShaderId::argmax_f32;
+    const auto shader_id = [&]() {
+      if (reduce_type == ArgReduce::ArgMin) {
+        return in_kernel.dtype() == bfloat16
+            ? vulkan::StaticShaderId::argmin_bf16
+            : in_kernel.dtype() == float16 ? vulkan::StaticShaderId::argmin_f16
+                                           : vulkan::StaticShaderId::argmin_f32;
+      }
+      return in_kernel.dtype() == bfloat16 ? vulkan::StaticShaderId::argmax_bf16
+          : in_kernel.dtype() == float16   ? vulkan::StaticShaderId::argmax_f16
+                                           : vulkan::StaticShaderId::argmax_f32;
+    }();
     vulkan::dispatch_argmax_op(
         in_kernel, out_work, shader_id, command_buffer, s);
     vulkan::end_command_recording(s.index);

@@ -1,4 +1,4 @@
-find_package(Vulkan COMPONENTS glslc REQUIRED)
+find_package(Vulkan COMPONENTS glslang REQUIRED)
 
 if(Vulkan_FOUND)
   message(STATUS "Vulkan found: ${Vulkan_VERSION}")
@@ -66,6 +66,15 @@ if(Vulkan_FOUND)
 
   # Find shaderc for shader generation (required)
   include(FindShaderc REQUIRED)
+  if(APPLE)
+    find_library(SHADERC_SHARED_LIBRARY NAMES shaderc_shared)
+    if(SHADERC_SHARED_LIBRARY)
+      set(SHADERC_LIBRARY ${SHADERC_SHARED_LIBRARY})
+      set_target_properties(Shaderc::shaderc_combined PROPERTIES
+        IMPORTED_LOCATION "${SHADERC_SHARED_LIBRARY}"
+      )
+    endif()
+  endif()
   message(STATUS "shaderc found for shader generation: ${SHADERC_LIBRARY}")
 
   # Build shader generator tool
@@ -77,13 +86,9 @@ if(Vulkan_FOUND)
   )
   target_link_libraries(vulkan-shaders-gen PRIVATE 
     Shaderc::shaderc_combined
-    glslang
-    glslang-SPIRV
-    SPIRV-Tools-opt
-    SPIRV-Tools
   )
   target_compile_features(vulkan-shaders-gen PRIVATE cxx_std_17)
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(vulkan-shaders-gen PRIVATE -fno-var-tracking-assignments)
   endif()
   if(VULKAN_SHADER_GEN_CMAKE_ARGS)
@@ -169,10 +174,6 @@ if(Vulkan_FOUND)
   target_link_libraries(mlx PRIVATE 
     Vulkan::Vulkan
     Shaderc::shaderc_combined
-    glslang
-    glslang-SPIRV
-    SPIRV-Tools-opt
-    SPIRV-Tools
   )
   add_dependencies(mlx vulkan_shaders_target)
   

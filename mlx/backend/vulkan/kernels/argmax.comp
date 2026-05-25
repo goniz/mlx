@@ -18,8 +18,16 @@ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 
-shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
+shared float tmpmax[BLOCK_SIZE];
 shared uint tmp[BLOCK_SIZE];
+
+float load_value(uint idx) {
+#if defined(DATA_A_BF16)
+    return bf16_to_fp32(uint(data_a[idx]));
+#else
+    return float(data_a[idx]);
+#endif
+}
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -29,15 +37,15 @@ void main() {
         return;
     }
 
-    A_TYPE amax = ARGMIN != 0 ? A_TYPE(FLT_MAX) : A_TYPE(-FLT_MAX);
+    float amax = ARGMIN != 0 ? FLT_MAX : -FLT_MAX;
     uint acol = col;
 
     if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
+        amax = load_value(row*p.KX + col);
     }
 
     for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
+        float val = load_value(row*p.KX + i);
         if ((ARGMIN != 0 && val < amax) || (ARGMIN == 0 && val > amax)) {
             amax = val;
             acol = i;

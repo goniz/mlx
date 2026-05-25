@@ -2998,11 +2998,36 @@ void process_shaders() {
       "argmax.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
   string_to_spv(
+      "argmax_f16",
+      "argmax.comp",
+      merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"D_TYPE", "int"}}));
+  string_to_spv(
+      "argmax_bf16",
+      "argmax.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"}, {"D_TYPE", "int"}, {"DATA_A_BF16", "1"}}));
+  string_to_spv(
       "argmin_f32",
       "argmax.comp",
       merge_maps(
           base_dict,
           {{"A_TYPE", "float"}, {"D_TYPE", "int"}, {"ARGMIN", "1"}}));
+  string_to_spv(
+      "argmin_f16",
+      "argmax.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float16_t"}, {"D_TYPE", "int"}, {"ARGMIN", "1"}}));
+  string_to_spv(
+      "argmin_bf16",
+      "argmax.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"D_TYPE", "int"},
+           {"ARGMIN", "1"},
+           {"DATA_A_BF16", "1"}}));
   string_to_spv(
       "sum_rows_f32",
       "sum_rows.comp",

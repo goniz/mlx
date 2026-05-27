@@ -746,11 +746,9 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
       ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
       : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
 
-  const uint32_t gqa_block_rows =
-      q_len == 1u ? std::max(tuning.block_rows, qk_ratio) : tuning.block_rows;
   // Pack GQA heads into rows only for decode; doing this for short prefill
   // conflates sequence rows and corrupts small-prompt attention.
-  if (q_len == 1u && qk_ratio > 1u && qk_ratio <= gqa_block_rows &&
+  if (q_len == 1u && qk_ratio > 1u && qk_ratio <= tuning.block_rows &&
       qk_ratio * kv_heads == q_heads &&
       mask_heads <= 1u) {
     gqa_ratio = qk_ratio;
@@ -1164,10 +1162,6 @@ bool try_eval_flash_attention_vulkan(
   const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
   const bool is_lowp_attention =
       q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16;
-
-  if (q_len == 1 && has_sinks && !has_arr_mask) {
-    return false;
-  }
 
   // Keep low-precision prefill on the manual path for now, but allow the
   // native flash kernel on decode shapes where generation throughput matters

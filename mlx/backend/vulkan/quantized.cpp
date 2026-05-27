@@ -490,11 +490,15 @@ layout(set = 0, binding = 0) readonly buffer W { uint data[]; } w;
 )";
   os << vulkan::storage_buffer_layout_for_dtype(uint8, 1)
      << " readonly buffer Scales { uint8_t data[]; } scales;\n";
+  os << vulkan::storage_buffer_layout_for_dtype(x.dtype(), 2)
+     << " readonly buffer X { X_TYPE data[]; } x;\n";
   os << R"(
-layout(set = 0, binding = 2) readonly buffer X { X_TYPE data[]; } x;
 layout(set = 0, binding = 3) readonly buffer LhsIndices { uint data[]; } lhs;
 layout(set = 0, binding = 4) readonly buffer RhsIndices { uint data[]; } rhs;
-layout(set = 0, binding = 5) buffer Output { OUT_TYPE data[]; } out_buf;
+)";
+  os << vulkan::storage_buffer_layout_for_dtype(out.dtype(), 5)
+     << " buffer Output { OUT_TYPE data[]; } out_buf;\n";
+  os << R"(
 
 float bf16_to_fp32(uint v) {
   return uintBitsToFloat(v << 16u);

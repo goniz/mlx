@@ -603,6 +603,17 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 atol = 1e-5 if dtype == mx.float32 else 1e-2
                 self.assertTrue(mx.allclose(out, expected, atol=atol))
 
+        q = mx.random.normal(shape=(1, 64, 1, D), dtype=mx.bfloat16)
+        k = mx.random.normal(shape=(1, 8, 76, D), dtype=mx.bfloat16)
+        v = mx.random.normal(shape=(1, 8, 76, D), dtype=mx.bfloat16)
+        sinks = 10 * mx.random.normal(shape=(64,), dtype=mx.bfloat16)
+        mask = mx.ones((1, 1, 1, 76), dtype=mx.bool_)
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, sinks=sinks)
+        expected = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask=mask, sinks=sinks
+        )
+        self.assertTrue(mx.allclose(out, expected, atol=1e-2))
+
     def test_sdpa_grad(self):
         # High tolerance due to cuDNN SDPA kernel requiring tf32.
         tolerance = {"rtol": 1e-2, "atol": 1e-2}

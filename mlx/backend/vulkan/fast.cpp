@@ -1165,6 +1165,10 @@ bool try_eval_flash_attention_vulkan(
   const bool is_lowp_attention =
       q.dtype() == float16 && k.dtype() == float16 && v.dtype() == float16;
 
+  if (q_len == 1 && has_sinks && !has_arr_mask) {
+    return false;
+  }
+
   // Keep low-precision prefill on the manual path for now, but allow the
   // native flash kernel on decode shapes where generation throughput matters
   // most and the path was originally introduced. GPT-OSS prefill uses bf16 K/V

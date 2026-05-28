@@ -727,6 +727,7 @@ bool fp_gather_qmm_fused_matvec(
   std::ostringstream os;
   vulkan::DynamicShaderPreambleOptions preamble_options;
   preamble_options.dtypes = {uint8, x.dtype(), out.dtype()};
+  preamble_options.local_size_x = 64;  // One AMD wavefront for better occupancy
   os << vulkan::emit_dynamic_shader_preamble(preamble_options);
   os << "#define X_TYPE " << vulkan::dtype_to_glsl_storage_type(x.dtype())
      << "\n";
@@ -744,7 +745,6 @@ bool fp_gather_qmm_fused_matvec(
     os << "#define OUT_BF16 1\n";
   }
   os << R"(
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushConstants {
   uint rows;
@@ -774,7 +774,7 @@ layout(set = 0, binding = 4) readonly buffer RhsIndices { uint data[]; } rhs;
      << " buffer Output { OUT_TYPE data[]; } out_buf;\n";
   os << R"(
 
-shared float partial[256];
+shared float partial[64];
 
 float bf16_to_fp32(uint v) {
   return uintBitsToFloat(v << 16u);
@@ -896,8 +896,8 @@ void main() {
       {&out, 5},
   };
   const std::string shader_name =
-      std::string(bits == 4 ? "dynamic_gather_mxfp4_qmm_matvec"
-                            : "dynamic_gather_mxfp8_qmm_matvec") +
+      std::string(bits == 4 ? "dynamic_gather_mxfp4_qmm_matvec_wg64"
+                            : "dynamic_gather_mxfp8_qmm_matvec_wg64") +
       "_x" + std::to_string(static_cast<int>(x.dtype().val())) + "_o" +
       std::to_string(static_cast<int>(out.dtype().val()));
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(

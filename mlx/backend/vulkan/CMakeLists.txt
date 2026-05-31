@@ -1,22 +1,38 @@
-find_package(Vulkan COMPONENTS glslc REQUIRED)
+if(APPLE)
+  find_package(Vulkan COMPONENTS glslang REQUIRED)
+  find_program(MLX_VULKAN_SHADER_COMPILER NAMES glslang REQUIRED)
+  set(MLX_VULKAN_SHADER_COMPILER_ARGS -V --target-env vulkan1.3 -S comp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(Vulkan COMPONENTS glslc REQUIRED)
+  set(MLX_VULKAN_SHADER_COMPILER ${Vulkan_GLSLC_EXECUTABLE})
+  set(MLX_VULKAN_SHADER_COMPILER_ARGS -fshader-stage=compute --target-env=vulkan1.3)
+else()
+  find_package(Vulkan REQUIRED)
+endif()
 
 if(Vulkan_FOUND)
   message(STATUS "Vulkan found: ${Vulkan_VERSION}")
   
   # Test shader extension support
   function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
+    if(NOT MLX_VULKAN_SHADER_COMPILER)
+      message(STATUS "${EXTENSION_NAME} probe skipped; shader compiler unavailable")
+      set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+      return()
+    endif()
+
     execute_process(
-      COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
-      RESULT_VARIABLE glslc_result
-      OUTPUT_VARIABLE glslc_output
-      ERROR_VARIABLE glslc_error
+      COMMAND ${MLX_VULKAN_SHADER_COMPILER} ${MLX_VULKAN_SHADER_COMPILER_ARGS} -o - "${TEST_SHADER_FILE}"
+      RESULT_VARIABLE shader_compiler_result
+      OUTPUT_VARIABLE shader_compiler_output
+      ERROR_VARIABLE shader_compiler_error
     )
 
-    if(glslc_result EQUAL 0)
-      message(STATUS "${EXTENSION_NAME} supported by glslc")
+    if(shader_compiler_result EQUAL 0)
+      message(STATUS "${EXTENSION_NAME} supported by shader compiler")
       set(${RESULT_VARIABLE} ON PARENT_SCOPE)
-    elseif(glslc_error MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
-      message(STATUS "${EXTENSION_NAME} not supported by glslc")
+    elseif(shader_compiler_error MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
+      message(STATUS "${EXTENSION_NAME} not supported by shader compiler")
       set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
     else()
       message(STATUS "${EXTENSION_NAME} probe failed; assuming unsupported")
@@ -64,8 +80,35 @@ if(Vulkan_FOUND)
     list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DMLX_VULKAN_BFLOAT16_GLSLC_SUPPORT)
   endif()
 
-  # Find shaderc for shader generation (required)
-  include(FindShaderc REQUIRED)
+  # Find shaderc for shader generation. Prefer the static combined
+  # archive; fall back to the shared library only if the archive is unavailable.
+  include(FindShaderc)
+  if(NOT Shaderc_FOUND)
+    find_path(SHADERC_INCLUDE_DIR NAMES shaderc/shaderc.hpp)
+    find_library(SHADERC_SHARED_LIBRARY NAMES shaderc_shared shaderc)
+    if(NOT SHADERC_INCLUDE_DIR OR NOT SHADERC_SHARED_LIBRARY)
+      message(FATAL_ERROR "shaderc not found. Install shaderc or set SHADERC_ROOT to the installation directory.")
+    endif()
+    set(SHADERC_LIBRARY ${SHADERC_SHARED_LIBRARY})
+    add_library(Shaderc::shaderc_combined UNKNOWN IMPORTED)
+    set_target_properties(Shaderc::shaderc_combined PROPERTIES
+      IMPORTED_LOCATION "${SHADERC_SHARED_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${SHADERC_INCLUDE_DIR}"
+    )
+  endif()
+
+  set(SHADERC_LINK_LIBRARIES Shaderc::shaderc_combined)
+  if(SHADERC_LIBRARY MATCHES "\\.(a|lib)$")
+    foreach(_shaderc_dep
+        ${GLSLANG_LIBRARY}
+        ${GLSLANG_SPIRV_LIBRARY}
+        ${SPIRV_TOOLS_OPT_LIBRARY}
+        ${SPIRV_TOOLS_LIBRARY})
+      if(_shaderc_dep)
+        list(APPEND SHADERC_LINK_LIBRARIES ${_shaderc_dep})
+      endif()
+    endforeach()
+  endif()
   message(STATUS "shaderc found for shader generation: ${SHADERC_LIBRARY}")
 
   # Build shader generator tool
@@ -75,15 +118,11 @@ if(Vulkan_FOUND)
   set_target_properties(vulkan-shaders-gen PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
   )
-  target_link_libraries(vulkan-shaders-gen PRIVATE 
-    Shaderc::shaderc_combined
-    glslang
-    glslang-SPIRV
-    SPIRV-Tools-opt
-    SPIRV-Tools
+  target_link_libraries(vulkan-shaders-gen PRIVATE
+    ${SHADERC_LINK_LIBRARIES}
   )
   target_compile_features(vulkan-shaders-gen PRIVATE cxx_std_17)
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(vulkan-shaders-gen PRIVATE -fno-var-tracking-assignments)
   endif()
   if(VULKAN_SHADER_GEN_CMAKE_ARGS)
@@ -166,13 +205,9 @@ if(Vulkan_FOUND)
   )
   
   target_include_directories(mlx PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-  target_link_libraries(mlx PRIVATE 
+  target_link_libraries(mlx PRIVATE
     Vulkan::Vulkan
-    Shaderc::shaderc_combined
-    glslang
-    glslang-SPIRV
-    SPIRV-Tools-opt
-    SPIRV-Tools
+    ${SHADERC_LINK_LIBRARIES}
   )
   add_dependencies(mlx vulkan_shaders_target)
   

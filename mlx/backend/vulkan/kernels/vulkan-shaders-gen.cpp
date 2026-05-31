@@ -33,7 +33,6 @@
 
 #define ASYNCIO_CONCURRENCY 64
 
-std::mutex lock;
 std::vector<std::pair<std::string, std::string>> shader_fnames;
 std::locale c_locale("C");
 
@@ -223,9 +222,6 @@ compile_count_guard acquire_compile_slot() {
   return compile_count_guard(&compile_count, &decrement_compile_count);
 }
 
-// Global shaderc compiler instance (thread-safe)
-shaderc::Compiler g_compiler;
-
 // File system includer for shaderc
 class FileIncluder : public shaderc::CompileOptions::IncluderInterface {
  public:
@@ -286,8 +282,7 @@ void string_to_spv_func(
     std::string out_path,
     std::map<std::string, std::string> defines,
     bool coopmat,
-    bool dep_file,
-    compile_count_guard slot) {
+    bool dep_file) {
   // Determine target environment based on shader name
   shaderc_target_env target_env = shaderc_target_env_vulkan;
   uint32_t env_version = (name.find("_cm2") != std::string::npos)
@@ -301,6 +296,8 @@ void string_to_spv_func(
               << std::endl;
     return;
   }
+
+  shaderc::Compiler compiler;
 
   // Set up compile options
   shaderc::CompileOptions options;
@@ -332,7 +329,7 @@ void string_to_spv_func(
   }
 
   // Compile the shader
-  shaderc::SpvCompilationResult result = g_compiler.CompileGlslToSpv(
+  shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(
       source.c_str(),
       source.size(),
       shaderc_compute_shader,
@@ -364,7 +361,6 @@ void string_to_spv_func(
     write_binary_file(target_cpp + ".d", dep_content);
   }
 
-  std::lock_guard<std::mutex> guard(lock);
   shader_fnames.push_back(std::make_pair(name, out_path));
 }
 
@@ -398,17 +394,8 @@ void string_to_spv(
     return;
   }
 
-  compile_count_guard slot = acquire_compile_slot();
-  compiles.push_back(
-      std::async(
-          string_to_spv_func,
-          name,
-          input_filepath,
-          out_path,
-          defines,
-          coopmat,
-          generate_dep_file,
-          std::move(slot)));
+  string_to_spv_func(
+      name, input_filepath, out_path, defines, coopmat, generate_dep_file);
   // Don't write the same dep file from multiple processes
   generate_dep_file = false;
 }

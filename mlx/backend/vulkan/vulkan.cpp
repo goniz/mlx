@@ -85,7 +85,8 @@ uint64_t score_physical_device(
   const uint64_t type_score =
       static_cast<uint64_t>(device_type_rank(properties.deviceType)) << 60;
   const uint64_t local_mem_score =
-      std::min<uint64_t>(total_device_local_memory(physical_device), (1ull << 56) - 1)
+      std::min<uint64_t>(
+          total_device_local_memory(physical_device), (1ull << 56) - 1)
       << 4;
   const uint64_t queue_topology_score =
       indices.has_separate_transfer ? (1ull << 3) : 0ull;
@@ -382,8 +383,7 @@ bool VulkanContext::probe_shader_bfloat16_support() const {
     auto verify_fp32 = [](const array& out_arr) {
       const auto* out_ptr = out_arr.data<float>();
       return nearly_equal(out_ptr[0], 4.0f) &&
-          nearly_equal(out_ptr[1], -1.0f) &&
-          nearly_equal(out_ptr[2], 10.0f) &&
+          nearly_equal(out_ptr[1], -1.0f) && nearly_equal(out_ptr[2], 10.0f) &&
           nearly_equal(out_ptr[3], -1.0f);
     };
 
@@ -523,7 +523,28 @@ void VulkanContext::init() {
         VK_MAKE_API_VERSION(0, 1, 0, 0),
         VK_API_VERSION_1_2);
 
-    vk::InstanceCreateInfo create_info({}, &app_info);
+    vk::InstanceCreateFlags instance_create_flags{};
+    std::vector<const char*> instance_extensions;
+#if defined(__APPLE__) && defined(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)
+    const auto available_instance_extensions =
+        vk::enumerateInstanceExtensionProperties();
+    if (has_device_extension(
+            available_instance_extensions,
+            VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+      instance_create_flags |=
+          vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
+      instance_extensions.push_back(
+          VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    }
+#endif
+
+    vk::InstanceCreateInfo create_info(
+        instance_create_flags,
+        &app_info,
+        0,
+        nullptr,
+        static_cast<uint32_t>(instance_extensions.size()),
+        instance_extensions.data());
 
     instance = vk::createInstance(create_info);
 
@@ -534,7 +555,8 @@ void VulkanContext::init() {
           "[vulkan::init] Failed to find GPUs with Vulkan support.");
     }
 
-    const auto forced_device_index = parse_env_uint32("MLX_VULKAN_DEVICE_INDEX");
+    const auto forced_device_index =
+        parse_env_uint32("MLX_VULKAN_DEVICE_INDEX");
     const auto preferred_vendor_id =
         parse_env_uint32("MLX_VULKAN_PREFERRED_VENDOR_ID");
 
@@ -599,8 +621,8 @@ void VulkanContext::init() {
         extensions, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
     const bool has_cooperative_matrix_ext = has_device_extension(
         extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
-    const bool has_nv_cooperative_matrix2_ext = has_device_extension(
-        extensions, "VK_NV_cooperative_matrix2");
+    const bool has_nv_cooperative_matrix2_ext =
+        has_device_extension(extensions, "VK_NV_cooperative_matrix2");
     const bool has_shader_integer_dot_product_ext = has_device_extension(
         extensions, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
     const bool has_shader_bfloat16_ext =
@@ -611,8 +633,8 @@ void VulkanContext::init() {
 #endif
     const bool has_shader_atomic_float_ext = has_device_extension(
         extensions, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
-    const bool has_push_descriptor_ext = has_device_extension(
-        extensions, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    const bool has_push_descriptor_ext =
+        has_device_extension(extensions, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
     auto device_properties = physical_device.getProperties();
     vendor_id = device_properties.vendorID;
@@ -684,11 +706,14 @@ void VulkanContext::init() {
     supported_storage_8bit.pNext = &supported_scalar_block_layout;
     vk::PhysicalDeviceShaderIntegerDotProductFeatures
         supported_shader_integer_dot_product{};
-    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT supported_shader_atomic_float{};
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT
+        supported_shader_atomic_float{};
     supported_scalar_block_layout.pNext = &supported_shader_integer_dot_product;
     if (has_shader_atomic_float_ext) {
-      supported_shader_atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
-      supported_shader_integer_dot_product.pNext = &supported_shader_atomic_float;
+      supported_shader_atomic_float.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+      supported_shader_integer_dot_product.pNext =
+          &supported_shader_atomic_float;
     }
 
     vk::PhysicalDeviceSubgroupSizeControlFeatures
@@ -703,8 +728,7 @@ void VulkanContext::init() {
 
     void** supported_feature_tail = has_shader_atomic_float_ext
         ? reinterpret_cast<void**>(&supported_shader_atomic_float.pNext)
-        : reinterpret_cast<void**>(
-              &supported_shader_integer_dot_product.pNext);
+        : reinterpret_cast<void**>(&supported_shader_integer_dot_product.pNext);
     if (has_subgroup_size_control_ext) {
       append_pnext(supported_feature_tail, supported_subgroup_size_control);
     }
@@ -749,12 +773,12 @@ void VulkanContext::init() {
     enabled_scalar_block_layout.pNext = &enabled_shader_integer_dot_product;
 
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT enabled_shader_atomic_float{};
-    enabled_shader_atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+    enabled_shader_atomic_float.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
 
     // Link enabled atomic float feature if extension is available
     if (has_shader_atomic_float_ext) {
-      enabled_shader_integer_dot_product.pNext =
-          &enabled_shader_atomic_float;
+      enabled_shader_integer_dot_product.pNext = &enabled_shader_atomic_float;
     }
 
     vk::PhysicalDeviceSubgroupSizeControlFeatures
@@ -900,8 +924,7 @@ void VulkanContext::init() {
       while (prop_tail->pNext != nullptr) {
         prop_tail = prop_tail->pNext;
       }
-      prop_tail->pNext =
-          reinterpret_cast<VkBaseOutStructure*>(&cm2_props);
+      prop_tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&cm2_props);
 
       // Append cm2 supported features to the features chain
       VkBaseOutStructure* feat_tail =
@@ -909,8 +932,7 @@ void VulkanContext::init() {
       while (feat_tail->pNext != nullptr) {
         feat_tail = feat_tail->pNext;
       }
-      feat_tail->pNext =
-          reinterpret_cast<VkBaseOutStructure*>(&cm2_features);
+      feat_tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&cm2_features);
 
       // Re-query with the extended chains
       physical_device.getFeatures2(&supported_features);
@@ -960,7 +982,8 @@ void VulkanContext::init() {
     if (shader_buffer_atomic_float32_supported) {
       device_extensions.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     }
-    if (has_device_extension(extensions, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME)) {
+    if (has_device_extension(
+            extensions, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME)) {
       device_extensions.push_back(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME);
     }
 #ifdef VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME
@@ -971,6 +994,12 @@ void VulkanContext::init() {
     if (has_push_descriptor_ext) {
       device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     }
+#ifdef VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME
+    if (has_device_extension(
+            extensions, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+      device_extensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
+#endif
 
     vk::DeviceCreateInfo device_create_info;
     device_create_info.flags = vk::DeviceCreateFlags();
@@ -1029,7 +1058,8 @@ void VulkanContext::init() {
     this->shader_int8_supported_ = shader_int8_supported;
     this->storage_buffer_8bit_supported_ = storage_buffer_8bit_supported;
     this->scalar_block_layout_supported_ = scalar_block_layout_supported;
-    this->shader_buffer_atomic_float32_supported_ = shader_buffer_atomic_float32_supported;
+    this->shader_buffer_atomic_float32_supported_ =
+        shader_buffer_atomic_float32_supported;
     this->shader_bfloat16_extension_present_ = has_shader_bfloat16_ext;
     this->shader_bfloat16_reported_supported_ = shader_bfloat16_supported;
     this->shader_bfloat16_supported_ = false;
@@ -1046,7 +1076,8 @@ void VulkanContext::init() {
     this->coopmat2_conv2d_supported_ = coopmat2_conv2d_supported;
     this->integer_dot_product_supported_ = integer_dot_product_supported;
     // Only enable push descriptor support if both extension is present AND
-    // function pointer was successfully resolved (avoid descriptor unbound issues)
+    // function pointer was successfully resolved (avoid descriptor unbound
+    // issues)
     this->push_descriptor_supported_ =
         has_push_descriptor_ext && push_descriptor_fn != nullptr;
     this->push_descriptor_fn_ = push_descriptor_fn;
@@ -1059,11 +1090,11 @@ void VulkanContext::init() {
     // Clean up partially initialized resources on failure
     // Note: We don't call waitIdle() here to avoid hangs during failed init
     if (device_) {
-      device_.destroy();
+      vkDestroyDevice(static_cast<VkDevice>(device_), nullptr);
       device_ = nullptr;
     }
     if (instance_) {
-      instance_.destroy();
+      vkDestroyInstance(static_cast<VkInstance>(instance_), nullptr);
       instance_ = nullptr;
     }
     throw;
@@ -1076,18 +1107,22 @@ void VulkanContext::cleanup() {
   if (device_) {
     // Only wait for idle if we were fully initialized
     // to avoid hanging on partially initialized devices
+    // Use raw Vulkan calls during teardown. Vulkan-Hpp's static dispatch loader
+    // can already be partially destroyed during process exit on macOS.
+    VkDevice device = static_cast<VkDevice>(device_);
     if (initialized_) {
-      device_.waitIdle();
+      vkDeviceWaitIdle(device);
     }
     if (timeline_semaphore_) {
-      device_.destroySemaphore(timeline_semaphore_);
+      vkDestroySemaphore(
+          device, static_cast<VkSemaphore>(timeline_semaphore_), nullptr);
       timeline_semaphore_ = nullptr;
     }
-    device_.destroy();
+    vkDestroyDevice(device, nullptr);
     device_ = nullptr;
   }
   if (instance_) {
-    instance_.destroy();
+    vkDestroyInstance(static_cast<VkInstance>(instance_), nullptr);
     instance_ = nullptr;
   }
   physical_device_ = nullptr;

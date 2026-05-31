@@ -317,16 +317,7 @@ void string_to_spv_func(
     options.AddMacroDefinition(define.first, define.second);
   }
 
-  // Optimization: disable for coopmat, f16/bf16, and rope shaders (matching
-  // glslc behavior). F16/BF16 shaders with mixed precision need unoptimized
-  // compilation to avoid aggressive loop optimizations that break correctness.
-  if (!coopmat && name.find("f16") == std::string::npos &&
-      name.find("bf16") == std::string::npos &&
-      name.find("rope") == std::string::npos) {
-    options.SetOptimizationLevel(shaderc_optimization_level_performance);
-  } else {
-    options.SetOptimizationLevel(shaderc_optimization_level_zero);
-  }
+  options.SetOptimizationLevel(shaderc_optimization_level_performance);
 
   // Compile the shader
   shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(

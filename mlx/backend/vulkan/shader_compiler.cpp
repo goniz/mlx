@@ -161,8 +161,8 @@ DynamicShaderFeatures collect_dynamic_shader_features(
     features.uses_8bit_storage =
         features.uses_8bit_storage || uses_8bit_storage(dtype);
   }
-  features.uses_scalar_block_layout =
-      options.needs_scalar_block_layout || features.uses_8bit_storage;
+  features.uses_scalar_block_layout = options.needs_scalar_block_layout ||
+      features.uses_8bit_storage || features.uses_16bit_storage;
   return features;
 }
 
@@ -313,7 +313,7 @@ std::string emit_bf16_conversion_helpers() {
 std::string storage_buffer_layout_for_dtype(Dtype dtype, uint32_t binding) {
   return fmt::format(
       "layout({}set = 0, binding = {})",
-      uses_8bit_storage(dtype) ? "scalar, " : "",
+      (uses_8bit_storage(dtype) || uses_16bit_storage(dtype)) ? "scalar, " : "",
       binding);
 }
 

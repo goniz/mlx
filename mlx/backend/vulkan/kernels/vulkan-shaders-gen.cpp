@@ -304,7 +304,6 @@ void string_to_spv_func(
   options.SetTargetEnvironment(target_env, env_version);
   options.SetSourceLanguage(shaderc_source_language_glsl);
   options.SetForcedVersionProfile(460, shaderc_profile_core);
-  options.SetGenerateDebugInfo();
 
   // Set up file includer for #include directives
   size_t last_slash = in_path.find_last_of("/\\");

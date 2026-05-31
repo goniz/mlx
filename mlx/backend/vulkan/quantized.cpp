@@ -490,11 +490,15 @@ layout(set = 0, binding = 0) readonly buffer W { uint data[]; } w;
 )";
   os << vulkan::storage_buffer_layout_for_dtype(uint8, 1)
      << " readonly buffer Scales { uint8_t data[]; } scales;\n";
+  os << vulkan::storage_buffer_layout_for_dtype(x.dtype(), 2)
+     << " readonly buffer X { X_TYPE data[]; } x;\n";
   os << R"(
-layout(set = 0, binding = 2) readonly buffer X { X_TYPE data[]; } x;
 layout(set = 0, binding = 3) readonly buffer LhsIndices { uint data[]; } lhs;
 layout(set = 0, binding = 4) readonly buffer RhsIndices { uint data[]; } rhs;
-layout(set = 0, binding = 5) buffer Output { OUT_TYPE data[]; } out_buf;
+)";
+  os << vulkan::storage_buffer_layout_for_dtype(out.dtype(), 5)
+     << " buffer Output { OUT_TYPE data[]; } out_buf;\n";
+  os << R"(
 
 float bf16_to_fp32(uint v) {
   return uintBitsToFloat(v << 16u);
@@ -654,6 +658,264 @@ void main() {
       sizeof(PushConstants),
       &pc);
   vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
+bool fp_gather_qmm_fused_matvec(
+    const array& w,
+    const array& scales,
+    const array& x,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    Stream s,
+    int bits) {
+  if (w.dtype() != uint32 || scales.dtype() != uint8 ||
+      !is_supported_quantized_output_dtype(x.dtype()) ||
+      lhs_indices.dtype() != uint32 || rhs_indices.dtype() != uint32 ||
+      !is_supported_quantized_output_dtype(out.dtype()) ||
+      (bits != 4 && bits != 8)) {
+    return false;
+  }
+  if (!is_row_contiguous_zero_offset(w) ||
+      !is_row_contiguous_zero_offset(scales) ||
+      !is_row_contiguous_zero_offset(x) ||
+      !is_row_contiguous_zero_offset(lhs_indices) ||
+      !is_row_contiguous_zero_offset(rhs_indices)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  const uint32_t rows = static_cast<uint32_t>(out.shape(-2));
+  const uint32_t cols = static_cast<uint32_t>(out.shape(-1));
+  const uint32_t K = static_cast<uint32_t>(x.shape(-1));
+  const uint32_t batches =
+      static_cast<uint32_t>(out.size() / (rows * cols));
+
+  struct PushConstants {
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t K;
+    uint32_t packed_row_words;
+    uint32_t x_batch_stride;
+    uint32_t x_row_stride;
+    uint32_t out_batch_stride;
+    uint32_t out_row_stride;
+    uint32_t scale_matrix_stride;
+    uint32_t scale_row_stride;
+    uint32_t w_matrix_stride_words;
+    uint32_t bits;
+  } pc{};
+  pc.rows = rows;
+  pc.cols = cols;
+  pc.K = K;
+  pc.packed_row_words = static_cast<uint32_t>(w.strides(-2));
+  pc.x_batch_stride = static_cast<uint32_t>(x.shape(-2) * x.shape(-1));
+  pc.x_row_stride = static_cast<uint32_t>(x.strides(-2));
+  pc.out_batch_stride = rows * cols;
+  pc.out_row_stride = static_cast<uint32_t>(out.strides(-2));
+  pc.scale_matrix_stride = static_cast<uint32_t>(scales.strides(-3));
+  pc.scale_row_stride = static_cast<uint32_t>(scales.strides(-2));
+  pc.w_matrix_stride_words = static_cast<uint32_t>(w.strides(-3));
+  pc.bits = static_cast<uint32_t>(bits);
+
+  std::ostringstream os;
+  vulkan::DynamicShaderPreambleOptions preamble_options;
+  preamble_options.dtypes = {uint8, x.dtype(), out.dtype()};
+  preamble_options.local_size_x = 64;  // One AMD wavefront for better occupancy
+  os << vulkan::emit_dynamic_shader_preamble(preamble_options);
+  os << "#define X_TYPE " << vulkan::dtype_to_glsl_storage_type(x.dtype())
+     << "\n";
+  os << "#define OUT_TYPE " << vulkan::dtype_to_glsl_storage_type(out.dtype())
+     << "\n";
+  if (bits == 4) {
+    os << "#define FP_BITS_4 1\n";
+  } else {
+    os << "#define FP_BITS_8 1\n";
+  }
+  if (x.dtype() == bfloat16) {
+    os << "#define X_BF16 1\n";
+  }
+  if (out.dtype() == bfloat16) {
+    os << "#define OUT_BF16 1\n";
+  }
+  os << R"(
+
+layout(push_constant) uniform PushConstants {
+  uint rows;
+  uint cols;
+  uint K;
+  uint packed_row_words;
+  uint x_batch_stride;
+  uint x_row_stride;
+  uint out_batch_stride;
+  uint out_row_stride;
+  uint scale_matrix_stride;
+  uint scale_row_stride;
+  uint w_matrix_stride_words;
+  uint bits;
+} p;
+layout(set = 0, binding = 0) readonly buffer W { uint data[]; } w;
+)";
+  os << vulkan::storage_buffer_layout_for_dtype(uint8, 1)
+     << " readonly buffer Scales { uint8_t data[]; } scales;\n";
+  os << vulkan::storage_buffer_layout_for_dtype(x.dtype(), 2)
+     << " readonly buffer X { X_TYPE data[]; } x;\n";
+  os << R"(
+layout(set = 0, binding = 3) readonly buffer LhsIndices { uint data[]; } lhs;
+layout(set = 0, binding = 4) readonly buffer RhsIndices { uint data[]; } rhs;
+)";
+  os << vulkan::storage_buffer_layout_for_dtype(out.dtype(), 5)
+     << " buffer Output { OUT_TYPE data[]; } out_buf;\n";
+  os << R"(
+
+shared float partial[64];
+
+float bf16_to_fp32(uint v) {
+  return uintBitsToFloat(v << 16u);
+}
+
+uint fp32_to_bf16(float v) {
+  uint u = floatBitsToUint(v);
+  return (u >> 16u) + (((u & 0xFFFFu) + 0x7FFFu) >> 16u);
+}
+
+float load_x_val(uint idx) {
+#if defined(X_BF16)
+  return bf16_to_fp32(uint(x.data[idx]));
+#else
+  return float(x.data[idx]);
+#endif
+}
+
+void store_out(uint idx, float v) {
+#if defined(OUT_BF16)
+  out_buf.data[idx] = uint16_t(fp32_to_bf16(v));
+#else
+  out_buf.data[idx] = OUT_TYPE(v);
+#endif
+}
+
+float e8m0_to_fp32(uint8_t v) {
+  uint bits = v == uint8_t(0) ? 0x00400000u : (uint(v) << 23);
+  return uintBitsToFloat(bits);
+}
+
+float fp4_to_float(uint q) {
+  switch (q & 15u) {
+    case 0u: return 0.0;
+    case 1u: return 0.5;
+    case 2u: return 1.0;
+    case 3u: return 1.5;
+    case 4u: return 2.0;
+    case 5u: return 3.0;
+    case 6u: return 4.0;
+    case 7u: return 6.0;
+    case 8u: return -0.0;
+    case 9u: return -0.5;
+    case 10u: return -1.0;
+    case 11u: return -1.5;
+    case 12u: return -2.0;
+    case 13u: return -3.0;
+    case 14u: return -4.0;
+    default: return -6.0;
+  }
+}
+
+float fp8_e4m3_to_fp32(uint8_t v) {
+  uint ux = uint(v);
+  uint exponent = (ux >> 3u) & 15u;
+  uint mantissa = ux & 7u;
+  float result = exponent == 0u
+      ? float(mantissa) * 0.001953125
+      : exp2(float(int(exponent) - 7)) * (1.0 + float(mantissa) * 0.125);
+  return (ux & 128u) != 0u ? -result : result;
+}
+
+float decode_weight_at(uint w_row_base, uint k, float scale) {
+#if defined(FP_BITS_4)
+  uint packed = w.data[w_row_base + (k >> 3u)];
+  uint q = (packed >> ((k & 7u) * 4u)) & 15u;
+  return fp4_to_float(q) * scale;
+#else
+  uint packed = w.data[w_row_base + (k >> 2u)];
+  uint8_t q = uint8_t((packed >> ((k & 3u) * 8u)) & 255u);
+  return fp8_e4m3_to_fp32(q) * scale;
+#endif
+}
+
+void main() {
+  const uint col = gl_WorkGroupID.x;
+  const uint row = gl_WorkGroupID.y;
+  const uint batch = gl_WorkGroupID.z;
+  const uint tid = gl_LocalInvocationID.x;
+
+  if (row >= p.rows || col >= p.cols) {
+    return;
+  }
+
+  const uint lhs_batch = lhs.data[batch];
+  const uint rhs_batch = rhs.data[batch];
+  const uint w_row_base = rhs_batch * p.w_matrix_stride_words + col * p.packed_row_words;
+  const uint scale_row_base = rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
+  const uint x_row_base = lhs_batch * p.x_batch_stride + row * p.x_row_stride;
+
+  float acc = 0.0f;
+  for (uint k = tid; k < p.K; k += gl_WorkGroupSize.x) {
+    const uint group = k >> 5u;
+    const float scale = e8m0_to_fp32(scales.data[scale_row_base + group]);
+    acc = fma(load_x_val(x_row_base + k), decode_weight_at(w_row_base, k, scale), acc);
+  }
+
+  partial[tid] = acc;
+  barrier();
+  for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) {
+      partial[tid] += partial[tid + stride];
+    }
+    barrier();
+  }
+
+  if (tid == 0u) {
+    store_out(batch * p.out_batch_stride + row * p.out_row_stride + col, partial[0]);
+  }
+}
+)";
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&w, 0},
+      {&scales, 1},
+      {&x, 2},
+      {&lhs_indices, 3},
+      {&rhs_indices, 4},
+      {&out, 5},
+  };
+  const std::string shader_name =
+      std::string(bits == 4 ? "dynamic_gather_mxfp4_qmm_matvec_wg64"
+                            : "dynamic_gather_mxfp8_qmm_matvec_wg64") +
+      "_x" + std::to_string(static_cast<int>(x.dtype().val())) + "_o" +
+      std::to_string(static_cast<int>(out.dtype().val()));
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      shader_name,
+      os.str(),
+      6,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  // One workgroup per output element (col, row, batch)
+  vkCmdDispatch(dispatch.command_buffer, cols, rows, batches);
   vulkan::end_command_recording(s.index);
   return true;
 }
@@ -1512,25 +1774,6 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   array x_f32 = ensure_float32_row_contiguous(inputs[0], s);
-  Shape xq_shape = x_f32.shape();
-  xq_shape.back() = xq_shape.back() * bits_ / 32;
-  Shape x_scales_shape = x_f32.shape();
-  x_scales_shape.back() = x_scales_shape.back() / group_size_;
-
-  array x_q(xq_shape, uint32, nullptr, {});
-  array x_scales(x_scales_shape, uint8, nullptr, {});
-  if (!vulkan::nvfp4_quantize_from_float32(
-          x_f32, x_q, x_scales, global_scale_x, s)) {
-    throw std::runtime_error(
-        "[QQMatmul::eval_gpu] Failed to quantize lhs on Vulkan.");
-  }
-
-  array xhat(x_f32.shape(), float32, nullptr, {});
-  if (!vulkan::nvfp4_dequantize_to_float32(
-          x_q, x_scales, global_scale_x, xhat, s)) {
-    throw std::runtime_error(
-        "[QQMatmul::eval_gpu] Failed to dequantize lhs on Vulkan.");
-  }
 
   array what(expanded_quantized_shape(inputs[1], bits_), float32, nullptr, {});
   if (!vulkan::nvfp4_dequantize_to_float32(
@@ -1542,7 +1785,7 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   array rhs =
       ensure_row_contiguous_zero_offset(swapaxes_in_eval(what, -1, -2), s);
   array result(out.shape(), float32, nullptr, {});
-  if (!try_eval_matmul_vulkan({xhat, rhs}, result, s)) {
+  if (!try_eval_matmul_vulkan({x_f32, rhs}, result, s)) {
     throw std::runtime_error(
         "[QQMatmul::eval_gpu] Failed to dispatch Vulkan fallback matmul.");
   }
@@ -1629,6 +1872,12 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         group_size_ != 32) {
       throw std::runtime_error(
           "[GatherQMM::eval_gpu] Incompatible gather FP qmm shapes.");
+    }
+
+    // Use matvec kernel with cooperative K-reduction for better utilization
+    if (fp_gather_qmm_fused_matvec(
+            w, scales, x_work, lhs_indices, rhs_indices, out, s, bits_)) {
+      return;
     }
 
     if (!fp_gather_qmm_fused(

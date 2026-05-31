@@ -1,22 +1,38 @@
-find_package(Vulkan COMPONENTS glslang REQUIRED)
+if(APPLE)
+  find_package(Vulkan COMPONENTS glslang REQUIRED)
+  find_program(MLX_VULKAN_SHADER_COMPILER NAMES glslang REQUIRED)
+  set(MLX_VULKAN_SHADER_COMPILER_ARGS -V --target-env vulkan1.3 -S comp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(Vulkan COMPONENTS glslc REQUIRED)
+  set(MLX_VULKAN_SHADER_COMPILER ${Vulkan_GLSLC_EXECUTABLE})
+  set(MLX_VULKAN_SHADER_COMPILER_ARGS -fshader-stage=compute --target-env=vulkan1.3)
+else()
+  find_package(Vulkan REQUIRED)
+endif()
 
 if(Vulkan_FOUND)
   message(STATUS "Vulkan found: ${Vulkan_VERSION}")
   
   # Test shader extension support
   function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
+    if(NOT MLX_VULKAN_SHADER_COMPILER)
+      message(STATUS "${EXTENSION_NAME} probe skipped; shader compiler unavailable")
+      set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+      return()
+    endif()
+
     execute_process(
-      COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
-      RESULT_VARIABLE glslc_result
-      OUTPUT_VARIABLE glslc_output
-      ERROR_VARIABLE glslc_error
+      COMMAND ${MLX_VULKAN_SHADER_COMPILER} ${MLX_VULKAN_SHADER_COMPILER_ARGS} -o - "${TEST_SHADER_FILE}"
+      RESULT_VARIABLE shader_compiler_result
+      OUTPUT_VARIABLE shader_compiler_output
+      ERROR_VARIABLE shader_compiler_error
     )
 
-    if(glslc_result EQUAL 0)
-      message(STATUS "${EXTENSION_NAME} supported by glslc")
+    if(shader_compiler_result EQUAL 0)
+      message(STATUS "${EXTENSION_NAME} supported by shader compiler")
       set(${RESULT_VARIABLE} ON PARENT_SCOPE)
-    elseif(glslc_error MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
-      message(STATUS "${EXTENSION_NAME} not supported by glslc")
+    elseif(shader_compiler_error MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
+      message(STATUS "${EXTENSION_NAME} not supported by shader compiler")
       set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
     else()
       message(STATUS "${EXTENSION_NAME} probe failed; assuming unsupported")

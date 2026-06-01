@@ -762,6 +762,82 @@ std::string conv1d_load_expr(const std::string& expr, Dtype dtype) {
   }
 }
 
+std::string conv1d_store_expr(const std::string& expr, Dtype dtype) {
+  switch (dtype) {
+    case float32:
+      return expr;
+    case float16:
+      return "float16_t(" + expr + ")";
+    case bfloat16:
+      return "uint16_t(fp32_to_bf16(" + expr + "))";
+    default:
+      throw std::runtime_error("Unsupported Conv1d Vulkan dtype.");
+  }
+}
+
+// This narrow depthwise Conv1d path is generated dynamically so it can
+// specialize only the input/weight/output dtype triplet without adding a static
+// shader variant matrix for the Qwen-style inference fast path.
+std::string build_depthwise_conv1d_shader(
+    Dtype in_dtype,
+    Dtype wt_dtype,
+    Dtype out_dtype) {
+  std::ostringstream os;
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  if (in_dtype == float16 || wt_dtype == float16 || out_dtype == float16) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+  }
+  if (in_dtype == float16 || wt_dtype == float16 || out_dtype == float16 ||
+      in_dtype == bfloat16 || wt_dtype == bfloat16 || out_dtype == bfloat16) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+    os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  }
+  os << "\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  if (in_dtype == bfloat16 || wt_dtype == bfloat16) {
+    os << "float bf16_to_fp32(uint u) { return uintBitsToFloat(u << 16); }\n";
+  }
+  if (out_dtype == bfloat16) {
+    os << R"(
+uint fp32_to_bf16(float v) {
+  uint u = floatBitsToUint(v);
+  return (u >> 16u) + (((u & 0xFFFFu) + 0x7FFFu) >> 16u);
+}
+)";
+  }
+  os << "\nlayout(push_constant) uniform PushConstants {\n";
+  os << "  uint total; uint out_len; uint channels; uint kernel;\n";
+  os << "  uint in_stride_batch; uint in_stride_time; uint in_stride_channel;\n";
+  os << "} pc;\n";
+  os << "layout(set = 0, binding = 0) readonly buffer Input {"
+     << conv1d_storage_type(in_dtype) << " data[];} in_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer Weight {"
+     << conv1d_storage_type(wt_dtype) << " data[];} wt_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Output {"
+     << conv1d_storage_type(out_dtype) << " data[];} out_buf;\n\n";
+  os << "void main() {\n";
+  os << "  uint idx = gl_GlobalInvocationID.x;\n";
+  os << "  if (idx >= pc.total) return;\n";
+  os << "  uint channel = idx % pc.channels;\n";
+  os << "  uint time = (idx / pc.channels) % pc.out_len;\n";
+  os << "  uint batch = idx / (pc.channels * pc.out_len);\n";
+  os << "  uint in_index = batch * pc.in_stride_batch + time * pc.in_stride_time + channel * pc.in_stride_channel;\n";
+  os << "  uint wt_index = channel * pc.kernel;\n";
+  os << "  float acc = 0.0;\n";
+  os << "  for (uint k = 0; k < pc.kernel; ++k) {\n";
+  os << "    float x = "
+     << conv1d_load_expr("in_buf.data[in_index + k * pc.in_stride_time]", in_dtype)
+     << ";\n";
+  os << "    float w = "
+     << conv1d_load_expr("wt_buf.data[wt_index + k]", wt_dtype) << ";\n";
+  os << "    acc = fma(x, w, acc);\n";
+  os << "  }\n";
+  os << "  out_buf.data[idx] = " << conv1d_store_expr("acc", out_dtype)
+     << ";\n";
+  os << "}\n";
+  return os.str();
+}
+
 std::string build_conv1d_shader(Dtype in_dtype, Dtype wt_dtype) {
   std::ostringstream os;
   os << "#version 450\n";
@@ -836,6 +912,16 @@ struct Conv1dPushConstants {
   uint32_t dilation;
   uint32_t input_dilation;
   uint32_t flip;
+};
+
+struct DepthwiseConv1dPushConstants {
+  uint32_t total;
+  uint32_t out_len;
+  uint32_t channels;
+  uint32_t kernel;
+  uint32_t in_stride_batch;
+  uint32_t in_stride_time;
+  uint32_t in_stride_channel;
 };
 
 struct Conv2dGeneralPushConstants {
@@ -1262,6 +1348,57 @@ bool try_eval_conv1d_direct_vulkan(
 
   in = ensure_conv1d_storage(std::move(in), s, "conv1d.copy_input");
   wt = ensure_conv1d_storage(std::move(wt), s, "conv1d.copy_weight");
+
+  const bool is_depthwise = input_dilation == 1 && groups == in.shape(2) &&
+      groups == wt.shape(0) && wt.shape(2) == 1 && stride == 1 &&
+      dilation == 1 && padding == 0 && !flip &&
+      (out.dtype() == float32 || out.dtype() == float16 ||
+       out.dtype() == bfloat16);
+  if (is_depthwise) {
+    out.set_data(vulkan::allocator().malloc(out.nbytes()));
+    if (out.size() == 0) {
+      return true;
+    }
+
+    DepthwiseConv1dPushConstants pc{};
+    pc.total = checked_u32_size(out.size(), "depthwise conv1d total");
+    pc.out_len = checked_u32_size(out.shape(1), "depthwise conv1d output length");
+    pc.channels = checked_u32_size(out.shape(2), "depthwise conv1d channels");
+    pc.kernel = checked_u32_size(wt.shape(1), "depthwise conv1d kernel");
+    pc.in_stride_batch =
+        checked_u32_size(in.strides(0), "depthwise conv1d input stride 0");
+    pc.in_stride_time =
+        checked_u32_size(in.strides(1), "depthwise conv1d input stride 1");
+    pc.in_stride_channel =
+        checked_u32_size(in.strides(2), "depthwise conv1d input stride 2");
+
+    const std::string shader_name = "dynamic_depthwise_conv1d_" +
+        std::to_string(static_cast<int>(in.dtype().val())) + "_" +
+        std::to_string(static_cast<int>(wt.dtype().val())) + "_" +
+        std::to_string(static_cast<int>(out.dtype().val()));
+    const std::string glsl_source =
+        build_depthwise_conv1d_shader(in.dtype(), wt.dtype(), out.dtype());
+    vulkan::DynamicArrayRef arrays[] = {{&in, 0}, {&wt, 1}, {&out, 2}};
+    auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+        shader_name,
+        glsl_source,
+        3,
+        arrays,
+        sizeof(DepthwiseConv1dPushConstants),
+        s);
+    vkCmdPushConstants(
+        dispatch.command_buffer,
+        dispatch.pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(DepthwiseConv1dPushConstants),
+        &pc);
+    vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+    vulkan::end_command_recording(s.index);
+    vulkan::retain_array_for_stream(s, in);
+    vulkan::retain_array_for_stream(s, wt);
+    return true;
+  }
 
   array out_work(out.shape(), float32, nullptr, {});
   out_work.set_data(vulkan::allocator().malloc(out_work.nbytes()));

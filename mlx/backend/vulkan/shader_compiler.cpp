@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -319,8 +320,10 @@ std::string storage_buffer_layout_for_dtype(Dtype dtype, uint32_t binding) {
 
 std::string emit_dynamic_shader_preamble(
     const DynamicShaderPreambleOptions& options) {
-  if (!options.use_local_size_x_id && options.local_size_x == 0) {
-    throw std::runtime_error("Dynamic Vulkan shader local_size_x must be > 0.");
+  if (!options.use_local_size_x_id &&
+      (options.local_size_x == 0 || options.local_size_y == 0 ||
+       options.local_size_z == 0)) {
+    throw std::runtime_error("Dynamic Vulkan shader local sizes must be > 0.");
   }
 
   const auto features = collect_dynamic_shader_features(options);
@@ -346,10 +349,12 @@ std::string emit_dynamic_shader_preamble(
   }
   if (options.use_local_size_x_id) {
     os << "\nlayout(local_size_x_id = " << options.local_size_x_id
-       << ", local_size_y = 1, local_size_z = 1) in;\n\n";
+       << ", local_size_y = " << options.local_size_y
+       << ", local_size_z = " << options.local_size_z << ") in;\n\n";
   } else {
     os << "\nlayout(local_size_x = " << options.local_size_x
-       << ", local_size_y = 1, local_size_z = 1) in;\n\n";
+       << ", local_size_y = " << options.local_size_y
+       << ", local_size_z = " << options.local_size_z << ") in;\n\n";
   }
   return os.str();
 }
@@ -369,6 +374,134 @@ std::string emit_dynamic_shader_preamble(
   options.dtypes = {in_dtype, out_dtype};
   options.needs_int64 = needs_int64;
   return emit_dynamic_shader_preamble(options);
+}
+
+std::string dynamic_template_arguments_hash(
+    const std::vector<std::pair<std::string, DynamicTemplateArg>>&
+        template_args) {
+  std::ostringstream os;
+  for (const auto& [name, arg] : template_args) {
+    if (std::holds_alternative<int>(arg)) {
+      os << "_" << std::get<int>(arg);
+    } else if (std::holds_alternative<bool>(arg)) {
+      os << (std::get<bool>(arg) ? "_t" : "_f");
+    } else if (std::holds_alternative<Dtype>(arg)) {
+      os << "_" << static_cast<int>(std::get<Dtype>(arg).val());
+    }
+  }
+  return os.str();
+}
+
+namespace {
+
+std::string read_float_expr_for_dtype(const std::string& expr, Dtype dtype) {
+  if (dtype == mlx::core::bfloat16) {
+    return "bf16_to_fp32(uint(" + expr + "))";
+  }
+  if (dtype == mlx::core::float32) {
+    return expr;
+  }
+  return "float(" + expr + ")";
+}
+
+} // namespace
+
+std::string emit_custom_kernel_source(
+    const std::string& header,
+    const std::string& source,
+    const std::vector<std::string>& input_names,
+    const std::vector<array>& inputs,
+    const std::vector<std::string>& output_names,
+    const std::vector<Dtype>& output_dtypes,
+    const std::vector<std::pair<std::string, DynamicTemplateArg>>&
+        template_args,
+    std::tuple<int, int, int> threadgroup) {
+  const auto [tx, ty, tz] = threadgroup;
+  DynamicShaderPreambleOptions options;
+  options.local_size_x = std::max(tx, 1);
+  options.local_size_y = std::max(ty, 1);
+  options.local_size_z = std::max(tz, 1);
+  options.needs_int64 = true;
+  options.dtypes.reserve(
+      inputs.size() + output_dtypes.size() + template_args.size());
+  for (const auto& input : inputs) {
+    options.dtypes.push_back(input.dtype());
+  }
+  for (const auto& dtype : output_dtypes) {
+    options.dtypes.push_back(dtype);
+  }
+  for (const auto& [_, arg] : template_args) {
+    if (std::holds_alternative<Dtype>(arg)) {
+      options.dtypes.push_back(std::get<Dtype>(arg));
+    }
+  }
+
+  std::ostringstream os;
+  os << emit_dynamic_shader_preamble(options);
+  os << header;
+  os << "\n";
+  for (const auto& dtype : options.dtypes) {
+    if (dtype == mlx::core::bfloat16) {
+      os << emit_bf16_conversion_helpers();
+      break;
+    }
+  }
+
+  for (const auto& [name, arg] : template_args) {
+    if (std::holds_alternative<int>(arg)) {
+      os << "const int " << name << " = " << std::get<int>(arg) << ";\n";
+    } else if (std::holds_alternative<bool>(arg)) {
+      os << "const bool " << name << " = "
+         << (std::get<bool>(arg) ? "true" : "false") << ";\n";
+    } else if (std::holds_alternative<Dtype>(arg)) {
+      Dtype dtype = std::get<Dtype>(arg);
+      os << "#define " << name << " " << dtype_to_glsl_storage_type(dtype)
+         << "\n";
+      os << "float read_" << name << "(" << dtype_to_glsl_storage_type(dtype)
+         << " x) { return " << read_float_expr_for_dtype("x", dtype)
+         << "; }\n";
+      os << dtype_to_glsl_storage_type(dtype) << " write_" << name
+         << "(float x) { return " << cast_expr_for_dtype("x", float32, dtype)
+         << "; }\n";
+    }
+  }
+  if (!template_args.empty()) {
+    os << "\n";
+  }
+
+  uint32_t binding = 0;
+  std::vector<std::pair<std::string, std::string>> name_aliases;
+  for (size_t i = 0; i < inputs.size(); ++i, ++binding) {
+    const auto& name = input_names[i];
+    const auto safe_name = name == "out" ? name + "_buf" : name;
+    if (safe_name != name) {
+      name_aliases.push_back({name, safe_name});
+    }
+    const auto dtype = inputs[i].dtype();
+    os << storage_buffer_layout_for_dtype(dtype, binding)
+       << " readonly buffer " << name << "Buffer { "
+       << dtype_to_glsl_storage_type(dtype) << " data[]; } " << safe_name
+       << ";\n";
+  }
+  for (size_t i = 0; i < output_names.size(); ++i, ++binding) {
+    const auto& name = output_names[i];
+    const auto safe_name = name == "out" ? name + "_buf" : name;
+    if (safe_name != name) {
+      name_aliases.push_back({name, safe_name});
+    }
+    const auto dtype = output_dtypes[i];
+    os << storage_buffer_layout_for_dtype(dtype, binding) << " buffer " << name
+       << "Buffer { " << dtype_to_glsl_storage_type(dtype) << " data[]; } "
+       << safe_name << ";\n";
+  }
+  for (const auto& [name, safe_name] : name_aliases) {
+    os << "#define " << name << " " << safe_name << "\n";
+  }
+
+  os << "\nvoid main() {\n";
+  os << source;
+  os << "\n}\n";
+  return os.str();
 }
 
 std::string zero_literal_for_dtype(Dtype dtype) {

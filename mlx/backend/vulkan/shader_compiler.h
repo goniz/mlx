@@ -4,8 +4,12 @@
 
 #include <cstdint>
 #include <string>
+#include <tuple>
+#include <utility>
+#include <variant>
 #include <vector>
 
+#include "mlx/array.h"
 #include "mlx/dtype.h"
 
 namespace mlx::core::vulkan {
@@ -36,6 +40,8 @@ struct DynamicShaderPreambleOptions {
   bool needs_scalar_block_layout{false};
   bool use_local_size_x_id{false};
   uint32_t local_size_x{256};
+  uint32_t local_size_y{1};
+  uint32_t local_size_z{1};
   uint32_t local_size_x_id{0};
 };
 
@@ -75,6 +81,27 @@ std::string emit_dynamic_shader_preamble(
     Dtype in_dtype,
     Dtype out_dtype,
     bool needs_int64);
+
+using DynamicTemplateArg = std::variant<int, bool, Dtype>;
+
+// Returns a deterministic suffix for dynamic shader template arguments.
+std::string dynamic_template_arguments_hash(
+    const std::vector<std::pair<std::string, DynamicTemplateArg>>&
+        template_args);
+
+// Emits a full GLSL compute shader for mx.fast.vulkan_kernel-style kernels.
+// The caller provides the body of main(); this helper supplies the dynamic
+// preamble, template constants/helpers, and input/output storage buffers.
+std::string emit_custom_kernel_source(
+    const std::string& header,
+    const std::string& source,
+    const std::vector<std::string>& input_names,
+    const std::vector<array>& inputs,
+    const std::vector<std::string>& output_names,
+    const std::vector<Dtype>& output_dtypes,
+    const std::vector<std::pair<std::string, DynamicTemplateArg>>&
+        template_args,
+    std::tuple<int, int, int> threadgroup);
 
 // Returns a GLSL zero literal for the given dtype.
 std::string zero_literal_for_dtype(Dtype dtype);

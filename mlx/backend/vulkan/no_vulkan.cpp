@@ -2,6 +2,7 @@
 
 #include "mlx/primitives.h"
 #include "mlx/distributed/primitives.h"
+#include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
 
 #define NO_GPU_MULTI(func)                                             \
@@ -22,6 +23,22 @@
   }
 
 namespace mlx::core {
+
+namespace fast {
+
+// Mirrors the Metal/CUDA no-backend stubs so the public fast API remains
+// defined for builds where Vulkan is disabled.
+CustomKernelFunction vulkan_kernel(
+    const std::string&,
+    const std::vector<std::string>&,
+    const std::vector<std::string>&,
+    const std::string&,
+    const std::string&,
+    bool) {
+  throw std::runtime_error("[vulkan_kernel] No Vulkan back-end.");
+}
+
+} // namespace fast
 
 bool fast::ScaledDotProductAttention::use_fallback(
     const array& q,

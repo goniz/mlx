@@ -13,6 +13,18 @@
 #if !defined(TO_FLOAT_TYPE)
 #define TO_FLOAT_TYPE float
 #endif
+#if !defined(S_TYPE)
+#define S_TYPE float
+#endif
+#if !defined(D_TYPE)
+#define D_TYPE float
+#endif
+#if !defined(SCALE_TO_FLOAT_TYPE)
+#define SCALE_TO_FLOAT_TYPE(x) float(x)
+#endif
+#if !defined(FROM_FLOAT_TYPE)
+#define FROM_FLOAT_TYPE(x) (x)
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -20,16 +32,16 @@ layout(binding = 0) readonly buffer W {
     uint8_t data_w[];
 };
 layout(binding = 1) readonly buffer SCALES {
-    float data_scales[];
+    S_TYPE data_scales[];
 };
 layout(binding = 2) readonly buffer BIASES {
-    float data_biases[];
+    S_TYPE data_biases[];
 };
 layout(binding = 3) readonly buffer X {
     B_TYPE data_x[];
 };
 layout(binding = 4) writeonly buffer OUT {
-    float data_out[];
+    D_TYPE data_out[];
 };
 
 layout(push_constant) uniform parameter {
@@ -65,8 +77,9 @@ void main() {
     float acc = 0.0f;
     for (uint k = tid; k < p.K; k += gl_WorkGroupSize.x) {
         const uint group = k / p.group_size;
-        const float w = data_scales[scale_row_base + group] *
-            float(data_w[w_row_base + k]) + data_biases[bias_row_base + group];
+        const float w = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base + group]) *
+            float(data_w[w_row_base + k]) +
+            SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base + group]);
         acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k]), w, acc);
     }
 
@@ -80,6 +93,6 @@ void main() {
     }
 
     if (tid == 0u) {
-        data_out[row * p.out_row_stride + col] = partial[0];
+        data_out[row * p.out_row_stride + col] = D_TYPE(FROM_FLOAT_TYPE(partial[0]));
     }
 }

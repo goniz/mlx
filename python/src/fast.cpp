@@ -624,4 +624,62 @@ void init_fast(nb::module_& parent_module) {
            before the kernel runs. Default: ``False``.
         stream (mx.stream, optional): Stream to run the kernel on. Default: ``None``.
       )pbdoc");
+
+  // Mirrors the Metal/CUDA custom-kernel binding shape: the factory returns a
+  // callable that accepts inputs, output metadata, launch geometry, and template
+  // arguments.
+  m.def(
+      "vulkan_kernel",
+      [](const std::string& name,
+         const std::vector<std::string>& input_names,
+         const std::vector<std::string>& output_names,
+         const std::string& source,
+         const std::string& header,
+         bool ensure_row_contiguous) {
+        auto kernel = mx::fast::vulkan_kernel(
+            name,
+            input_names,
+            output_names,
+            source,
+            header,
+            ensure_row_contiguous);
+        return nb::cpp_function(
+            PyCustomKernelFunction(std::move(kernel), "[vulkan_kernel]"),
+            nb::kw_only(),
+            "inputs"_a,
+            "output_shapes"_a,
+            "output_dtypes"_a,
+            "grid"_a,
+            "threadgroup"_a,
+            "template"_a = nb::none(),
+            "init_value"_a = nb::none(),
+            "verbose"_a = false,
+            "stream"_a = nb::none(),
+            nb::sig(
+                "def __call__(self, *, inputs: List[Union[scalar, array]], output_shapes: List[Sequence[int]], output_dtypes: List[Dtype], grid: tuple[int, int, int], threadgroup: tuple[int, int, int], template: Optional[List[Tuple[str, Union[bool, int, Dtype]]]] = None, init_value: Optional[float] = None, verbose: bool = false, stream: Union[None, Stream, Device] = None)"));
+      },
+      "name"_a,
+      "input_names"_a,
+      "output_names"_a,
+      "source"_a,
+      "header"_a = "",
+      "ensure_row_contiguous"_a = true,
+      R"pbdoc(
+      A JIT-compiled custom Vulkan compute shader defined from a source string.
+
+      The source is the body of ``main()``. Inputs and outputs are exposed as
+      storage buffers named after ``input_names`` and ``output_names`` with a
+      ``.data`` member. Template dtype arguments additionally define
+      ``read_<Name>(value)`` and ``write_<Name>(float_value)`` helpers.
+
+      Args:
+        name (str): Kernel name used for compilation and diagnostics.
+        input_names (list(str)): Names for the input buffers.
+        output_names (list(str)): Names for the output buffers.
+        source (str): GLSL source for the body of ``main()``.
+        header (str, optional): GLSL source emitted before buffers and
+            ``main()``. Default: ``""``.
+        ensure_row_contiguous (bool): Whether to ensure inputs are row
+            contiguous before the kernel runs. Default: ``True``.
+      )pbdoc");
 }

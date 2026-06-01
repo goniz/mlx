@@ -1335,12 +1335,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   };
   array x = ensure_row_contiguous_zero_offset(inputs[0], s);
   array w = ensure_row_contiguous_zero_offset(inputs[1], s);
-  array scales = mode_ == QuantizationMode::Affine
-      ? ensure_float32_row_contiguous(inputs[2], s)
-      : inputs[2];
-  std::optional<array> biases = mode_ == QuantizationMode::Affine
-      ? std::make_optional(ensure_float32_row_contiguous(inputs[3], s))
-      : std::nullopt;
 
   const bool vector_lhs = x.ndim() == 1;
   const bool flatten_lhs_batches = x.ndim() > 2 && w.ndim() == 2;
@@ -1414,14 +1408,19 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.group_size = static_cast<uint32_t>(group_size_);
           push_constants.num_groups = num_groups;
 
+          const bool use_decode_matvec = rows == 1;
           const bool use_tiled_prefill = rows > 1 && group_size_ >= 32 &&
               (group_size_ % 32) == 0 &&
               fused_affine_bf16_tiled_prefill_enabled();
-          const auto shader_id = use_tiled_prefill
+          const auto shader_id = use_decode_matvec
+              ? vulkan::StaticShaderId::fused_affine_matvec8_bf16_bf16
+              : use_tiled_prefill
               ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
               : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16;
-          const std::array<uint32_t, 3> grid = shader_id ==
-                  vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
+          const std::array<uint32_t, 3> grid = use_decode_matvec
+              ? std::array<uint32_t, 3>{cols, rows, 1u}
+              : shader_id ==
+                      vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
               ? std::array<
                     uint32_t,
                     3>{(cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
@@ -1471,6 +1470,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       }
     }
   }
+
+  array scales = mode_ == QuantizationMode::Affine
+      ? ensure_float32_row_contiguous(inputs[2], s)
+      : inputs[2];
+  std::optional<array> biases = mode_ == QuantizationMode::Affine
+      ? std::make_optional(ensure_float32_row_contiguous(inputs[3], s))
+      : std::nullopt;
 
   if (x_mat.dtype() == bfloat16) {
     x_mat = ensure_float32_row_contiguous(x_mat, s);

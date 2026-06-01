@@ -22,6 +22,7 @@
 #include "mlx/backend/vulkan/quantized.h"
 #include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
+#include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/transforms_impl.h"
@@ -253,6 +254,110 @@ bool try_convert_fp8_f32_gpu(
       dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
   vulkan::end_command_recording(s.index);
   return true;
+}
+
+CustomKernelFunction make_vulkan_kernel(
+    const std::string& name,
+    const std::vector<std::string>& input_names,
+    const std::vector<std::string>& output_names,
+    const std::string& source,
+    const std::string& header,
+    bool ensure_row_contiguous) {
+  if (output_names.empty()) {
+    throw std::invalid_argument(
+        "[vulkan_kernel] Must specify at least one output.");
+  }
+
+  std::vector<std::tuple<bool, bool, bool>> shape_infos;
+  shape_infos.reserve(input_names.size());
+  for (const auto& n : input_names) {
+    std::tuple<bool, bool, bool> shape_info{
+        source.find(n + "_shape") != std::string::npos,
+        source.find(n + "_strides") != std::string::npos,
+        source.find(n + "_ndim") != std::string::npos};
+    if (std::get<0>(shape_info) || std::get<1>(shape_info) ||
+        std::get<2>(shape_info)) {
+      throw std::invalid_argument(
+          "[vulkan_kernel] Shape, stride, and ndim auto-bindings are not supported yet.");
+    }
+    shape_infos.push_back(shape_info);
+  }
+
+  return [=, shape_infos = std::move(shape_infos)](
+             const std::vector<array>& inputs,
+             const std::vector<Shape>& output_shapes,
+             const std::vector<Dtype>& output_dtypes,
+             std::tuple<int, int, int> grid,
+             std::tuple<int, int, int> threadgroup,
+             const std::vector<std::pair<std::string, TemplateArg>>&
+                 template_args = {},
+             std::optional<float> init_value = std::nullopt,
+             bool verbose = false,
+             StreamOrDevice s_ = {}) {
+    if (inputs.size() != input_names.size()) {
+      std::ostringstream msg;
+      msg << "[vulkan_kernel] Expected `inputs` to have size "
+          << input_names.size() << " but got size " << inputs.size() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (output_shapes.size() != output_names.size()) {
+      std::ostringstream msg;
+      msg << "[vulkan_kernel] Expected `output_shapes` to have size "
+          << output_names.size() << " but got size " << output_shapes.size()
+          << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (output_dtypes.size() != output_names.size()) {
+      std::ostringstream msg;
+      msg << "[vulkan_kernel] Expected `output_dtypes` to have size "
+          << output_names.size() << " but got size " << output_dtypes.size()
+          << ".";
+      throw std::invalid_argument(msg.str());
+    }
+
+    auto s = to_stream(s_);
+    if (s.device != Device::gpu) {
+      throw std::invalid_argument("[vulkan_kernel] Only supports the GPU.");
+    }
+
+    std::string kernel_name =
+        "custom_vulkan_kernel_" + name +
+        vulkan::dynamic_template_arguments_hash(template_args);
+    std::string kernel_source = vulkan::emit_custom_kernel_source(
+        header,
+        source,
+        input_names,
+        inputs,
+        output_names,
+        output_dtypes,
+        template_args,
+        threadgroup);
+
+    if (verbose) {
+      std::cout << "Generated Vulkan source code for `" << kernel_name
+                << "`:" << std::endl
+                << "```" << std::endl
+                << kernel_source << std::endl
+                << "```" << std::endl;
+    }
+
+    return array::make_arrays(
+        std::move(output_shapes),
+        std::move(output_dtypes),
+        std::make_shared<CustomKernel>(
+            s,
+            std::move(kernel_name),
+            std::move(kernel_source),
+            grid,
+            threadgroup,
+            shape_infos,
+            ensure_row_contiguous,
+            init_value,
+            std::vector<ScalarArg>{},
+            false,
+            0),
+        std::move(inputs));
+  };
 }
 
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
@@ -2224,12 +2329,12 @@ bool try_eval_rms_norm_vulkan(
     return false;
   }
 
-  const bool native_lowp_2048 = x.shape(-1) == 2048 &&
+  const bool native_lowp_rms_norm =
       (x.dtype() == float16 || x.dtype() == bfloat16) &&
-      x.dtype() == w.dtype() && x.dtype() == out.dtype();
+      x.dtype() == out.dtype() && (!has_weight || x.dtype() == w.dtype());
   auto shader_id = (x.dtype() == float32 && w.dtype() == float32 &&
                     out.dtype() == float32) ||
-          native_lowp_2048
+          native_lowp_rms_norm
       ? rms_norm_shader_id(x.dtype())
       : std::nullopt;
   const bool use_f32_staging_io = !shader_id.has_value();
@@ -2500,6 +2605,17 @@ bool try_eval_layer_norm_vulkan(
 }
 
 } // namespace
+
+CustomKernelFunction vulkan_kernel(
+    const std::string& name,
+    const std::vector<std::string>& input_names,
+    const std::vector<std::string>& output_names,
+    const std::string& source,
+    const std::string& header,
+    bool ensure_row_contiguous) {
+  return make_vulkan_kernel(
+      name, input_names, output_names, source, header, ensure_row_contiguous);
+}
 
 bool ScaledDotProductAttention::use_fallback(
     const array& q,
@@ -3247,7 +3363,60 @@ void Quantize::eval_gpu(
 void CustomKernel::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("CustomKernel has no Vulkan implementation.");
+  auto s = stream();
+
+  std::vector<array> copies;
+
+  for (auto& out : outputs) {
+    if (init_value_) {
+      copies.emplace_back(init_value_.value(), out.dtype());
+      fill_gpu(copies.back(), out, s);
+    } else {
+      out.set_data(allocator::malloc(out.nbytes()));
+    }
+  }
+
+  auto check_input = [&copies, &s, this](const array& x) -> const array {
+    const bool no_copy = x.flags().row_contiguous && x.offset() == 0;
+    if (!ensure_row_contiguous_ || no_copy) {
+      return x;
+    }
+    copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
+    copy_gpu(x, copies.back(), CopyType::General, s);
+    return copies.back();
+  };
+
+  std::vector<array> checked_inputs;
+  checked_inputs.reserve(inputs.size());
+  for (const auto& in : inputs) {
+    checked_inputs.push_back(check_input(in));
+  }
+
+  std::vector<vulkan::DynamicArrayRef> arrays;
+  arrays.reserve(checked_inputs.size() + outputs.size());
+  uint32_t binding = 0;
+  for (const auto& in : checked_inputs) {
+    arrays.push_back({&in, binding++});
+  }
+  for (auto& out : outputs) {
+    arrays.push_back({&out, binding++});
+  }
+
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      name_,
+      source_,
+      static_cast<uint32_t>(arrays.size()),
+      arrays.data(),
+      0,
+      s);
+
+  const auto [tx, ty, tz] = threadgroup_;
+  const auto [gx, gy, gz] = grid_;
+  const uint32_t wx = static_cast<uint32_t>((gx + tx - 1) / tx);
+  const uint32_t wy = static_cast<uint32_t>((gy + ty - 1) / ty);
+  const uint32_t wz = static_cast<uint32_t>((gz + tz - 1) / tz);
+  vkCmdDispatch(dispatch.command_buffer, wx, wy, wz);
+  vulkan::end_command_recording(s.index);
 }
 
 } // namespace fast

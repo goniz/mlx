@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include "mlx/primitives.h"
+#include "mlx/backend/vulkan/vulkan_api.h"
 #include "mlx/distributed/primitives.h"
 #include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
@@ -23,6 +24,25 @@
   }
 
 namespace mlx::core {
+
+namespace vulkan {
+
+bool is_available() {
+  return false;
+}
+
+int device_count() {
+  return 0;
+}
+
+const std::unordered_map<std::string, std::variant<std::string, size_t>>&
+device_info(int) {
+  static std::unordered_map<std::string, std::variant<std::string, size_t>>
+      empty;
+  return empty;
+}
+
+} // namespace vulkan
 
 namespace fast {
 

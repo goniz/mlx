@@ -10,13 +10,11 @@
 // Use C++ Vulkan API instead of C API
 #include <vulkan/vulkan.hpp>
 
-#include "mlx/api.h"
+#include "mlx/backend/vulkan/vulkan_api.h"
 
 namespace mlx::core::vulkan {
 
-MLX_API bool is_available();
 MLX_API bool is_unified_memory();
-MLX_API int device_count();
 
 enum class GpuArchitecture : uint8_t {
   Unknown,

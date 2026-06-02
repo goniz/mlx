@@ -18,6 +18,7 @@ nanobind_add_module(
   ${CMAKE_CURRENT_SOURCE_DIR}/load.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/metal.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/cuda.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/vulkan.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/memory.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/mlx_func.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/ops.cpp
@@ -54,6 +55,7 @@ if(MLX_BUILD_PYTHON_STUBS)
     "${CMAKE_CURRENT_SOURCE_DIR}/../mlx/core/fft.pyi"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mlx/core/linalg.pyi"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mlx/core/metal.pyi"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mlx/core/vulkan.pyi"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mlx/core/random.pyi"
     # Make this an optional installable component.
     EXCLUDE_FROM_ALL

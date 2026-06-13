@@ -484,8 +484,9 @@ array cast_flash_attention_kv_to_f16(
 
 array cast_flash_attention_mask_to_f16(const array& x, Stream s) {
   auto data = x.data_shared_ptr();
-  if (x.dtype() == float16 && x.offset() == 0 && x.strides().back() == 1 &&
-      data != nullptr && data->buffer.ptr() != nullptr) {
+  if (x.dtype() == float16 && x.offset() == 0 && x.flags().row_contiguous &&
+      x.strides().back() == 1 && data != nullptr &&
+      data->buffer.ptr() != nullptr) {
     return x;
   }
   array out = vulkan::acquire_scratch_array(
@@ -570,9 +571,6 @@ vulkan::StaticShaderId flash_attention_main_shader(
     }
   }
   if (kv_bf16) {
-    if (vulkan::VulkanContext::get().shader_float16_supported()) {
-      return vulkan::StaticShaderId::flash_attn_f32_f16_bf16;
-    }
     return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_fp32;
   }
   if (path == FlashAttentionTuningParams::Path::CoopMat1) {
@@ -1242,10 +1240,6 @@ bool try_eval_flash_attention_vulkan(
   array k = inputs[1];
   array v = inputs[2];
 
-  if (has_bool_mask) {
-    return false;
-  }
-
   if (!flash_attention_enabled_for(k, v)) {
     return false;
   }
@@ -1280,14 +1274,18 @@ bool try_eval_flash_attention_vulkan(
   // 1. bf16 is supported by the shader
   // 2. K and V are already bf16 (no cast needed)
   // 3. Either:
-  //    a. Prefill mode: causal mask with q_len > 1 and q_len == kv_len
+  //    a. Prefill mode: q_len > 1 and q_len == kv_len, with causal or array mask
   //    b. Decode mode: q_len == 1 (K/V are appended during decode, so kv_len >=
   //    1)
   const bool use_native_bf16_kv =
       vulkan::VulkanContext::get().shader_bfloat16_supported() &&
       k.dtype() == bfloat16 && v.dtype() == bfloat16 &&
-      ((do_causal && q_len > 1 && q_len == kv_len) ||
+      (((do_causal || has_arr_mask) && q_len > 1 && q_len == kv_len) ||
        q_len == 1);
+
+  if (has_bool_mask && !use_native_bf16_kv) {
+    return false;
+  }
 
   if (batch == 0 || q_heads == 0 || q_len == 0 || hsk == 0 || kv_heads == 0 ||
       kv_len == 0 || hsv == 0 || hsk % 4 != 0 || hsv % 4 != 0 ||
@@ -1321,7 +1319,16 @@ bool try_eval_flash_attention_vulkan(
   }
   std::optional<array> mask;
   if (has_arr_mask) {
-    mask = cast_flash_attention_mask_to_f16(inputs[3], s);
+    if (has_bool_mask) {
+      mask = where(
+          inputs[3],
+          array(0.0f, float16),
+          array(finfo(float16).min, float16),
+          s);
+    } else {
+      mask = inputs[3];
+    }
+    mask = cast_flash_attention_mask_to_f16(*mask, s);
   }
   std::optional<array> sinks;
   if (has_sinks) {

@@ -2,6 +2,7 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 128;
@@ -11,8 +12,16 @@ layout (constant_id = 3) const uint Bc = 32;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+#ifndef BOOL_MASK
+#define BOOL_MASK 0
+#endif
+
+#if BOOL_MASK
+layout (binding = 0) readonly buffer A {uint8_t data_a[];};
+#else
 layout (binding = 0) readonly buffer A {float16_t data_a[];};
 layout (binding = 0) readonly buffer Av4 {f16vec4 data_av4[];};
+#endif
 layout (binding = 1) writeonly buffer D {uint data_d[];};
 
 layout (push_constant) uniform parameter {
@@ -52,6 +61,7 @@ void main() {
 
     uint result = 0;
 
+#if !BOOL_MASK
     // Fast path for fully in-bounds blocks where we can do f16vec4 loads
     if ((nem0 % Bc) == 0 && (nem1 % Br) == 0 &&
         ((Br * Bc) % (BLOCK_SIZE * 4)) == 0) {
@@ -94,6 +104,7 @@ void main() {
             barrier();
         }
     } else {
+#endif
         [[unroll]] for (uint block_x = 0; block_x < 16; ++block_x) {
             float min_v = FLT_MAX_OVER_2;
             float max_v = -FLT_MAX_OVER_2;
@@ -108,7 +119,11 @@ void main() {
                 j1 += i1 * Br;
 
                 if (j0 < nem0 && j1 < nem1) {
+#if BOOL_MASK
+                    float f = data_a[j0 + j1 * nbm1 + i2 * nbm2 + i3 * nbm3] != uint8_t(0) ? 0.0f : -FLT_MAX_OVER_2;
+#else
                     float f = float(data_a[j0 + j1 * nbm1 + i2 * nbm2 + i3 * nbm3]);
+#endif
                     min_v = min(min_v, f);
                     max_v = max(max_v, f);
                 }
@@ -134,7 +149,9 @@ void main() {
             }
             barrier();
         }
+#if !BOOL_MASK
     }
+#endif
 
     if (tid == 0) {
         data_d[i0 + i1 * nbd1 + i2 * nbd2 + i3 * nbd3] = result;

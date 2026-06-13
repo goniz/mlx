@@ -496,6 +496,16 @@ array cast_flash_attention_mask_to_f16(const array& x, Stream s) {
   return out;
 }
 
+array ensure_flash_attention_bool_mask_layout(const array& x, Stream s) {
+  auto data = x.data_shared_ptr();
+  if (x.dtype() == bool_ && x.offset() == 0 && x.flags().row_contiguous &&
+      x.strides().back() == 1 && data != nullptr &&
+      data->buffer.ptr() != nullptr) {
+    return x;
+  }
+  return contiguous_copy_gpu(x, s);
+}
+
 array cast_flash_attention_sinks_to_f32(const array& x, Stream s) {
   auto data = x.data_shared_ptr();
   if (x.dtype() == float32 && x.offset() == 0 && x.flags().row_contiguous &&
@@ -544,8 +554,12 @@ struct FlashAttentionTuningParams {
 
 vulkan::StaticShaderId flash_attention_main_shader(
     FlashAttentionTuningParams::Path path,
-    bool use_native_bf16_kv) {
+    bool use_native_bf16_kv,
+    bool use_bool_mask = false) {
   const bool kv_bf16 = use_native_bf16_kv;
+  if (kv_bf16 && use_bool_mask) {
+    return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_boolmask_fp32;
+  }
   if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_SHADER");
       env != nullptr) {
     const std::string value(env);
@@ -979,6 +993,7 @@ bool try_dispatch_flash_attention_native_vulkan(
     array& out_storage,
     Stream s,
     bool use_native_bf16_kv,
+    bool use_bool_mask,
     float scale) {
   const uint32_t batch = checked_u32_size(q.shape(0), "flash_attn batch");
   const uint32_t q_heads = checked_u32_size(q.shape(1), "flash_attn q_heads");
@@ -995,7 +1010,7 @@ bool try_dispatch_flash_attention_native_vulkan(
   const uint32_t v_stride =
       checked_u32_size(v.strides(2), "flash_attn v_stride");
 
-  const auto plan = make_flash_attention_execution_plan(
+  auto plan = make_flash_attention_execution_plan(
       hsk,
       hsv,
       q_len,
@@ -1013,7 +1028,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       v_stride);
   const auto& tuning = plan.tuning;
   const auto shader_id =
-      flash_attention_main_shader(tuning.path, use_native_bf16_kv);
+      flash_attention_main_shader(tuning.path, use_native_bf16_kv, use_bool_mask);
   if (tuning.d_split == 0 || tuning.block_rows == 0 || tuning.block_cols == 0 ||
       tuning.row_split == 0 || hsk % tuning.d_split != 0 ||
       hsv % tuning.d_split != 0 ||
@@ -1148,7 +1163,8 @@ bool try_dispatch_flash_attention_native_vulkan(
       vulkan::dispatch_flash_attention_mask_opt_op(
           *mask,
           *mask_opt,
-          vulkan::StaticShaderId::fa_mask_opt,
+          use_bool_mask ? vulkan::StaticShaderId::fa_mask_opt_bool
+                        : vulkan::StaticShaderId::fa_mask_opt,
           command_buffer,
           s,
           mask_opt_push_constants,
@@ -1320,15 +1336,10 @@ bool try_eval_flash_attention_vulkan(
   std::optional<array> mask;
   if (has_arr_mask) {
     if (has_bool_mask) {
-      mask = where(
-          inputs[3],
-          array(0.0f, float16),
-          array(finfo(float16).min, float16),
-          s);
+      mask = ensure_flash_attention_bool_mask_layout(inputs[3], s);
     } else {
-      mask = inputs[3];
+      mask = cast_flash_attention_mask_to_f16(inputs[3], s);
     }
-    mask = cast_flash_attention_mask_to_f16(*mask, s);
   }
   std::optional<array> sinks;
   if (has_sinks) {
@@ -1374,6 +1385,7 @@ bool try_eval_flash_attention_vulkan(
             out_storage,
             s,
             use_native_bf16_kv,
+            has_bool_mask,
             scale)) {
       return false;
     }

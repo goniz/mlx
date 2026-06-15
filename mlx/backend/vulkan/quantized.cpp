@@ -1412,13 +1412,22 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           const bool use_tiled_prefill = rows > 1 && group_size_ >= 32 &&
               (group_size_ % 32) == 0 &&
               fused_affine_bf16_tiled_prefill_enabled();
+          const bool use_large_n_tile = use_tiled_prefill && cols >= 65536;
           const auto shader_id = use_decode_matvec
               ? vulkan::StaticShaderId::fused_affine_matvec8_bf16_bf16
+              : use_large_n_tile
+              ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled_n32
               : use_tiled_prefill
               ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
               : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16;
           const std::array<uint32_t, 3> grid = use_decode_matvec
               ? std::array<uint32_t, 3>{cols, rows, 1u}
+              : shader_id ==
+                      vulkan::StaticShaderId::
+                          fused_affine_qmm_bf16_bf16_tiled_n32
+              ? std::array<
+                    uint32_t,
+                    3>{(cols + 31u) / 32u, (rows + 31u) / 32u, 1u}
               : shader_id ==
                       vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
               ? std::array<

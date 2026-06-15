@@ -240,7 +240,13 @@ std::string build_complex_sum_scan_shader(bool reverse, bool inclusive) {
   return os.str();
 }
 
-std::string build_prod_scan_shader(bool reverse, bool inclusive) {
+std::string build_float_scan_shader(
+    Scan::ReduceType reduce_type,
+    bool reverse,
+    bool inclusive) {
+  const bool prod = reduce_type == Scan::Prod;
+  const bool min = reduce_type == Scan::Min;
+  const bool max = reduce_type == Scan::Max;
   std::ostringstream os;
   os << "#version 450\n\n";
   os << "layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
@@ -254,19 +260,45 @@ std::string build_prod_scan_shader(bool reverse, bool inclusive) {
   os << "    uint row = gl_GlobalInvocationID.x;\n";
   os << "    if (row >= p.row_count) return;\n";
   os << "    uint base = row * p.n_cols;\n";
-  os << "    float acc = 1.0;\n";
+  os << "    float acc = ";
+  if (prod) {
+    os << "1.0;\n";
+  } else if (min) {
+    os << "1.0 / 0.0;\n";
+  } else if (max) {
+    os << "-1.0 / 0.0;\n";
+  } else {
+    os << "0.0;\n";
+  }
   os << "    for (uint logical_col = 0; logical_col < p.n_cols; ++logical_col) {\n";
   if (reverse) {
     os << "        uint col = p.n_cols - 1 - logical_col;\n";
   } else {
     os << "        uint col = logical_col;\n";
   }
+  os << "        float value = data_a[base + col];\n";
   if (inclusive) {
-    os << "        acc *= data_a[base + col];\n";
+    if (prod) {
+      os << "        acc *= value;\n";
+    } else if (min) {
+      os << "        acc = min(acc, value);\n";
+    } else if (max) {
+      os << "        acc = max(acc, value);\n";
+    } else {
+      os << "        acc += value;\n";
+    }
     os << "        data_d[base + col] = acc;\n";
   } else {
     os << "        data_d[base + col] = acc;\n";
-    os << "        acc *= data_a[base + col];\n";
+    if (prod) {
+      os << "        acc *= value;\n";
+    } else if (min) {
+      os << "        acc = min(acc, value);\n";
+    } else if (max) {
+      os << "        acc = max(acc, value);\n";
+    } else {
+      os << "        acc += value;\n";
+    }
   }
   os << "    }\n";
   os << "}\n";
@@ -376,20 +408,23 @@ bool try_dispatch_complex_sum_scan(
   return true;
 }
 
-bool try_dispatch_prod_scan(
+bool try_dispatch_float_scan(
     const array& in,
     array& out,
     Stream s,
+    Scan::ReduceType reduce_type,
     bool reverse,
     bool inclusive) {
   if (in.dtype() != float32 || out.dtype() != float32 || in.ndim() == 0 ||
-      in.shape(in.ndim() - 1) == 0 || in.size() != out.size()) {
+      in.shape(in.ndim() - 1) == 0 || in.size() != out.size() ||
+      (reduce_type != Scan::Prod && reduce_type != Scan::Min &&
+       reduce_type != Scan::Max)) {
     return false;
   }
 
   const uint32_t n_cols =
-      checked_u32_size(in.shape(in.ndim() - 1), "prod_scan n_cols");
-  const uint32_t total = checked_u32_size(out.size(), "prod_scan size");
+      checked_u32_size(in.shape(in.ndim() - 1), "float_scan n_cols");
+  const uint32_t total = checked_u32_size(out.size(), "float_scan size");
   if (total % n_cols != 0) {
     return false;
   }
@@ -398,9 +433,13 @@ bool try_dispatch_prod_scan(
     return true;
   }
 
-  const std::string shader_name = std::string("dynamic_cumprod_f32_") +
+  const std::string shader_name = std::string("dynamic_") +
+      (reduce_type == Scan::Prod  ? "cumprod_f32_"
+           : reduce_type == Scan::Min ? "cummin_f32_"
+                                      : "cummax_f32_") +
       (reverse ? "rev_" : "fwd_") + (inclusive ? "inc" : "exc");
-  const std::string glsl = build_prod_scan_shader(reverse, inclusive);
+  const std::string glsl =
+      build_float_scan_shader(reduce_type, reverse, inclusive);
   const std::array<uint32_t, 2> pc = {n_cols, row_count};
   const std::array<vulkan::DynamicArrayRef, 2> refs = {{{&in, 0}, {&out, 1}}};
 
@@ -666,8 +705,8 @@ bool try_eval_scan_vulkan(
 
   if (((reduce_type == Scan::Prod && !cumprod_c64 && !scan_f32 &&
         !cumprod_i32 && !integral_i64) ||
-       (reduce_type == Scan::Min && !int_minmax_i32) ||
-       (reduce_type == Scan::Max && !int_minmax_i32) ||
+       (reduce_type == Scan::Min && !int_minmax_i32 && !scan_f32) ||
+       (reduce_type == Scan::Max && !int_minmax_i32 && !scan_f32) ||
        reduce_type == Scan::LogAddExp) &&
       scan_input.shape(scan_input.ndim() - 1) > 128) {
     return false;
@@ -760,8 +799,13 @@ bool try_eval_scan_vulkan(
           command_buffer = vulkan::begin_command_recording(s.index);
         } else if (scan_f32 && scan_input.shape(scan_input.ndim() - 1) > 128) {
           vulkan::end_command_recording(s.index);
-          if (!try_dispatch_prod_scan(
-                  scan_input, inclusive_out, s, reverse, inclusive)) {
+          if (!try_dispatch_float_scan(
+                  scan_input,
+                  inclusive_out,
+                  s,
+                  reduce_type,
+                  reverse,
+                  inclusive)) {
             return false;
           }
           command_buffer = vulkan::begin_command_recording(s.index);
@@ -785,6 +829,18 @@ bool try_eval_scan_vulkan(
             return false;
           }
           command_buffer = vulkan::begin_command_recording(s.index);
+        } else if (scan_f32 && scan_input.shape(scan_input.ndim() - 1) > 128) {
+          vulkan::end_command_recording(s.index);
+          if (!try_dispatch_float_scan(
+                  scan_input,
+                  inclusive_out,
+                  s,
+                  reduce_type,
+                  reverse,
+                  inclusive)) {
+            return false;
+          }
+          command_buffer = vulkan::begin_command_recording(s.index);
         } else {
           vulkan::dispatch_scan_op(
               scan_input,
@@ -801,6 +857,18 @@ bool try_eval_scan_vulkan(
           vulkan::end_command_recording(s.index);
           if (!try_dispatch_integral_scan(
                   scan_input, inclusive_out, s, reduce_type, reverse, inclusive)) {
+            return false;
+          }
+          command_buffer = vulkan::begin_command_recording(s.index);
+        } else if (scan_f32 && scan_input.shape(scan_input.ndim() - 1) > 128) {
+          vulkan::end_command_recording(s.index);
+          if (!try_dispatch_float_scan(
+                  scan_input,
+                  inclusive_out,
+                  s,
+                  reduce_type,
+                  reverse,
+                  inclusive)) {
             return false;
           }
           command_buffer = vulkan::begin_command_recording(s.index);

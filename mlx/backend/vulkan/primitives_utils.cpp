@@ -510,21 +510,25 @@ std::optional<vulkan::StaticShaderId> scatter_axis_shader_id(
   MLX_VK_GATHER_CASE(bfloat16, int32, scatter_axis_bf16_i32);
   MLX_VK_GATHER_CASE(int32, int32, scatter_axis_i32_i32);
   MLX_VK_GATHER_CASE(uint32, int32, scatter_axis_u32_i32);
+  MLX_VK_GATHER_CASE(bool_, int32, scatter_axis_bool_i32);
   MLX_VK_GATHER_CASE(float32, int64, scatter_axis_f32_i64);
   MLX_VK_GATHER_CASE(float16, int64, scatter_axis_f16_i64);
   MLX_VK_GATHER_CASE(bfloat16, int64, scatter_axis_bf16_i64);
   MLX_VK_GATHER_CASE(int32, int64, scatter_axis_i32_i64);
   MLX_VK_GATHER_CASE(uint32, int64, scatter_axis_u32_i64);
+  MLX_VK_GATHER_CASE(bool_, int64, scatter_axis_bool_i64);
   MLX_VK_GATHER_CASE(float32, uint32, scatter_axis_f32_u32);
   MLX_VK_GATHER_CASE(float16, uint32, scatter_axis_f16_u32);
   MLX_VK_GATHER_CASE(bfloat16, uint32, scatter_axis_bf16_u32);
   MLX_VK_GATHER_CASE(int32, uint32, scatter_axis_i32_u32);
   MLX_VK_GATHER_CASE(uint32, uint32, scatter_axis_u32_u32);
+  MLX_VK_GATHER_CASE(bool_, uint32, scatter_axis_bool_u32);
   MLX_VK_GATHER_CASE(float32, uint64, scatter_axis_f32_u64);
   MLX_VK_GATHER_CASE(float16, uint64, scatter_axis_f16_u64);
   MLX_VK_GATHER_CASE(bfloat16, uint64, scatter_axis_bf16_u64);
   MLX_VK_GATHER_CASE(int32, uint64, scatter_axis_i32_u64);
   MLX_VK_GATHER_CASE(uint32, uint64, scatter_axis_u32_u64);
+  MLX_VK_GATHER_CASE(bool_, uint64, scatter_axis_bool_u64);
   return std::nullopt;
 }
 

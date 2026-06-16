@@ -1570,6 +1570,20 @@ void process_shaders() {
   indexing_shaders("scatter_pair", "scatter_pair.comp");
   indexing_shaders("scatter_axis", "scatter_axis.comp");
 
+  auto scatter_axis_bool_shaders =
+      [&](const std::string& index_tag,
+          const std::map<std::string, std::string>& extra_index_defines) {
+        auto defines =
+            merge_maps({{"VALUE_TYPE", "uint8_t"}}, extra_index_defines);
+        string_to_spv(
+            "scatter_axis_bool_" + index_tag, "scatter_axis.comp", defines);
+      };
+  scatter_axis_bool_shaders("i32", {});
+  scatter_axis_bool_shaders("i64", {{"INDEX_IS_I64", "1"}});
+  scatter_axis_bool_shaders("u32", {{"INDEX_IS_UNSIGNED", "1"}});
+  scatter_axis_bool_shaders(
+      "u64", {{"INDEX_IS_I64", "1"}, {"INDEX_IS_UNSIGNED", "1"}});
+
   auto scatter_sum_axis_shaders =
       [&](const std::string& value_tag,
           const std::string& value_type,
@@ -2207,6 +2221,10 @@ void process_shaders() {
       "fused_affine_qmm_bf16_bf16", "mul_mm_affine_bf16_acc.comp", {});
   string_to_spv(
       "fused_affine_qmm_bf16_bf16_tiled", "mul_mm_affine_bf16_tiled.comp", {});
+  string_to_spv(
+      "fused_affine_qmm_bf16_bf16_tiled_n32",
+      "mul_mm_affine_bf16_tiled.comp",
+      {{"MLX_BN", "32"}, {"MLX_TN", "4"}});
 
   string_to_spv(
       "fused_affine_matvec8_f32_f32",

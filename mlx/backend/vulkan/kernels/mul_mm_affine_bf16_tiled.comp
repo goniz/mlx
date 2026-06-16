@@ -38,11 +38,27 @@ layout(push_constant) uniform parameter {
     uint num_groups;
 } p;
 
-const uint BM = 32u;
-const uint BN = 16u;
-const uint BK = 32u;
-const uint TM = 4u;
-const uint TN = 2u;
+#ifndef MLX_BM
+#define MLX_BM 32
+#endif
+#ifndef MLX_BN
+#define MLX_BN 16
+#endif
+#ifndef MLX_BK
+#define MLX_BK 32
+#endif
+#ifndef MLX_TM
+#define MLX_TM 4
+#endif
+#ifndef MLX_TN
+#define MLX_TN 2
+#endif
+
+const uint BM = MLX_BM;
+const uint BN = MLX_BN;
+const uint BK = MLX_BK;
+const uint TM = MLX_TM;
+const uint TN = MLX_TN;
 
 shared float xs[BM][BK];
 shared float ws[BN][BK];
@@ -101,6 +117,7 @@ void main() {
         barrier();
 
         for (uint kk = 0u; kk < BK; ++kk) {
+#if MLX_TN == 2
             const float w0 = ws[lx * TN + 0u][kk];
             const float w1 = ws[lx * TN + 1u][kk];
             for (uint mr = 0u; mr < TM; ++mr) {
@@ -108,17 +125,61 @@ void main() {
                 acc[mr][0] = fma(x, w0, acc[mr][0]);
                 acc[mr][1] = fma(x, w1, acc[mr][1]);
             }
+#elif MLX_TN == 4
+            const float w0 = ws[lx * TN + 0u][kk];
+            const float w1 = ws[lx * TN + 1u][kk];
+            const float w2 = ws[lx * TN + 2u][kk];
+            const float w3 = ws[lx * TN + 3u][kk];
+            for (uint mr = 0u; mr < TM; ++mr) {
+                const float x = xs[ly * TM + mr][kk];
+                acc[mr][0] = fma(x, w0, acc[mr][0]);
+                acc[mr][1] = fma(x, w1, acc[mr][1]);
+                acc[mr][2] = fma(x, w2, acc[mr][2]);
+                acc[mr][3] = fma(x, w3, acc[mr][3]);
+            }
+#else
+            for (uint mr = 0u; mr < TM; ++mr) {
+                const float x = xs[ly * TM + mr][kk];
+                for (uint nc = 0u; nc < TN; ++nc) {
+                    acc[mr][nc] = fma(x, ws[lx * TN + nc][kk], acc[mr][nc]);
+                }
+            }
+#endif
         }
         barrier();
     }
 
     for (uint mr = 0u; mr < TM; ++mr) {
         const uint row = row0 + mr;
+#if MLX_TN == 2
         if (row < p.rows && col0 < p.cols) {
             data_out[row * p.out_row_stride + col0] = uint16_t(fp32_to_bf16(acc[mr][0]));
         }
         if (row < p.rows && col0 + 1u < p.cols) {
             data_out[row * p.out_row_stride + col0 + 1u] = uint16_t(fp32_to_bf16(acc[mr][1]));
         }
+#elif MLX_TN == 4
+        if (row < p.rows && col0 < p.cols) {
+            data_out[row * p.out_row_stride + col0] = uint16_t(fp32_to_bf16(acc[mr][0]));
+        }
+        if (row < p.rows && col0 + 1u < p.cols) {
+            data_out[row * p.out_row_stride + col0 + 1u] = uint16_t(fp32_to_bf16(acc[mr][1]));
+        }
+        if (row < p.rows && col0 + 2u < p.cols) {
+            data_out[row * p.out_row_stride + col0 + 2u] = uint16_t(fp32_to_bf16(acc[mr][2]));
+        }
+        if (row < p.rows && col0 + 3u < p.cols) {
+            data_out[row * p.out_row_stride + col0 + 3u] = uint16_t(fp32_to_bf16(acc[mr][3]));
+        }
+#else
+        if (row < p.rows) {
+            for (uint nc = 0u; nc < TN; ++nc) {
+                if (col0 + nc < p.cols) {
+                    data_out[row * p.out_row_stride + col0 + nc] =
+                        uint16_t(fp32_to_bf16(acc[mr][nc]));
+                }
+            }
+        }
+#endif
     }
 }

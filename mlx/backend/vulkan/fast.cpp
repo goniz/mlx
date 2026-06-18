@@ -46,53 +46,6 @@ constexpr char kFlashAttnMaskCastScratchLane[] = "flash_attn.mask_cast";
 constexpr char kFlashAttnSinksCastScratchLane[] = "flash_attn.sinks_cast";
 constexpr uint32_t kFlashAttnSinkEnableBit = 1u << 24;
 
-bool needs_host_row_contiguous(const array& arr) {
-  return !arr.flags().row_contiguous || arr.offset() != 0;
-}
-
-array ensure_host_readable_row_contiguous(array arr, Stream s) {
-  if (needs_host_row_contiguous(arr) || arr.has_primitive()) {
-    arr = contiguous_copy_gpu(arr, s);
-  }
-  arr.wait();
-  return arr;
-}
-
-template <typename T>
-T bit_cast_scalar(const auto& value) {
-  return std::bit_cast<T>(value);
-}
-
-uint8_t to_fp8_e4m3_scalar(float x) {
-  constexpr uint32_t fp8_max = 543u << 21;
-  constexpr uint32_t denorm_mask = 141u << 23;
-  uint32_t f_bits = bit_cast_scalar<uint32_t>(x);
-  uint32_t sign = f_bits & 0x80000000u;
-  f_bits ^= sign;
-
-  uint32_t f_bits_low = bit_cast_scalar<uint32_t>(
-      bit_cast_scalar<float>(f_bits) + bit_cast_scalar<float>(denorm_mask));
-  uint8_t result_low = static_cast<uint8_t>(f_bits_low - denorm_mask);
-
-  uint8_t mant_odd = static_cast<uint8_t>((f_bits >> 20) & 1u);
-  uint32_t f_bits_high = f_bits + (((7u - 127u) << 23) + 0x7FFFFu);
-  f_bits_high += mant_odd;
-  uint8_t result_high = static_cast<uint8_t>(f_bits_high >> 20);
-
-  uint8_t result = f_bits < (121u << 23) ? result_low : result_high;
-  if (f_bits >= fp8_max) {
-    result = 0x7E;
-  }
-  return result | static_cast<uint8_t>(sign >> 24);
-}
-
-float from_fp8_e4m3_scalar(uint8_t x) {
-  uint16_t bits = static_cast<uint16_t>(x & 127u) << 7;
-  float16_t half = bit_cast_scalar<float16_t>(bits);
-  float out = static_cast<float>(half) * 256.0f;
-  return (x & 128u) ? -out : out;
-}
-
 std::string build_to_fp8_f32_shader() {
   std::ostringstream os;
   os << vulkan::emit_dynamic_shader_preamble(float32, uint8, false);
@@ -320,8 +273,7 @@ CustomKernelFunction make_vulkan_kernel(
       throw std::invalid_argument("[vulkan_kernel] Only supports the GPU.");
     }
 
-    std::string kernel_name =
-        "custom_vulkan_kernel_" + name +
+    std::string kernel_name = "custom_vulkan_kernel_" + name +
         vulkan::dynamic_template_arguments_hash(template_args);
     std::string kernel_source = vulkan::emit_custom_kernel_source(
         header,
@@ -447,6 +399,41 @@ std::optional<vulkan::StaticShaderId> rms_norm_shader_id(Dtype dtype) {
     default:
       return std::nullopt;
   }
+}
+
+std::optional<vulkan::StaticShaderId> norm_shader_id(Dtype dtype) {
+  switch (dtype) {
+    case float32:
+      return vulkan::StaticShaderId::norm_f32;
+    case float16:
+      if (!vulkan::VulkanContext::get().shader_float16_supported()) {
+        return std::nullopt;
+      }
+      return vulkan::StaticShaderId::norm_f16;
+    case bfloat16:
+      return vulkan::StaticShaderId::norm_bf16;
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<vulkan::StaticShaderId> layer_norm_affine_shader_id(
+    Dtype out_dtype) {
+  switch (out_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::layer_norm_affine_f32;
+    case float16:
+      return vulkan::StaticShaderId::layer_norm_affine_f32_f16;
+    case bfloat16:
+      return vulkan::StaticShaderId::layer_norm_affine_f32_bf16;
+    default:
+      return std::nullopt;
+  }
+}
+
+bool can_dispatch_layer_norm_affine_dtype(Dtype dtype) {
+  return dtype != float16 ||
+      vulkan::VulkanContext::get().shader_float16_supported();
 }
 
 void begin_tracked_manual_op(
@@ -866,8 +853,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
   // Pack GQA heads into rows only for decode; doing this for short prefill
   // conflates sequence rows and corrupts small-prompt attention.
   if (q_len == 1u && qk_ratio > 1u && qk_ratio <= tuning.block_rows &&
-      qk_ratio * kv_heads == q_heads &&
-      mask_heads <= 1u) {
+      qk_ratio * kv_heads == q_heads && mask_heads <= 1u) {
     gqa_ratio = qk_ratio;
     n_rows = gqa_ratio;
     workgroups_y /= gqa_ratio;
@@ -1027,8 +1013,8 @@ bool try_dispatch_flash_attention_native_vulkan(
       k_stride,
       v_stride);
   const auto& tuning = plan.tuning;
-  const auto shader_id =
-      flash_attention_main_shader(tuning.path, use_native_bf16_kv, use_bool_mask);
+  const auto shader_id = flash_attention_main_shader(
+      tuning.path, use_native_bf16_kv, use_bool_mask);
   if (tuning.d_split == 0 || tuning.block_rows == 0 || tuning.block_cols == 0 ||
       tuning.row_split == 0 || hsk % tuning.d_split != 0 ||
       hsv % tuning.d_split != 0 ||
@@ -1290,9 +1276,9 @@ bool try_eval_flash_attention_vulkan(
   // 1. bf16 is supported by the shader
   // 2. K and V are already bf16 (no cast needed)
   // 3. Either:
-  //    a. Prefill mode: q_len > 1 and q_len == kv_len, with causal or array mask
-  //    b. Decode mode: q_len == 1 (K/V are appended during decode, so kv_len >=
-  //    1)
+  //    a. Prefill mode: q_len > 1 and q_len == kv_len, with causal or array
+  //    mask b. Decode mode: q_len == 1 (K/V are appended during decode, so
+  //    kv_len >= 1)
   const bool use_native_bf16_kv =
       vulkan::VulkanContext::get().shader_bfloat16_supported() &&
       k.dtype() == bfloat16 && v.dtype() == bfloat16 &&
@@ -1949,8 +1935,7 @@ bool try_eval_sdpa_heads_vulkan(
     vulkan::record_primitive_for_stream(s, "sdpa_manual_heads");
     vulkan::ScopedPrimitiveTracking tracking_scope(s, inputs, tracked_outputs);
 
-    if (is_decode && k_in.dtype() != float32 &&
-        v_in.dtype() != float32) {
+    if (is_decode && k_in.dtype() != float32 && v_in.dtype() != float32) {
       // --- Decode GQA path: avoid broadcast copies on K/V
       // ----------------------- Use NC matvec with f16 matrix + f32 vector, no
       // repeated-head broadcast.
@@ -2483,10 +2468,14 @@ bool try_eval_layer_norm_vulkan(
     return false;
   }
 
-  if (x.dtype() != float32) {
-    array x_f32(x.shape(), float32, nullptr, {});
-    copy_gpu(x, x_f32, CopyType::General, s);
-    x = x_f32;
+  auto norm_shader = norm_shader_id(x.dtype());
+  if (!norm_shader.has_value()) {
+    if (x.dtype() != float32) {
+      array x_f32(x.shape(), float32, nullptr, {});
+      copy_gpu(x, x_f32, CopyType::General, s);
+      x = x_f32;
+    }
+    norm_shader = vulkan::StaticShaderId::norm_f32;
   }
   if (!x.flags().contiguous || x.offset() != 0 || x.strides().back() != 1) {
     x = contiguous_copy_gpu(x, s);
@@ -2517,9 +2506,9 @@ bool try_eval_layer_norm_vulkan(
   };
 
   const bool needs_affine = has_weight || has_bias;
-  array out_target = needs_affine
-      ? (out.dtype() == float16 ? array(out.shape(), float32, nullptr, {})
-                                : out)
+  array out_target =
+      needs_affine && can_dispatch_layer_norm_affine_dtype(out.dtype())
+      ? out
       : (out.dtype() == float32 ? out
                                 : array(out.shape(), float32, nullptr, {}));
   const bool staged_output = needs_affine
@@ -2572,8 +2561,7 @@ bool try_eval_layer_norm_vulkan(
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_norm_op(
-        x, norm_out, vulkan::StaticShaderId::norm_f32, command_buffer, s, eps);
+    vulkan::dispatch_norm_op(x, norm_out, *norm_shader, command_buffer, s, eps);
 
     if (needs_affine) {
       insert_compute_barrier(command_buffer);
@@ -2588,15 +2576,18 @@ bool try_eval_layer_norm_vulkan(
       affine_push_constants.b_stride = has_bias && b_work->ndim() == 1
           ? checked_u32_size(b_work->strides(0), "layer_norm_affine b_stride")
           : 0u;
-      const auto affine_shader_id = out_target.dtype() == bfloat16
-          ? vulkan::StaticShaderId::layer_norm_affine_f32_bf16
-          : vulkan::StaticShaderId::layer_norm_affine_f32;
+      const auto affine_shader_id =
+          layer_norm_affine_shader_id(out_target.dtype());
+      if (!affine_shader_id.has_value()) {
+        throw std::runtime_error(
+            "LayerNorm affine unsupported output dtype on Vulkan.");
+      }
       vulkan::dispatch_layer_norm_affine_op(
           norm_out,
           *w_work,
           *b_work,
           final_work,
-          affine_shader_id,
+          *affine_shader_id,
           command_buffer,
           s,
           affine_push_constants);
@@ -2656,7 +2647,9 @@ bool ScaledDotProductAttention::use_fallback(
       lowp_attention && q.shape(2) == 1 && q.shape(1) == k.shape(1);
   if (!output_logsumexp && lowp_decode_mha) {
     trace_use_fallback(
-        "ScaledDotProductAttention", s, "low_precision_guard",
+        "ScaledDotProductAttention",
+        s,
+        "low_precision_guard",
         "lowp_decode_mha");
     return true;
   }
@@ -3158,88 +3151,30 @@ void ConvertFP8::eval_gpu(
         "[ConvertFP8::eval_gpu] Expected one input and one output.");
   }
 
-  if (try_convert_fp8_f32_gpu(inputs[0], outputs[0], to_fp8_, stream())) {
+  auto s = stream();
+  array in = inputs[0];
+
+  // The GPU FP8 kernel operates on float32 for encode. Cast f16/bf16 inputs
+  // to f32 on-device to keep the path fully async without host readback.
+  if (to_fp8_ && in.dtype() != float32) {
+    array in_f32(in.shape(), float32, nullptr, {});
+    copy_gpu(in, in_f32, CopyType::General, s);
+    in = in_f32;
+  }
+
+  if (try_convert_fp8_f32_gpu(in, outputs[0], to_fp8_, s)) {
     return;
   }
 
-  auto in = ensure_host_readable_row_contiguous(inputs[0], stream());
-  auto& out = outputs[0];
-  out.set_data(allocator::malloc(out.nbytes()));
-
-  if (out.size() == 0) {
-    return;
-  }
-
-  if (to_fp8_) {
-    auto* dst = out.data<uint8_t>();
-    switch (in.dtype()) {
-      case float16: {
-        auto* src = in.data<float16_t>();
-        for (int i = 0; i < in.size(); ++i) {
-          dst[i] = to_fp8_e4m3_scalar(static_cast<float>(src[i]));
-        }
-        return;
-      }
-      case bfloat16: {
-        auto* src = in.data<bfloat16_t>();
-        for (int i = 0; i < in.size(); ++i) {
-          dst[i] = to_fp8_e4m3_scalar(static_cast<float>(src[i]));
-        }
-        return;
-      }
-      case float32: {
-        auto* src = in.data<float>();
-        for (int i = 0; i < in.size(); ++i) {
-          dst[i] = to_fp8_e4m3_scalar(src[i]);
-        }
-        return;
-      }
-      default:
-        throw std::runtime_error(
-            "[ConvertFP8::eval_gpu] Unsupported input dtype.");
-    }
-  }
-
-  auto* src = in.data<uint8_t>();
-  switch (out.dtype()) {
-    case float16: {
-      auto* dst = out.data<float16_t>();
-      for (int i = 0; i < in.size(); ++i) {
-        dst[i] = float16_t(from_fp8_e4m3_scalar(src[i]));
-      }
-      return;
-    }
-    case bfloat16: {
-      auto* dst = out.data<bfloat16_t>();
-      for (int i = 0; i < in.size(); ++i) {
-        dst[i] = bfloat16_t(from_fp8_e4m3_scalar(src[i]));
-      }
-      return;
-    }
-    case float32: {
-      auto* dst = out.data<float>();
-      for (int i = 0; i < in.size(); ++i) {
-        dst[i] = from_fp8_e4m3_scalar(src[i]);
-      }
-      return;
-    }
-    default:
-      throw std::runtime_error(
-          "[ConvertFP8::eval_gpu] Unsupported output dtype.");
-  }
+  throw std::runtime_error(
+      "[ConvertFP8::eval_gpu] Unsupported dtype combination for FP8 "
+      "conversion on Vulkan. Only float16/bfloat16/float32 <-> fp8_e4m3 "
+      "is supported via the GPU path.");
 }
 
 void Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  auto copy_fallback_outputs = [&](std::vector<array> fallback_outputs) {
-    auto& s = stream();
-    for (size_t i = 0; i < outputs.size(); ++i) {
-      outputs[i].set_data(allocator::malloc(outputs[i].nbytes()));
-      copy_gpu(fallback_outputs[i], outputs[i], CopyType::General, s);
-    }
-  };
-
   if (dequantize_) {
     if (mode_ != QuantizationMode::Affine) {
       if ((mode_ == QuantizationMode::Mxfp4 ||
@@ -3317,11 +3252,17 @@ void Quantize::eval_gpu(
       if (mode_ == QuantizationMode::Mxfp4 ||
           mode_ == QuantizationMode::Mxfp8) {
         auto& s = stream();
-        std::vector<array> fallback_inputs = inputs;
-        if (fallback_inputs[0].dtype() != float32) {
-          fallback_inputs[0] = astype(fallback_inputs[0], float32, s);
+        array in_f32 = inputs[0];
+        if (in_f32.dtype() != float32) {
+          in_f32 = array(inputs[0].shape(), float32, nullptr, {});
+          in_f32.set_data(allocator::malloc(in_f32.nbytes()));
+          copy_gpu(inputs[0], in_f32, CopyType::General, s);
         }
-        copy_fallback_outputs(fallback_(fallback_inputs));
+        if (!vulkan::fp_quantize_from_float32(
+                in_f32, outputs[0], outputs[1], s, group_size_, bits_)) {
+          throw std::runtime_error(
+              "[Quantize::eval_gpu] Mxfp4/Mxfp8 quantize failed on Vulkan.");
+        }
         return;
       }
       if (mode_ == QuantizationMode::Nvfp4 &&

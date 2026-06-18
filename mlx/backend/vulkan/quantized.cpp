@@ -639,17 +639,12 @@ void main() {
       {&out, 5},
   };
   const std::string shader_name =
-      std::string(bits == 4 ? "dynamic_gather_mxfp4_qmm"
-                            : "dynamic_gather_mxfp8_qmm") +
+      std::string(
+          bits == 4 ? "dynamic_gather_mxfp4_qmm" : "dynamic_gather_mxfp8_qmm") +
       "_x" + std::to_string(static_cast<int>(x.dtype().val())) + "_o" +
       std::to_string(static_cast<int>(out.dtype().val()));
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      shader_name,
-      os.str(),
-      6,
-      arrays,
-      sizeof(PushConstants),
-      s);
+      shader_name, os.str(), 6, arrays, sizeof(PushConstants), s);
   vkCmdPushConstants(
       dispatch.command_buffer,
       dispatch.pipeline->layout,
@@ -694,8 +689,7 @@ bool fp_gather_qmm_fused_matvec(
   const uint32_t rows = static_cast<uint32_t>(out.shape(-2));
   const uint32_t cols = static_cast<uint32_t>(out.shape(-1));
   const uint32_t K = static_cast<uint32_t>(x.shape(-1));
-  const uint32_t batches =
-      static_cast<uint32_t>(out.size() / (rows * cols));
+  const uint32_t batches = static_cast<uint32_t>(out.size() / (rows * cols));
 
   struct PushConstants {
     uint32_t rows;
@@ -727,7 +721,7 @@ bool fp_gather_qmm_fused_matvec(
   std::ostringstream os;
   vulkan::DynamicShaderPreambleOptions preamble_options;
   preamble_options.dtypes = {uint8, x.dtype(), out.dtype()};
-  preamble_options.local_size_x = 64;  // One AMD wavefront for better occupancy
+  preamble_options.local_size_x = 64; // One AMD wavefront for better occupancy
   os << vulkan::emit_dynamic_shader_preamble(preamble_options);
   os << "#define X_TYPE " << vulkan::dtype_to_glsl_storage_type(x.dtype())
      << "\n";
@@ -896,17 +890,13 @@ void main() {
       {&out, 5},
   };
   const std::string shader_name =
-      std::string(bits == 4 ? "dynamic_gather_mxfp4_qmm_matvec_wg64"
-                            : "dynamic_gather_mxfp8_qmm_matvec_wg64") +
+      std::string(
+          bits == 4 ? "dynamic_gather_mxfp4_qmm_matvec_wg64"
+                    : "dynamic_gather_mxfp8_qmm_matvec_wg64") +
       "_x" + std::to_string(static_cast<int>(x.dtype().val())) + "_o" +
       std::to_string(static_cast<int>(out.dtype().val()));
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
-      shader_name,
-      os.str(),
-      6,
-      arrays,
-      sizeof(PushConstants),
-      s);
+      shader_name, os.str(), 6, arrays, sizeof(PushConstants), s);
   vkCmdPushConstants(
       dispatch.command_buffer,
       dispatch.pipeline->layout,
@@ -1081,6 +1071,209 @@ bool fp_dequantize_to_float32(
     int group_size,
     int bits) {
   return fp_dequantize_to_float32_fallback(w, scales, out, s, group_size, bits);
+}
+
+bool fp_quantize_from_float32(
+    const array& in,
+    array& w,
+    array& scales,
+    Stream s,
+    int group_size,
+    int bits) {
+  if (in.dtype() != float32 || w.dtype() != uint32 || scales.dtype() != uint8) {
+    return false;
+  }
+  if (group_size != 32 || (bits != 4 && bits != 8)) {
+    return false;
+  }
+  if ((in.size() % group_size) != 0) {
+    return false;
+  }
+  if (w.size() != in.size() * bits / 32 ||
+      scales.size() != in.size() / group_size) {
+    return false;
+  }
+
+  array in_work = ensure_row_contiguous_zero_offset(in, s);
+  if (!is_row_contiguous_zero_offset(in_work)) {
+    return false;
+  }
+
+  w.set_data(allocator::malloc(w.nbytes()));
+  scales.set_data(allocator::malloc(scales.nbytes()));
+  if (in.size() == 0) {
+    return true;
+  }
+
+  const uint32_t num_groups = static_cast<uint32_t>(scales.size());
+  if (static_cast<size_t>(num_groups) != scales.size()) {
+    return false;
+  }
+
+  vulkan::DynamicShaderPreambleOptions preamble_options;
+  preamble_options.dtypes = {float32, uint8};
+  preamble_options.local_size_x = 32;
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(preamble_options);
+  os << R"(
+layout(push_constant) uniform PushConstants { uint num_groups; } pc;
+layout(set = 0, binding = 0) readonly buffer Input { float data[]; } in_buf;
+layout(set = 0, binding = 1) buffer Packed { uint data[]; } packed_buf;
+)";
+  os << vulkan::storage_buffer_layout_for_dtype(uint8, 2)
+     << " buffer Scales { uint8_t data[]; } scale_buf;\n";
+  os << R"(
+shared float group_abs[32];
+shared uint group_q[32];
+
+uint fp32_to_e8m0(float x) {
+  if (isinf(x)) {
+    return 255u;
+  }
+  if (!(x > 0.0)) {
+    return 0u;
+  }
+  int n = int(round(log2(x)));
+  n = clamp(n, -127, 127);
+  return uint(n + 127);
+}
+
+float e8m0_to_fp32(uint x) {
+  uint bits = x == 0u ? 0x00400000u : (x << 23);
+  return uintBitsToFloat(bits);
+}
+
+uint to_fp8_e4m3(float x) {
+  uint f_bits = floatBitsToUint(x);
+  uint sign = f_bits & 0x80000000u;
+  f_bits ^= sign;
+
+  uint f_bits_low = floatBitsToUint(uintBitsToFloat(f_bits) + uintBitsToFloat(141u << 23));
+  uint result_low = f_bits_low - (141u << 23);
+
+  uint mant_odd = (f_bits >> 20) & 1u;
+  uint f_bits_high = f_bits + (((7u - 127u) << 23) + 0x7FFFFu);
+  f_bits_high += mant_odd;
+  uint result_high = f_bits_high >> 20;
+
+  uint result = f_bits < (121u << 23) ? result_low : result_high;
+  if (f_bits >= (543u << 21)) {
+    result = 0x7Eu;
+  }
+  return result | (sign >> 24);
+}
+
+uint fp32_to_fp4_e2m1(float x) {
+  uint sign_bit = (floatBitsToUint(x) & 0x80000000u) != 0u ? 8u : 0u;
+  x = abs(x);
+
+  uint bits;
+  if (x > 5.0) {
+    bits = 7u;
+  } else if (x >= 3.5) {
+    bits = 6u;
+  } else if (x > 2.5) {
+    bits = 5u;
+  } else if (x >= 1.75) {
+    bits = 4u;
+  } else if (x > 1.25) {
+    bits = 3u;
+  } else if (x >= 0.75) {
+    bits = 2u;
+  } else if (x > 0.25) {
+    bits = 1u;
+  } else {
+    bits = 0u;
+  }
+  return bits | sign_bit;
+}
+
+void main() {
+  const uint group = gl_WorkGroupID.x;
+  const uint tid = gl_LocalInvocationID.x;
+  if (group >= pc.num_groups) {
+    return;
+  }
+
+  const uint base = group * 32u;
+  const float x = in_buf.data[base + tid];
+  group_abs[tid] = abs(x);
+  barrier();
+
+  for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) {
+      group_abs[tid] = max(group_abs[tid], group_abs[tid + stride]);
+    }
+    barrier();
+  }
+
+)";
+  os << "  const float scale_base = group_abs[0] / "
+     << (bits == 4 ? "6.0" : "448.0") << ";\n";
+  os << R"(
+  const uint scale_enc = fp32_to_e8m0(scale_base);
+  const float scale = e8m0_to_fp32(scale_enc);
+  if (tid == 0u) {
+    scale_buf.data[group] = uint8_t(scale_enc);
+  }
+
+  const float normalized = scale == 0.0 ? 0.0 : x / scale;
+)";
+  if (bits == 4) {
+    os << R"(
+  group_q[tid] = fp32_to_fp4_e2m1(normalized);
+  barrier();
+
+  if (tid < 4u) {
+    const uint qbase = tid * 8u;
+    uint packed = 0u;
+    for (uint i = 0u; i < 8u; ++i) {
+      packed |= (group_q[qbase + i] & 15u) << (i * 4u);
+    }
+    packed_buf.data[group * 4u + tid] = packed;
+  }
+}
+)";
+  } else {
+    os << R"(
+  group_q[tid] = to_fp8_e4m3(normalized);
+  barrier();
+
+  if (tid < 8u) {
+    const uint qbase = tid * 4u;
+    uint packed = 0u;
+    for (uint i = 0u; i < 4u; ++i) {
+      packed |= (group_q[qbase + i] & 255u) << (i * 8u);
+    }
+    packed_buf.data[group * 8u + tid] = packed;
+  }
+}
+)";
+  }
+
+  vulkan::DynamicArrayRef arrays[] = {
+      {&in_work, 0},
+      {&w, 1},
+      {&scales, 2},
+  };
+  constexpr uint32_t kPushConstantSize = sizeof(uint32_t);
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      bits == 4 ? "dynamic_mxfp4_quant_f32" : "dynamic_mxfp8_quant_f32",
+      os.str(),
+      3,
+      arrays,
+      kPushConstantSize,
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      kPushConstantSize,
+      &num_groups);
+  vkCmdDispatch(dispatch.command_buffer, num_groups, 1, 1);
+  vulkan::end_command_recording(s.index);
+  return true;
 }
 
 bool fp_quantize_dequantize_to_float32(

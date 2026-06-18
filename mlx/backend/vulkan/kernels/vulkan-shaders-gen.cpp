@@ -1655,6 +1655,18 @@ void process_shaders() {
       "norm.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv(
+      "norm_f16",
+      "norm.comp",
+      merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
+  string_to_spv(
+      "norm_bf16",
+      "norm.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"D_TYPE", "float"},
+           {"LOAD_A(x)", "FLOAT_TYPE(bf16_to_fp32(uint(x)))"}}));
+  string_to_spv(
       "group_norm_f32",
       "group_norm.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

@@ -11,6 +11,14 @@ layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
+#if !defined(LOAD_A)
+#define LOAD_A(x) float(x)
+#endif
+
+#if !defined(STORE_D)
+#define STORE_D(x) D_TYPE(x)
+#endif
+
 shared vec2 sum[BLOCK_SIZE];
 
 void main() {
@@ -20,7 +28,7 @@ void main() {
     sum[tid] = vec2(0.0f, 0.0f);
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
-        const float xi = float(data_a[row*p.KX + col]);
+        const float xi = LOAD_A(data_a[row*p.KX + col]);
         sum[tid].x += xi;
         sum[tid].y += xi * xi;
     }
@@ -39,6 +47,6 @@ void main() {
     const float inv_std = inversesqrt(var + p.param1);
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
-        data_d[row*p.KX + col] = D_TYPE((float(data_a[row*p.KX + col]) - mean) * inv_std);
+        data_d[row*p.KX + col] = STORE_D((LOAD_A(data_a[row*p.KX + col]) - mean) * inv_std);
     }
 }

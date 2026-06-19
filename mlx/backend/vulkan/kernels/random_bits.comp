@@ -2,6 +2,8 @@
 
 #include "types.glsl"
 
+#extension GL_EXT_scalar_block_layout : require
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
@@ -12,7 +14,7 @@ layout(push_constant) uniform Params {
 } p;
 
 layout(binding = 0) readonly buffer Keys { uint keys[]; };
-layout(binding = 1) writeonly buffer Out { uint out_data[]; };
+layout(scalar, binding = 1) writeonly buffer Out { uint8_t out_data[]; };
 
 const uint ROTATIONS[2][4] = uint[2][4](
     uint[4](13, 15, 26, 6),
@@ -68,18 +70,28 @@ void main() {
     bool drop_last = !even && (half_idx == half_size);
     uvec2 count = uvec2(half_idx, drop_last ? 0 : half_idx + grid_y);
     uvec2 bits = threefry2x32_hash(key, count);
+
+    uint key_byte_offset = key_idx * p.bytes_per_key;
+
+    #define WRITE_WORD(word_idx, value) { \
+        uint byte_offset = (word_idx) * 4; \
+        if (byte_offset + 0 < p.bytes_per_key) out_data[key_byte_offset + byte_offset + 0] = uint8_t((value) & 0xffu); \
+        if (byte_offset + 1 < p.bytes_per_key) out_data[key_byte_offset + byte_offset + 1] = uint8_t(((value) >> 8) & 0xffu); \
+        if (byte_offset + 2 < p.bytes_per_key) out_data[key_byte_offset + byte_offset + 2] = uint8_t(((value) >> 16) & 0xffu); \
+        if (byte_offset + 3 < p.bytes_per_key) out_data[key_byte_offset + byte_offset + 3] = uint8_t(((value) >> 24) & 0xffu); \
+    }
     
     // Write first 4 bytes.
     uint idx1 = out_offset + half_idx;
     if (idx1 < out_offset + p.out_skip) {
-        out_data[idx1] = bits.x;
+        WRITE_WORD(half_idx, bits.x);
     }
     
     // Write second 4 bytes (if not dropping last).
     if (!drop_last) {
         uint idx2 = out_offset + half_idx + grid_y;
         if (idx2 < out_offset + p.out_skip) {
-            out_data[idx2] = bits.y;
+            WRITE_WORD(half_idx + grid_y, bits.y);
         }
     }
 }

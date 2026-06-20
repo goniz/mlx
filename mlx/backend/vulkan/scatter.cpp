@@ -574,7 +574,9 @@ bool try_eval_scatter_vulkan(
                 reduce_type)) {
           return true;
         }
-        return false;
+        if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
+          return false;
+        }
       }
     }
     if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
@@ -736,7 +738,9 @@ bool try_eval_scatter_vulkan(
               reduce_type)) {
         return true;
       }
-      return false;
+      if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
+        return false;
+      }
     }
   }
   const uint32_t slice_size = take_slice_size;

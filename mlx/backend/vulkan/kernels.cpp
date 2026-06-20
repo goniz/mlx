@@ -21,6 +21,7 @@
 namespace mlx::core::vulkan {
 
 constexpr uint32_t kMaxMulMatVecCols = 8;
+constexpr uint32_t kMaxSequentialLowPrecisionArange = 4096;
 
 uint32_t matvec_rows_per_workgroup() {
   static const uint32_t value = []() {
@@ -827,15 +828,19 @@ ArangePushConstants make_arange_push_constants(
     case float16: {
       auto push_constants =
           make_arange_push_constants_t<float16_t>(num_elements, start, step);
-      push_constants.KY =
-          start == std::trunc(start) && step == std::trunc(step) ? 1 : 0;
+      const bool use_sequential_low_precision =
+          num_elements <= kMaxSequentialLowPrecisionArange &&
+          start == std::trunc(start) && step == std::trunc(step);
+      push_constants.KY = use_sequential_low_precision ? 1 : 0;
       return push_constants;
     }
     case bfloat16: {
       auto push_constants =
           make_arange_push_constants_t<bfloat16_t>(num_elements, start, step);
-      push_constants.KY =
-          start == std::trunc(start) && step == std::trunc(step) ? 1 : 0;
+      const bool use_sequential_low_precision =
+          num_elements <= kMaxSequentialLowPrecisionArange &&
+          start == std::trunc(start) && step == std::trunc(step);
+      push_constants.KY = use_sequential_low_precision ? 1 : 0;
       return push_constants;
     }
     case float32:

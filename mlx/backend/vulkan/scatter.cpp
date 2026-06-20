@@ -72,6 +72,22 @@ bool supports_dynamic_scatter_sum_dtype(Dtype dtype) {
   return dtype == float32 || dtype == int32 || dtype == uint32;
 }
 
+bool supports_dynamic_scatter_reduction_dtype(
+    Dtype dtype,
+    Scatter::ReduceType reduce_type) {
+  switch (reduce_type) {
+    case Scatter::None:
+      return true;
+    case Scatter::Sum:
+      return supports_dynamic_scatter_sum_dtype(dtype);
+    case Scatter::Prod:
+    case Scatter::Max:
+    case Scatter::Min:
+      return dtype == float32 || dtype == int32 || dtype == uint32;
+  }
+  return false;
+}
+
 std::string build_generic_scatter_shader(
     Dtype value_dtype,
     Dtype index_dtype,
@@ -80,6 +96,10 @@ std::string build_generic_scatter_shader(
     Scatter::ReduceType reduce_type) {
   std::ostringstream os;
   const bool use_float_atomic_cas = value_dtype == float32 &&
+      (reduce_type == Scatter::Prod || reduce_type == Scatter::Max ||
+       reduce_type == Scatter::Min);
+  const bool use_integer_atomic_cas =
+      (value_dtype == int32 || value_dtype == uint32) &&
       (reduce_type == Scatter::Prod || reduce_type == Scatter::Max ||
        reduce_type == Scatter::Min);
 
@@ -177,6 +197,22 @@ std::string build_generic_scatter_shader(
     os << "        old_bits = prev_bits;\n";
     os << "    }\n";
     os << "}\n\n";
+  } else if (use_integer_atomic_cas) {
+    os << "void atomic_reduce(uint dst_offset, VALUE_TYPE value) {\n";
+    os << "    VALUE_TYPE old_value = out_data[dst_offset];\n";
+    os << "    while (true) {\n";
+    if (reduce_type == Scatter::Prod) {
+      os << "        VALUE_TYPE new_value = old_value * value;\n";
+    } else if (reduce_type == Scatter::Max) {
+      os << "        VALUE_TYPE new_value = max(old_value, value);\n";
+    } else {
+      os << "        VALUE_TYPE new_value = min(old_value, value);\n";
+    }
+    os << "        VALUE_TYPE prev_value = atomicCompSwap(out_data[dst_offset], old_value, new_value);\n";
+    os << "        if (prev_value == old_value) break;\n";
+    os << "        old_value = prev_value;\n";
+    os << "    }\n";
+    os << "}\n\n";
   }
 
   os << "void main() {\n";
@@ -202,6 +238,8 @@ std::string build_generic_scatter_shader(
     os << "\n    atomicAdd(out_data[dst_offset], upd_data[linear_idx]);\n";
   } else if (use_float_atomic_cas) {
     os << "\n    atomic_reduce(dst_offset, read_update(linear_idx));\n";
+  } else if (use_integer_atomic_cas) {
+    os << "\n    atomic_reduce(dst_offset, upd_data[linear_idx]);\n";
   } else if (reduce_type == Scatter::Prod) {
     os << "\n    out_data[dst_offset] *= upd_data[linear_idx];\n";
   } else if (reduce_type == Scatter::Max) {
@@ -236,8 +274,7 @@ bool try_dispatch_generic_scatter(
   const Dtype value_dtype = src_input.dtype();
   const Dtype index_dtype = inputs[1].dtype();
 
-  if (reduce_type == Scatter::Sum &&
-      !supports_dynamic_scatter_sum_dtype(value_dtype)) {
+  if (!supports_dynamic_scatter_reduction_dtype(value_dtype, reduce_type)) {
     return false;
   }
 

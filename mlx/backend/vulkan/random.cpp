@@ -59,7 +59,7 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
       command_buffer,
       stream(),
       push_constants,
-      {static_cast<uint32_t>(num_keys),
+      {static_cast<uint32_t>((num_keys + 255) / 256),
        static_cast<uint32_t>(half_size + odd),
        1});
   vulkan::end_command_recording(stream().index);

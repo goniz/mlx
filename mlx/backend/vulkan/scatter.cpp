@@ -273,6 +273,10 @@ bool try_dispatch_generic_scatter(
   const int nidx = static_cast<int>(norm_axes.size());
   const Dtype value_dtype = src_input.dtype();
   const Dtype index_dtype = inputs[1].dtype();
+  if (index_dtype != int32 && index_dtype != uint32 && index_dtype != int64 &&
+      index_dtype != uint64) {
+    return false;
+  }
 
   if (!supports_dynamic_scatter_reduction_dtype(value_dtype, reduce_type)) {
     return false;

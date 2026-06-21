@@ -1,8 +1,10 @@
 // Copyright © 2024 Apple Inc.
 
+#include <algorithm>
 #include <limits>
 
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/vulkan.h"
 
 namespace mlx::core {
 
@@ -51,6 +53,19 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
       odd ? 1u : 0u,
       static_cast<uint32_t>(out_skip)};
 
+  const auto limits = vulkan::VulkanContext::get()
+                          .physical_device()
+                          .getProperties()
+                          .limits;
+  const uint32_t half_work = static_cast<uint32_t>(half_size + odd);
+  const uint32_t grid_y = std::min(half_work, limits.maxComputeWorkGroupCount[1]);
+  const uint32_t grid_z =
+      static_cast<uint32_t>((half_work + grid_y - 1) / grid_y);
+  if (grid_z > limits.maxComputeWorkGroupCount[2]) {
+    throw std::runtime_error(
+        "RandomBits failed on Vulkan (dispatch shape too large).");
+  }
+
   auto command_buffer = vulkan::begin_command_recording(stream().index);
   vulkan::dispatch_random_bits_op(
       keys,
@@ -60,8 +75,8 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
       stream(),
       push_constants,
       {static_cast<uint32_t>((num_keys + 255) / 256),
-       static_cast<uint32_t>(half_size + odd),
-       1});
+       grid_y,
+       grid_z});
   vulkan::end_command_recording(stream().index);
 }
 

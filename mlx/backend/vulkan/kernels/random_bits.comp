@@ -46,8 +46,7 @@ uvec2 threefry2x32_hash(uvec2 key, uvec2 count) {
 
 void main() {
     uint key_idx = gl_GlobalInvocationID.x;
-    uint half_idx = gl_GlobalInvocationID.y;
-    uint grid_y = gl_NumWorkGroups.y;
+    uint half_idx = gl_GlobalInvocationID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
     
     if (key_idx >= p.num_keys) {
         return;
@@ -55,8 +54,9 @@ void main() {
     
     uint half_size = p.out_skip / 2;
     bool even = (p.out_skip % 2) == 0;
+    uint logical_grid_y = half_size + (even ? 0 : 1);
     
-    if (half_idx >= half_size + (even ? 0 : 1)) {
+    if (half_idx >= logical_grid_y) {
         return;
     }
     
@@ -69,7 +69,7 @@ void main() {
     
     // Generate random bits
     bool drop_last = !even && (half_idx == half_size);
-    uvec2 count = uvec2(half_idx, drop_last ? 0 : half_idx + grid_y);
+    uvec2 count = uvec2(half_idx, drop_last ? 0 : half_idx + logical_grid_y);
     uvec2 bits = threefry2x32_hash(key, count);
 
     uint key_byte_offset = key_idx * p.bytes_per_key;
@@ -90,9 +90,9 @@ void main() {
     
     // Write second 4 bytes (if not dropping last).
     if (!drop_last) {
-        uint idx2 = out_offset + half_idx + grid_y;
+        uint idx2 = out_offset + half_idx + logical_grid_y;
         if (idx2 < out_offset + p.out_skip) {
-            WRITE_WORD(half_idx + grid_y, bits.y);
+            WRITE_WORD(half_idx + logical_grid_y, bits.y);
         }
     }
 }

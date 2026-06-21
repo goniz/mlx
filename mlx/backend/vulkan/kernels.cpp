@@ -829,6 +829,9 @@ ArangePushConstants make_arange_push_constants(
           make_arange_push_constants_t<float16_t>(num_elements, start, step);
       const bool use_sequential_low_precision =
           start == std::trunc(start) && step == std::trunc(step);
+      if (use_sequential_low_precision) {
+        push_constants.step_f32 = static_cast<float>(float16_t(step));
+      }
       push_constants.KY = use_sequential_low_precision ? 1 : 0;
       return push_constants;
     }
@@ -837,6 +840,9 @@ ArangePushConstants make_arange_push_constants(
           make_arange_push_constants_t<bfloat16_t>(num_elements, start, step);
       const bool use_sequential_low_precision =
           start == std::trunc(start) && step == std::trunc(step);
+      if (use_sequential_low_precision) {
+        push_constants.step_f32 = static_cast<float>(bfloat16_t(step));
+      }
       push_constants.KY = use_sequential_low_precision ? 1 : 0;
       return push_constants;
     }

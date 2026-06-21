@@ -31,7 +31,8 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
         "RandomBits failed on Vulkan (only uint32 keys supported).");
   }
 
-  if (!keys.flags().contiguous || keys.offset() != 0 ||
+  if (!vulkan::is_vulkan_storage_array(keys) || !keys.flags().contiguous ||
+      keys.offset() != 0 ||
       keys.strides().back() != 1) {
     keys = contiguous_copy_gpu(keys, stream());
   }

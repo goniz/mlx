@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include <limits>
 #include <utility>
 
 #include "mlx/backend/common/slicing.h"
@@ -64,6 +65,130 @@ checked_shape_product(const array& arr, int begin, int end, const char* label) {
         checked_mul_u32(product, checked_u32_size(arr.shape(i), label), label);
   }
   return product;
+}
+
+bool is_host_readable_index_constant(const array& idx) {
+  auto data = idx.data_shared_ptr();
+  return !idx.has_primitive() && data != nullptr && data->buffer.ptr() != nullptr &&
+      !vulkan::is_vulkan_buffer(data->buffer) && idx.flags().row_contiguous &&
+      idx.offset() == 0 && idx.data_size() == idx.size();
+}
+
+int64_t read_contiguous_index(const array& idx, int i) {
+  switch (idx.dtype()) {
+    case int8:
+      return idx.data<int8_t>()[i];
+    case int16:
+      return idx.data<int16_t>()[i];
+    case int32:
+      return idx.data<int32_t>()[i];
+    case int64:
+      return idx.data<int64_t>()[i];
+    case uint8:
+      return idx.data<uint8_t>()[i];
+    case uint16:
+      return idx.data<uint16_t>()[i];
+    case uint32:
+      return idx.data<uint32_t>()[i];
+    case uint64: {
+      auto value = idx.data<uint64_t>()[i];
+      if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        throw std::runtime_error("uint64 index exceeds max int64_t value");
+      }
+      return static_cast<int64_t>(value);
+    }
+    default:
+      throw std::runtime_error("Unsupported index dtype for Vulkan scatter.");
+  }
+}
+
+int64_t normalize_scatter_index(int64_t idx, int64_t axis_size) {
+  if (idx < 0) {
+    idx += axis_size;
+  }
+  return idx;
+}
+
+SliceUpdate::ReduceType slice_update_reduce_type(
+    Scatter::ReduceType reduce_type) {
+  switch (reduce_type) {
+    case Scatter::Prod:
+      return SliceUpdate::Prod;
+    case Scatter::Max:
+      return SliceUpdate::Max;
+    case Scatter::Min:
+      return SliceUpdate::Min;
+    case Scatter::Sum:
+      return SliceUpdate::Sum;
+    case Scatter::None:
+      return SliceUpdate::None;
+  }
+  return SliceUpdate::None;
+}
+
+bool try_slice_update_scatter_composed(
+    const array& src,
+    const std::vector<array>& indices,
+    const array& upd,
+    array& out,
+    const std::vector<int>& axes,
+    const Shape& update_shape,
+    uint32_t index_count,
+    uint32_t slice_elems,
+    Scatter::ReduceType reduce_type,
+    Stream s) {
+  for (const auto& idx : indices) {
+    if (!is_host_readable_index_constant(idx)) {
+      return false;
+    }
+  }
+
+  array flat_upd = reshape(
+      ensure_row_contiguous(upd, s),
+      {static_cast<ShapeElem>(index_count),
+       static_cast<ShapeElem>(slice_elems)},
+      s);
+  array result(src.shape(), src.dtype(), nullptr, {});
+  result.set_data(allocator::malloc(result.nbytes()));
+  result.set_status(array::Status::available);
+  copy_gpu(src, result, source_copy_type(src), s);
+
+  const auto op_reduce = slice_update_reduce_type(reduce_type);
+  for (uint32_t i = 0; i < index_count; ++i) {
+    Shape start(src.ndim(), 0);
+    Shape stop = update_shape;
+    Shape unit_strides(src.ndim(), 1);
+    for (int j = 0; j < axes.size(); ++j) {
+      const int axis = axes[j];
+      const auto normalized_index = normalize_scatter_index(
+          read_contiguous_index(indices[j], i), src.shape(axis));
+      start[axis] = normalized_index;
+      stop[axis] += normalized_index;
+      if (stop[axis] > src.shape(axis)) {
+        return false;
+      }
+    }
+
+    array update_value = reshape(
+        slice(
+            flat_upd,
+            {static_cast<ShapeElem>(i), 0},
+            {static_cast<ShapeElem>(i + 1),
+             static_cast<ShapeElem>(slice_elems)},
+            s),
+        update_shape,
+        s);
+
+    array next(src.shape(), src.dtype(), nullptr, {});
+    next.set_data(allocator::malloc(next.nbytes()));
+    next.set_status(array::Status::available);
+    SliceUpdate op(s, op_reduce, start, stop, unit_strides);
+    op.eval_gpu({result, update_value}, next);
+    result = std::move(next);
+  }
+
+  copy_gpu(result, out, CopyType::GeneralGeneral, s);
+  return true;
 }
 
 constexpr uint32_t kMaxScatterPushConstants = 128;
@@ -579,6 +704,19 @@ bool try_eval_scatter_vulkan(
           return true;
         }
         if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
+          if (try_slice_update_scatter_composed(
+                  src,
+                  {idx0, idx1},
+                  upd,
+                  out,
+                  norm_axes,
+                  update_shape,
+                  index_count,
+                  slice_elems,
+                  reduce_type,
+                  s)) {
+            return true;
+          }
           return false;
         }
       }
@@ -743,6 +881,19 @@ bool try_eval_scatter_vulkan(
         return true;
       }
       if (reduce_type != Scatter::None && reduce_type != Scatter::Sum) {
+        if (try_slice_update_scatter_composed(
+                src,
+                {idx},
+                upd,
+                out,
+                norm_axes,
+                update_shape,
+                index_count,
+                slice_elems,
+                reduce_type,
+                s)) {
+          return true;
+        }
         return false;
       }
     }

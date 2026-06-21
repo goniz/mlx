@@ -61,6 +61,11 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   const uint32_t grid_y = std::min(half_work, limits.maxComputeWorkGroupCount[1]);
   const uint32_t grid_z =
       static_cast<uint32_t>((half_work + grid_y - 1) / grid_y);
+  const uint32_t grid_x = static_cast<uint32_t>((num_keys + 255) / 256);
+  if (grid_x > limits.maxComputeWorkGroupCount[0]) {
+    throw std::runtime_error(
+        "RandomBits failed on Vulkan (dispatch shape too large).");
+  }
   if (grid_z > limits.maxComputeWorkGroupCount[2]) {
     throw std::runtime_error(
         "RandomBits failed on Vulkan (dispatch shape too large).");
@@ -74,9 +79,7 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
       command_buffer,
       stream(),
       push_constants,
-      {static_cast<uint32_t>((num_keys + 255) / 256),
-       grid_y,
-       grid_z});
+      {grid_x, grid_y, grid_z});
   vulkan::end_command_recording(stream().index);
 }
 

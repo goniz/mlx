@@ -1,9 +1,10 @@
 // Copyright © 2024 Apple Inc.
 
 #include <algorithm>
+#include <limits>
 
-#include "mlx/backend/cpu/threefry.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/vulkan.h"
 
 namespace mlx::core {
 
@@ -30,98 +31,57 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
         "RandomBits failed on Vulkan (only uint32 keys supported).");
   }
 
-  if (width_ == 4 && bytes_per_key % 4 == 0) {
-    if (!keys.flags().contiguous || keys.offset() != 0 || keys.strides().back() != 1) {
-      keys = contiguous_copy_gpu(keys, stream());
-    }
-    keys.wait();
-
-    auto* kptr = keys.data<uint32_t>();
-    std::vector<uint32_t> host_out(out.size());
-    size_t out_skip = bytes_per_key / 4;
-    size_t half_size = out_skip / 2;
-    bool even = out_skip % 2 == 0;
-    for (size_t i = 0; i < num_keys; ++i) {
-      auto key = std::make_pair(kptr[2 * i], kptr[2 * i + 1]);
-      auto* dst = host_out.data() + i * out_skip;
-
-      std::pair<uintptr_t, uintptr_t> count{0, half_size + !even};
-      for (; count.first + 1 < half_size; count.first++, count.second++) {
-        std::tie(dst[count.first], dst[count.second]) =
-            random::threefry2x32_hash(key, count);
-      }
-      if (count.first < half_size) {
-        auto rb = random::threefry2x32_hash(key, count);
-        dst[count.first++] = rb.first;
-        dst[count.second] = rb.second;
-      }
-      if (!even) {
-        count.second = 0;
-        dst[half_size] = random::threefry2x32_hash(key, count).first;
-      }
-    }
-    copy_gpu(
-        array(host_out.begin(), out.shape(), uint32),
-        out,
-        CopyType::GeneralGeneral,
-        stream());
-    return;
-  }
-
-  if (!keys.flags().contiguous || keys.offset() != 0 || keys.strides().back() != 1) {
+  if (!vulkan::is_vulkan_storage_array(keys) || !keys.flags().contiguous ||
+      keys.offset() != 0 ||
+      keys.strides().back() != 1) {
     keys = contiguous_copy_gpu(keys, stream());
   }
-  keys.wait();
 
-  auto* kptr = keys.data<uint32_t>();
-  auto host_out = std::make_shared<std::vector<char>>(out.nbytes());
-  auto* cptr = host_out->data();
-  auto copy_word = [&](char* dst, size_t word_idx, uint32_t v) {
-    const size_t byte_offset = 4 * word_idx;
-    if (byte_offset + 4 <= bytes_per_key) {
-      std::copy(
-          reinterpret_cast<const char*>(&v),
-          reinterpret_cast<const char*>(&v) + 4,
-          dst + byte_offset);
-    } else {
-      std::copy(
-          reinterpret_cast<const char*>(&v),
-          reinterpret_cast<const char*>(&v) + (bytes_per_key - byte_offset),
-          dst + byte_offset);
-    }
-  };
-
+  out.set_data(allocator::malloc(out.nbytes()));
   size_t out_skip = (bytes_per_key + 4 - 1) / 4;
   size_t half_size = out_skip / 2;
-  bool even = out_skip % 2 == 0;
-  for (size_t i = 0; i < num_keys; ++i, cptr += bytes_per_key) {
-    auto key = std::make_pair(kptr[2 * i], kptr[2 * i + 1]);
+  bool odd = out_skip % 2 != 0;
 
-    std::pair<uintptr_t, uintptr_t> count{0, half_size + !even};
-    for (; count.first + 1 < half_size; count.first++, count.second++) {
-      auto rb = random::threefry2x32_hash(key, count);
-      copy_word(cptr, count.first, rb.first);
-      copy_word(cptr, count.second, rb.second);
-    }
-    if (count.first < half_size) {
-      auto rb = random::threefry2x32_hash(key, count);
-      copy_word(cptr, count.first++, rb.first);
-      copy_word(cptr, count.second, rb.second);
-    }
-    if (!even) {
-      count.second = 0;
-      copy_word(cptr, half_size, random::threefry2x32_hash(key, count).first);
-    }
+  if (num_keys > std::numeric_limits<uint32_t>::max() ||
+      bytes_per_key > std::numeric_limits<uint32_t>::max() ||
+      out_skip > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error("RandomBits failed on Vulkan (shape too large).");
   }
-  copy_gpu(
-      array(
-          static_cast<void*>(host_out->data()),
-          out.shape(),
-          out.dtype(),
-          [host_out](void*) {}),
+
+  vulkan::RandomBitsPushConstants push_constants{
+      static_cast<uint32_t>(num_keys),
+      static_cast<uint32_t>(bytes_per_key),
+      odd ? 1u : 0u,
+      static_cast<uint32_t>(out_skip)};
+
+  const auto limits = vulkan::VulkanContext::get()
+                          .physical_device()
+                          .getProperties()
+                          .limits;
+  const uint32_t half_work = static_cast<uint32_t>(half_size + odd);
+  const uint32_t grid_y = std::min(half_work, limits.maxComputeWorkGroupCount[1]);
+  const uint32_t grid_z =
+      static_cast<uint32_t>((half_work + grid_y - 1) / grid_y);
+  const uint32_t grid_x = static_cast<uint32_t>((num_keys + 255) / 256);
+  if (grid_x > limits.maxComputeWorkGroupCount[0]) {
+    throw std::runtime_error(
+        "RandomBits failed on Vulkan (dispatch shape too large).");
+  }
+  if (grid_z > limits.maxComputeWorkGroupCount[2]) {
+    throw std::runtime_error(
+        "RandomBits failed on Vulkan (dispatch shape too large).");
+  }
+
+  auto command_buffer = vulkan::begin_command_recording(stream().index);
+  vulkan::dispatch_random_bits_op(
+      keys,
       out,
-      CopyType::GeneralGeneral,
-      stream());
+      vulkan::StaticShaderId::random_bits_f32,
+      command_buffer,
+      stream(),
+      push_constants,
+      {grid_x, grid_y, grid_z});
+  vulkan::end_command_recording(stream().index);
 }
 
 } // namespace mlx::core

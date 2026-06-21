@@ -3,6 +3,7 @@
 #include "mlx/backend/vulkan/kernels.h"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -795,7 +796,7 @@ make_arange_push_constants_t(uint32_t num_elements, double start, double step) {
 
   ArangePushConstants push_constants{};
   push_constants.KX = num_elements;
-  push_constants.KY = 1;
+  push_constants.KY = 0;
   push_constants.start_i64 = static_cast<int64_t>(start_t);
   push_constants.step_i64 = static_cast<int64_t>(step_t);
   push_constants.start_f32 = static_cast<float>(start_t);
@@ -823,11 +824,28 @@ ArangePushConstants make_arange_push_constants(
       return make_arange_push_constants_t<int32_t>(num_elements, start, step);
     case int64:
       return make_arange_push_constants_t<int64_t>(num_elements, start, step);
-    case float16:
-      return make_arange_push_constants_t<float16_t>(num_elements, start, step);
-    case bfloat16:
-      return make_arange_push_constants_t<bfloat16_t>(
-          num_elements, start, step);
+    case float16: {
+      auto push_constants =
+          make_arange_push_constants_t<float16_t>(num_elements, start, step);
+      const bool use_sequential_low_precision =
+          start == std::trunc(start) && step == std::trunc(step);
+      if (use_sequential_low_precision) {
+        push_constants.step_f32 = static_cast<float>(float16_t(step));
+      }
+      push_constants.KY = use_sequential_low_precision ? 1 : 0;
+      return push_constants;
+    }
+    case bfloat16: {
+      auto push_constants =
+          make_arange_push_constants_t<bfloat16_t>(num_elements, start, step);
+      const bool use_sequential_low_precision =
+          start == std::trunc(start) && step == std::trunc(step);
+      if (use_sequential_low_precision) {
+        push_constants.step_f32 = static_cast<float>(bfloat16_t(step));
+      }
+      push_constants.KY = use_sequential_low_precision ? 1 : 0;
+      return push_constants;
+    }
     case float32:
       return make_arange_push_constants_t<float>(num_elements, start, step);
     default:

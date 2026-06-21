@@ -23,6 +23,36 @@ void main() {
         return;
     }
 
+#ifdef DATA_D_F16
+    if (p.KY != 0) {
+        if (i != 0) {
+            return;
+        }
+        float16_t value = float16_t(p.start_f32);
+        float16_t step = float16_t(p.step_f32);
+        for (uint j = 0; j < p.KX; ++j) {
+            data_d[j] = value;
+            value = float16_t(value + step);
+        }
+        return;
+    }
+#endif
+
+#ifdef DATA_D_BF16
+    if (p.KY != 0) {
+        if (i != 0) {
+            return;
+        }
+        uint32_t value = fp32_to_bf16(p.start_f32);
+        uint32_t step = fp32_to_bf16(p.step_f32);
+        for (uint j = 0; j < p.KX; ++j) {
+            data_d[j] = uint16_t(value);
+            value = fp32_to_bf16(bf16_to_fp32(value) + bf16_to_fp32(step));
+        }
+        return;
+    }
+#endif
+
     float value = p.start_f32 + p.step_f32 * float(i);
 #ifdef DATA_D_BF16
     data_d[i] = uint16_t(fp32_to_bf16(value));

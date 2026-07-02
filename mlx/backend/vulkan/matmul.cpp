@@ -12,13 +12,16 @@
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms.h"
+#include "mlx/transforms_impl.h"
 #include "mlx/utils.h"
 
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -38,6 +41,32 @@ constexpr char kMulMmACastScratchLane[] = "mul_mm.a_f16";
 constexpr char kMulMmBCastScratchLane[] = "mul_mm.b_f16";
 constexpr char kMulMmOutScratchLane[] = "mul_mm.out_work";
 constexpr char kMulMmSplitKScratchLane[] = "mul_mm.split_k";
+constexpr size_t kMulMmTransposeCacheLimit = 16;
+
+struct MulMmTransposeCacheEntry {
+  std::weak_ptr<array::Data> source;
+  const array::Data* source_id{nullptr};
+  Shape source_shape;
+  Strides source_strides;
+  int64_t source_offset{0};
+  Dtype source_dtype;
+  array transposed;
+};
+
+std::mutex& mul_mm_transpose_cache_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::deque<MulMmTransposeCacheEntry>& mul_mm_transpose_cache() {
+  static std::deque<MulMmTransposeCacheEntry> cache;
+  return cache;
+}
+
+bool cacheable_mul_mm_transpose_source(const array& source) {
+  return !source.has_primitive() && source.status() == array::Status::available &&
+      (source.dtype() == float16 || source.dtype() == bfloat16);
+}
 constexpr char kBlockMaskedMMLhsScratchLane[] = "block_masked_mm.lhs";
 constexpr char kBlockMaskedMMRhsScratchLane[] = "block_masked_mm.rhs";
 
@@ -848,6 +877,96 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   return has_vulkan_buffer(arr);
 }
 
+bool same_mul_mm_transpose_source(
+    const MulMmTransposeCacheEntry& entry,
+    const std::shared_ptr<array::Data>& source_data,
+    const array& source) {
+  auto locked_source = entry.source.lock();
+  return locked_source.get() == source_data.get() &&
+      entry.source_id == source_data.get() &&
+      entry.source_shape == source.shape() &&
+      entry.source_strides == source.strides() &&
+      entry.source_offset == source.offset() &&
+      entry.source_dtype == source.dtype();
+}
+
+std::optional<array> find_cached_mul_mm_transpose(const array& source) {
+  auto source_data = source.data_shared_ptr();
+  if (source_data == nullptr) {
+    return std::nullopt;
+  }
+
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  auto& cache = mul_mm_transpose_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (it->source.expired()) {
+      it = cache.erase(it);
+      continue;
+    }
+    if (same_mul_mm_transpose_source(*it, source_data, source)) {
+      auto cached = it->transposed;
+      auto entry = std::move(*it);
+      cache.erase(it);
+      cache.push_back(std::move(entry));
+      return cached;
+    }
+    ++it;
+  }
+  return std::nullopt;
+}
+
+void cache_mul_mm_transpose(const array& source, const array& transposed) {
+  if (!cacheable_mul_mm_transpose_source(source)) {
+    return;
+  }
+  auto source_data = source.data_shared_ptr();
+  if (source_data == nullptr || transposed.data_shared_ptr() == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  auto& cache = mul_mm_transpose_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (it->source.expired() ||
+        same_mul_mm_transpose_source(*it, source_data, source)) {
+      it = cache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  cache.push_back(MulMmTransposeCacheEntry{
+      source_data,
+      source_data.get(),
+      source.shape(),
+      source.strides(),
+      source.offset(),
+      source.dtype(),
+      transposed});
+  while (cache.size() > kMulMmTransposeCacheLimit) {
+    cache.pop_front();
+  }
+}
+
+array materialize_mul_mm_transpose(array b, Stream s) {
+  array b_t = swapaxes_in_eval(b, -1, -2);
+  if (is_row_contiguous_zero_offset(b_t)) {
+    return b_t;
+  }
+  if (!ensure_vulkan_buffer(b_t, s)) {
+    return b_t;
+  }
+  if (detail::in_tracing() || detail::retain_graph() ||
+      !cacheable_mul_mm_transpose_source(b)) {
+    return contiguous_copy_gpu(b_t, s);
+  }
+  if (auto cached = find_cached_mul_mm_transpose(b)) {
+    return *cached;
+  }
+  b_t = contiguous_copy_gpu(b_t, s);
+  cache_mul_mm_transpose(b, b_t);
+  return b_t;
+}
+
 void zero_initialize_output(array& out, Stream s) {
   if (out.size() == 0) {
     return;
@@ -1123,12 +1242,13 @@ bool try_eval_mul_mm_vulkan(
     return false;
   }
 
-  array b_t = swapaxes_in_eval(b, -1, -2);
+  array b_t = materialize_mul_mm_transpose(b, s);
   if (!is_row_contiguous_zero_offset(b_t)) {
     if (!ensure_vulkan_buffer(b_t, s)) {
       return false;
     }
     b_t = contiguous_copy_gpu(b_t, s);
+    cache_mul_mm_transpose(b, b_t);
   }
   if (!is_row_contiguous_zero_offset(b_t)) {
     return false;

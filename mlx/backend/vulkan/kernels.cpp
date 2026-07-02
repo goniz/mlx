@@ -54,6 +54,7 @@ namespace {
 constexpr char kSoftmaxLargeMaxScratchLane[] = "softmax.large.tmp_max";
 constexpr char kSoftmaxLargeSumScratchLane[] = "softmax.large.tmp_sum";
 constexpr char kCumsumMultipassScratchLane[] = "cumsum.multipass.tmp";
+constexpr char kArgsortLargeScratchLane[] = "argsort.large.tmp";
 constexpr uint32_t kDescriptorSetBatchSize = 32;
 constexpr uint32_t kVendorIdAmd = 0x1002u;
 constexpr uint32_t kVendorIdIntel = 0x8086u;
@@ -2759,12 +2760,11 @@ void dispatch_argsort_op(
 
   if (large_sort) {
     const uint32_t wg_unroll = ncols_padded / 1024u;
-    array tmp(
+    array tmp = acquire_scratch_array(
+        s,
+        kArgsortLargeScratchLane,
         {static_cast<int>(nrows), static_cast<int>(ncols_padded), 2},
-        int32,
-        nullptr,
-        {});
-    tmp.set_data(allocator::malloc(tmp.nbytes()));
+        int32);
 
     const std::array<BoundArray, 3> bound_arrays = {{
         {&in, "src0"},
@@ -2781,6 +2781,7 @@ void dispatch_argsort_op(
         s,
         grid,
         {1024u, wg_unroll});
+    mark_scratch_array_written(s, kArgsortLargeScratchLane);
     return;
   }
 

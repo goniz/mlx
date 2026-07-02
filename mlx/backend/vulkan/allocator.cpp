@@ -55,7 +55,14 @@ void* Buffer::raw_ptr() {
 
   vulkan::synchronize_buffer_for_host_access(buf);
 
-  return buf->mapped_ptr;
+  if (buf->mapped_ptr != nullptr) {
+    return buf->mapped_ptr;
+  }
+  if (auto* host_buf =
+          static_cast<vulkan::VulkanBuffer*>(buf->host_readback.ptr())) {
+    return host_buf->mapped_ptr;
+  }
+  return nullptr;
 }
 
 } // namespace allocator
@@ -535,8 +542,13 @@ Buffer VulkanAllocator::malloc_impl(size_t size, bool require_host_visible) {
     mapped_ptr = vk_device.mapMemory(vk_memory, 0, VK_WHOLE_SIZE);
   }
 
-  auto* buf = new VulkanBuffer{
-      mapped_ptr, vk_buffer, vk_memory, size, allocation_size, memory_flags};
+  auto* buf = new VulkanBuffer{mapped_ptr,
+                               Buffer{nullptr},
+                               vk_buffer,
+                               vk_memory,
+                               size,
+                               allocation_size,
+                               memory_flags};
 
   {
     std::unique_lock lk(mutex_);
@@ -593,6 +605,11 @@ void VulkanAllocator::free(Buffer buffer) {
 }
 
 void VulkanAllocator::free_vulkan_buffer(VulkanBuffer* buf) {
+  if (buf->host_readback.ptr() != nullptr) {
+    free(buf->host_readback);
+    buf->host_readback = Buffer{nullptr};
+  }
+
   auto vk_device = VulkanContext::get().device();
   if (buf->mapped_ptr != nullptr) {
     vk_device.unmapMemory(buf->memory);

@@ -417,6 +417,71 @@ void pop_sync_label() {
   }
 }
 
+void sync_copy_buffer_to_host(vk::Buffer src, vk::Buffer dst, size_t size) {
+  if (size == 0 || !src || !dst) {
+    return;
+  }
+
+  auto& ctx = VulkanContext::get();
+  auto device = ctx.device();
+  const bool use_transfer = ctx.has_separate_transfer_queue();
+  const uint32_t queue_family = use_transfer
+      ? ctx.transfer_queue_family_index()
+      : ctx.compute_queue_family_index();
+  const vk::Queue queue =
+      use_transfer ? ctx.transfer_queue() : ctx.compute_queue();
+
+  vk::CommandPoolCreateInfo pool_info(
+      vk::CommandPoolCreateFlagBits::eTransient, queue_family);
+  vk::CommandPool pool = device.createCommandPool(pool_info);
+
+  vk::CommandBufferAllocateInfo alloc_info(
+      pool, vk::CommandBufferLevel::ePrimary, 1);
+  vk::CommandBuffer cmd = device.allocateCommandBuffers(alloc_info).front();
+
+  cmd.begin(vk::CommandBufferBeginInfo(
+      vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+  vk::BufferCopy copy_region(0, 0, size);
+  cmd.copyBuffer(src, dst, copy_region);
+  cmd.end();
+
+  vk::Fence fence = device.createFence(vk::FenceCreateInfo{});
+  vk::SubmitInfo submit_info;
+  submit_info.setCommandBuffers(cmd);
+  queue.submit(submit_info, fence);
+  throw_if_vk_error(
+      static_cast<VkResult>(device.waitForFences(fence, VK_TRUE, UINT64_MAX)),
+      "[vulkan::raw_ptr] Failed waiting for host readback copy");
+
+  device.destroyFence(fence);
+  device.destroyCommandPool(pool);
+}
+
+void ensure_host_readback_mirror(VulkanBuffer* buffer) {
+  if (buffer == nullptr || buffer->mapped_ptr != nullptr || buffer->size == 0 ||
+      !buffer->buffer) {
+    return;
+  }
+
+  auto* host_buf = static_cast<VulkanBuffer*>(buffer->host_readback.ptr());
+  if (host_buf == nullptr ||
+      host_buf->allocation_size < buffer->allocation_size) {
+    if (buffer->host_readback.ptr() != nullptr) {
+      allocator().free(buffer->host_readback);
+    }
+    buffer->host_readback =
+        allocator().malloc_host_visible(buffer->allocation_size);
+    host_buf = static_cast<VulkanBuffer*>(buffer->host_readback.ptr());
+  }
+  if (host_buf == nullptr || host_buf->mapped_ptr == nullptr ||
+      !host_buf->buffer) {
+    throw std::runtime_error(
+        "[vulkan::raw_ptr] Failed to allocate host readback mirror.");
+  }
+
+  sync_copy_buffer_to_host(buffer->buffer, host_buf->buffer, buffer->size);
+}
+
 } // namespace
 
 // Stream data structure for Vulkan
@@ -934,6 +999,10 @@ class VulkanDevice {
     trace_sync(oss.str());
 
     if (!wait_semaphore || wait_timeline_value == 0) {
+      if (buffer->mapped_ptr == nullptr && buffer->size > 0) {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+        ensure_host_readback_mirror(buffer);
+      }
       return;
     }
 
@@ -956,6 +1025,11 @@ class VulkanDevice {
       buffer->last_semaphore = vk::Semaphore();
       buffer->last_timeline_value = 0;
       buffer->queue_affinity = VulkanBuffer::QueueAffinity::None;
+    }
+
+    if (buffer->mapped_ptr == nullptr) {
+      std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+      ensure_host_readback_mirror(buffer);
     }
   }
 

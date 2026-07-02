@@ -239,11 +239,7 @@ void soft_max(uint num_iters) {
             (idx < DATA_CACHE_SIZE ? data_cache[idx] : load_d(rowx*p.KX + col)) *
             rcpdivisor;
         normalized_sum += normalized;
-        if (idx < DATA_CACHE_SIZE) {
-            store_d(rowx*p.KX + col, normalized);
-        } else {
-            store_d(rowx*p.KX + col, normalized);
-        }
+        store_d(rowx*p.KX + col, normalized);
     }
 
     normalized_sum = reduce_sum(normalized_sum, tid);

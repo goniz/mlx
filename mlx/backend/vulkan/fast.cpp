@@ -521,6 +521,29 @@ array cast_flash_attention_q_to_f32(const array& x, Stream s) {
   return out;
 }
 
+array make_flash_attention_output_target(
+    array& out,
+    Stream s,
+    bool& uses_out_storage) {
+  const Shape kernel_shape = {
+      out.shape(0), out.shape(2), out.shape(1), out.shape(3)};
+  uses_out_storage = out.dtype() == float32;
+  if (!uses_out_storage) {
+    return vulkan::acquire_scratch_array(
+        s, kFlashAttnOutScratchLane, kernel_shape, float32);
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  array out_storage(kernel_shape, float32, nullptr, {});
+  out_storage.copy_shared_buffer(
+      out,
+      make_contiguous_strides(kernel_shape),
+      {true, true, false},
+      out.data_size(),
+      out.offset());
+  return out_storage;
+}
+
 struct FlashAttentionTuningParams {
   enum class Path {
     Scalar,
@@ -1354,11 +1377,9 @@ bool try_eval_flash_attention_vulkan(
   try {
     const bool use_causal_shader = do_causal && q_len > 1;
 
-    array out_storage = vulkan::acquire_scratch_array(
-        s,
-        kFlashAttnOutScratchLane,
-        {out.shape(0), out.shape(2), out.shape(1), out.shape(3)},
-        float32);
+    bool uses_out_storage = false;
+    array out_storage =
+        make_flash_attention_output_target(out, s, uses_out_storage);
 
     if (!try_dispatch_flash_attention_native_vulkan(
             q,
@@ -1374,12 +1395,23 @@ bool try_eval_flash_attention_vulkan(
             scale)) {
       return false;
     }
-    vulkan::mark_scratch_array_written(s, kFlashAttnOutScratchLane);
+    if (!uses_out_storage) {
+      vulkan::mark_scratch_array_written(s, kFlashAttnOutScratchLane);
+    }
 
     array out_transposed = swapaxes_in_eval(out_storage, 1, 2);
     trace_flash_attention_array("out_storage", out_storage);
     trace_flash_attention_array("out_transposed", out_transposed);
-    copy_gpu(out_transposed, out, CopyType::General, s);
+    if (uses_out_storage) {
+      out.copy_shared_buffer(
+          out_transposed,
+          out_transposed.strides(),
+          out_transposed.flags(),
+          out_transposed.data_size(),
+          out_transposed.offset());
+    } else {
+      copy_gpu(out_transposed, out, CopyType::General, s);
+    }
     out.set_status(array::Status::evaluated);
     return true;
   } catch (const std::runtime_error& e) {

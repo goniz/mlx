@@ -19,6 +19,11 @@
 
 namespace mlx::core {
 
+namespace vulkan {
+void clear_dequantized_weight_cache();
+void clear_mul_mm_transpose_cache();
+} // namespace vulkan
+
 namespace allocator {
 
 namespace {
@@ -678,6 +683,9 @@ size_t get_cache_memory() {
 }
 
 void clear_cache() {
+  vulkan::synchronize_all();
+  vulkan::clear_dequantized_weight_cache();
+  vulkan::clear_mul_mm_transpose_cache();
   vulkan::allocator().clear_cache();
 }
 

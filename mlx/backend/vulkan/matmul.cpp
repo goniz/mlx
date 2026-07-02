@@ -2540,6 +2540,15 @@ bool apply_block_mask_vulkan(
 
 } // namespace
 
+namespace vulkan {
+
+void clear_mul_mm_transpose_cache() {
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  mul_mm_transpose_cache().clear();
+}
+
+} // namespace vulkan
+
 bool try_eval_matmul_vulkan(
     const std::vector<array>& inputs,
     array& out,

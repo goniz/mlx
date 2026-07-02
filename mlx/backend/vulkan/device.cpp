@@ -107,10 +107,10 @@ uint32_t max_adaptive_deferred_ops() {
         const int parsed = std::stoi(env);
         return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
       } catch (...) {
-        return 128u;
+        return 32u;
       }
     }
-    return 128u;
+    return 32u;
   }();
   return value;
 }

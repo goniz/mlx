@@ -1055,6 +1055,11 @@ void main() {
 
 namespace vulkan {
 
+void clear_dequantized_weight_cache() {
+  std::lock_guard<std::mutex> lock(dequantized_weight_cache_mutex());
+  dequantized_weight_cache().clear();
+}
+
 bool affine_quantize_from_float32(
     const array& in,
     array& w,

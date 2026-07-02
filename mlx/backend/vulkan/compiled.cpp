@@ -1486,6 +1486,7 @@ void Compiled::eval_gpu(
           s.index, descriptor_epoch, descriptor_set);
     }
   }
+  vulkan::end_command_recording(s.index);
 }
 
 } // namespace mlx::core

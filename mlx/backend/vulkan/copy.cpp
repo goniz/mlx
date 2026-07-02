@@ -10,6 +10,8 @@
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
 #include "mlx/stream.h"
+#include "mlx/transforms.h"
+#include "mlx/transforms_impl.h"
 
 #include <algorithm>
 #include <cstring>
@@ -1412,8 +1414,17 @@ void copy_gpu_inplace(
   const array* source = &in;
   if (in.has_primitive()) {
     materialized_in.emplace(in);
-    if (materialized_in->status() == array::Status::unscheduled) {
-      materialized_in->eval();
+    if (detail::in_tracing() || detail::retain_graph()) {
+      if (materialized_in->status() == array::Status::unscheduled) {
+        materialized_in->eval();
+      }
+    } else {
+      auto data = materialized_in->data_shared_ptr();
+      if (materialized_in->status() != array::Status::unscheduled &&
+          (data == nullptr || data->buffer.ptr() == nullptr)) {
+        materialized_in->set_status(array::Status::unscheduled);
+      }
+      async_eval(*materialized_in);
     }
     source = &*materialized_in;
   } else {

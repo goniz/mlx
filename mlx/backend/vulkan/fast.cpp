@@ -1735,9 +1735,8 @@ void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
         "SDPA softmax requires float16 or float32 tensors.");
   }
 
-  array in_work = use_f16_variant ? cast_to_f32_sdpa(in, s) : in;
-  array out_work =
-      use_f16_variant ? array(out.shape(), float32, nullptr, {}) : out;
+  array in_work = in;
+  array out_work = out;
 
   in_work = ensure_sdpa_rowwise_layout(in_work, s);
   out_work.set_data(allocator::malloc(out_work.nbytes()));
@@ -1753,11 +1752,11 @@ void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
       vulkan::dispatch_softmax_large_op(
           in_work,
           out_work,
-          use_f16_variant ? vulkan::StaticShaderId::soft_max_large1_f32_f16
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large1_f16
                           : vulkan::StaticShaderId::soft_max_large1_f32,
-          use_f16_variant ? vulkan::StaticShaderId::soft_max_large2_f32_f16
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large2_f16
                           : vulkan::StaticShaderId::soft_max_large2_f32,
-          use_f16_variant ? vulkan::StaticShaderId::soft_max_large3_f32_f16
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large3_f16
                           : vulkan::StaticShaderId::soft_max_large3_f32,
           command_buffer,
           s);
@@ -1765,7 +1764,7 @@ void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
       vulkan::dispatch_softmax_op(
           in_work,
           out_work,
-          use_f16_variant ? vulkan::StaticShaderId::soft_max_f32_f16
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_f16
                           : vulkan::StaticShaderId::soft_max_f32,
           command_buffer,
           s);
@@ -1776,9 +1775,6 @@ void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
     throw;
   }
   end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
-  if (use_f16_variant) {
-    copy_gpu(out_work, out, CopyType::General, s);
-  }
   out.set_status(array::Status::evaluated);
 }
 

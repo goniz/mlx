@@ -1300,20 +1300,9 @@ void Compiled::eval_gpu(
     }
   }
 
-  array params_array({static_cast<int>(params_data.size())}, uint32, nullptr, {});
-  params_array.set_data(allocator::malloc(params_array.nbytes()));
-  auto* params_buffer =
-      static_cast<vulkan::VulkanBuffer*>(params_array.buffer().ptr());
-  if (params_buffer == nullptr || !params_buffer->buffer) {
-    throw std::runtime_error("Missing Vulkan params buffer for compiled kernel");
-  }
-  vulkan::enqueue_owned_staging_upload(
-      s,
-      params_data.data(),
-      params_array.nbytes(),
-      params_buffer->buffer,
-      params_array.offset() * size_of(params_array.dtype()),
-      params_array.data_shared_ptr());
+  auto params_array =
+      array(params_data.data(), {static_cast<int>(params_data.size())}, uint32);
+  params_array.eval();
   add_buffer(params_array);
   vulkan::retain_array_for_stream(s, params_array);
   writes.push_back({});
@@ -1338,7 +1327,7 @@ void Compiled::eval_gpu(
     }
   }
 
-  // Get command buffer after transfer uploads have been enqueued.
+  // Get command buffer
   auto cmd_buffer = vulkan::begin_command_recording(s.index);
   const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
 
@@ -1497,7 +1486,6 @@ void Compiled::eval_gpu(
           s.index, descriptor_epoch, descriptor_set);
     }
   }
-  vulkan::end_command_recording(s.index);
 }
 
 } // namespace mlx::core

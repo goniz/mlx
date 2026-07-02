@@ -73,7 +73,7 @@ bool try_eval_softmax_vulkan(
 
   const bool use_f16_variant = f16_io;
   const bool use_bf16_variant = bf16_io;
-  const bool use_f32_staging_io = f16_io;
+  const bool use_f32_staging_io = false;
   if (use_f32_staging_io) {
     array in_f32(in.shape(), float32, nullptr, {});
     copy_gpu(in, in_f32, CopyType::General, s);
@@ -134,15 +134,15 @@ bool try_eval_softmax_vulkan(
           out_kernel,
           use_bf16_variant ? vulkan::StaticShaderId::soft_max_large1_bf16
               : use_f16_variant
-              ? vulkan::StaticShaderId::soft_max_large1_f32_f16
+              ? vulkan::StaticShaderId::soft_max_large1_f16
               : vulkan::StaticShaderId::soft_max_large1_f32,
           use_bf16_variant ? vulkan::StaticShaderId::soft_max_large2_bf16
               : use_f16_variant
-              ? vulkan::StaticShaderId::soft_max_large2_f32_f16
+              ? vulkan::StaticShaderId::soft_max_large2_f16
               : vulkan::StaticShaderId::soft_max_large2_f32,
           use_bf16_variant ? vulkan::StaticShaderId::soft_max_large3_bf16
               : use_f16_variant
-              ? vulkan::StaticShaderId::soft_max_large3_f32_f16
+              ? vulkan::StaticShaderId::soft_max_large3_f16
               : vulkan::StaticShaderId::soft_max_large3_f32,
           command_buffer,
           s);
@@ -151,7 +151,7 @@ bool try_eval_softmax_vulkan(
           in_kernel,
           out_kernel,
           use_bf16_variant      ? vulkan::StaticShaderId::soft_max_bf16
-              : use_f16_variant ? vulkan::StaticShaderId::soft_max_f32_f16
+              : use_f16_variant ? vulkan::StaticShaderId::soft_max_f16
                                 : vulkan::StaticShaderId::soft_max_f32,
           command_buffer,
           s);

@@ -5,6 +5,7 @@
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
+#include "mlx/transforms.h"
 #include "mlx/utils.h"
 
 #include <algorithm>
@@ -18,7 +19,8 @@ const array* broadcast_scalar_source(const array& arr, const array& out) {
   if (!arr.has_primitive()) {
     return nullptr;
   }
-  if (typeid(arr.primitive()) != typeid(Broadcast) || arr.inputs().size() != 1) {
+  if (typeid(arr.primitive()) != typeid(Broadcast) ||
+      arr.inputs().size() != 1) {
     return nullptr;
   }
   const array& src = arr.inputs()[0];
@@ -107,7 +109,7 @@ bool is_supported_binary_input_layout(const array& arr, uint32_t max_offset) {
        offset_fits_binary_operand(arr, max_offset));
 }
 
-void ensure_materialized_scalar_input(array& arr) {
+void schedule_materialized_scalar_input(array& arr) {
   if (arr.data_size() != 1 || !arr.has_primitive()) {
     return;
   }
@@ -116,7 +118,7 @@ void ensure_materialized_scalar_input(array& arr) {
       (data == nullptr || data->buffer.ptr() == nullptr)) {
     arr.set_status(array::Status::unscheduled);
   }
-  arr.eval();
+  async_eval(arr);
 }
 
 bool ensure_vulkan_buffer(array& arr, Stream s) {
@@ -125,9 +127,21 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   }
 
   if (arr.has_primitive()) {
-    if (auto& p = arr.primitive();
-        typeid(p) == typeid(Broadcast) || typeid(p) == typeid(BroadcastAxes)) {
-      arr.eval();
+    auto data = arr.data_shared_ptr();
+    if (arr.status() != array::Status::unscheduled &&
+        (data == nullptr || data->buffer.ptr() == nullptr)) {
+      arr.set_status(array::Status::unscheduled);
+    }
+    async_eval(arr);
+    if (has_vulkan_buffer(arr)) {
+      return true;
+    }
+    if (!arr.has_primitive()) {
+      auto data = arr.data_shared_ptr();
+      if (data == nullptr || data->buffer.ptr() == nullptr) {
+        return false;
+      }
+      arr = contiguous_copy_gpu(arr, s);
       return has_vulkan_buffer(arr);
     }
     arr = contiguous_copy_gpu(arr, s);
@@ -665,14 +679,14 @@ std::string build_divmod_shader(Dtype dtype) {
   os << vulkan::emit_dynamic_shader_preamble(
       dtype, dtype, dtype == int64 || dtype == uint64);
   os << "layout(push_constant) uniform PushConstants { uint a_offset; uint b_offset; uint q_offset; uint r_offset; uint total_elements; } pc;\n";
-  os << "layout(set = 0, binding = 0) readonly buffer InputA {"
-     << type_name << " data[];} a_buf;\n";
-  os << "layout(set = 0, binding = 1) readonly buffer InputB {"
-     << type_name << " data[];} b_buf;\n";
-  os << "layout(set = 0, binding = 2) buffer Quotient {"
-     << type_name << " data[];} q_buf;\n";
-  os << "layout(set = 0, binding = 3) buffer Remainder {"
-     << type_name << " data[];} r_buf;\n\n";
+  os << "layout(set = 0, binding = 0) readonly buffer InputA {" << type_name
+     << " data[];} a_buf;\n";
+  os << "layout(set = 0, binding = 1) readonly buffer InputB {" << type_name
+     << " data[];} b_buf;\n";
+  os << "layout(set = 0, binding = 2) buffer Quotient {" << type_name
+     << " data[];} q_buf;\n";
+  os << "layout(set = 0, binding = 3) buffer Remainder {" << type_name
+     << " data[];} r_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
@@ -709,21 +723,20 @@ bool try_eval_divmod_vulkan(
   array b = b_input;
   auto& quotient = outputs[0];
   auto& remainder = outputs[1];
-  const bool float_case =
-      (a.dtype() == float16 || a.dtype() == float32) && a.dtype() == b.dtype() &&
-      a.dtype() == quotient.dtype() && a.dtype() == remainder.dtype();
-  const bool int_case = a.dtype() == b.dtype() && a.dtype() == quotient.dtype() &&
-      a.dtype() == remainder.dtype() &&
+  const bool float_case = (a.dtype() == float16 || a.dtype() == float32) &&
+      a.dtype() == b.dtype() && a.dtype() == quotient.dtype() &&
+      a.dtype() == remainder.dtype();
+  const bool int_case = a.dtype() == b.dtype() &&
+      a.dtype() == quotient.dtype() && a.dtype() == remainder.dtype() &&
       (a.dtype() == int16 || a.dtype() == uint16 || a.dtype() == int32 ||
        a.dtype() == uint32 || a.dtype() == int64 || a.dtype() == uint64);
-  if ((!float_case && !int_case) ||
-      quotient.shape() != remainder.shape()) {
+  if ((!float_case && !int_case) || quotient.shape() != remainder.shape()) {
     return false;
   }
 
   auto ensure_binary_input = [&](array& in) {
     if (in.data_size() == 1 && in.has_primitive()) {
-      ensure_materialized_scalar_input(in);
+      schedule_materialized_scalar_input(in);
     }
     return ensure_vulkan_buffer(in, s);
   };
@@ -799,8 +812,8 @@ bool try_eval_divmod_vulkan(
   vulkan::DynamicArrayRef arrays[] = {
       {&a, 0}, {&b, 1}, {&quotient_work, 2}, {&remainder_work, 3}};
   constexpr uint32_t kPushConstantSize = sizeof(uint32_t) * 5;
-  const std::string shader_name = "dynamic_divmod_v2_" +
-      std::to_string(static_cast<int>(a.dtype().val()));
+  const std::string shader_name =
+      "dynamic_divmod_v2_" + std::to_string(static_cast<int>(a.dtype().val()));
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name,
       build_divmod_shader(a.dtype()),
@@ -907,11 +920,11 @@ bool try_eval_binary_op_vulkan(
   const bool bool_add = std::is_same_v<Primitive, Add> &&
       a_input.dtype() == bool_ && b_input.dtype() == bool_ &&
       out.dtype() == bool_;
-  const bool small_signed_integer_case =
-      a_input.dtype() == b_input.dtype() && a_input.dtype() == out.dtype() &&
+  const bool small_signed_integer_case = a_input.dtype() == b_input.dtype() &&
+      a_input.dtype() == out.dtype() &&
       (a_input.dtype() == int8 || a_input.dtype() == int16);
-  const bool small_unsigned_integer_case =
-      a_input.dtype() == b_input.dtype() && a_input.dtype() == out.dtype() &&
+  const bool small_unsigned_integer_case = a_input.dtype() == b_input.dtype() &&
+      a_input.dtype() == out.dtype() &&
       (a_input.dtype() == uint8 || a_input.dtype() == uint16);
   const bool float_case = is_vulkan_float_dtype(a_input.dtype()) &&
       is_vulkan_float_dtype(b_input.dtype()) &&
@@ -919,29 +932,21 @@ bool try_eval_binary_op_vulkan(
   const bool integer_case = a_input.dtype() == b_input.dtype() &&
       a_input.dtype() == out.dtype() &&
       is_vulkan_integer_dtype(a_input.dtype());
-  const bool complex_add =
-      std::is_same_v<Primitive, Add> &&
+  const bool complex_add = std::is_same_v<Primitive, Add> &&
       is_same_complex_add(a_input, b_input, out);
-  const bool complex_sub =
-      std::is_same_v<Primitive, Subtract> &&
+  const bool complex_sub = std::is_same_v<Primitive, Subtract> &&
       is_same_complex_sub(a_input, b_input, out);
-  const bool complex_scalar_mul =
-      std::is_same_v<Primitive, Multiply> &&
+  const bool complex_scalar_mul = std::is_same_v<Primitive, Multiply> &&
       is_complex_scalar_mul(a_input, b_input, out);
-  const bool complex_float_mul =
-      std::is_same_v<Primitive, Multiply> &&
+  const bool complex_float_mul = std::is_same_v<Primitive, Multiply> &&
       is_complex_float_mul(a_input, b_input, out);
-  const bool complex_mul =
-      std::is_same_v<Primitive, Multiply> &&
+  const bool complex_mul = std::is_same_v<Primitive, Multiply> &&
       is_same_complex_mul(a_input, b_input, out);
-  const bool complex_div =
-      std::is_same_v<Primitive, Divide> &&
+  const bool complex_div = std::is_same_v<Primitive, Divide> &&
       is_same_complex_div(a_input, b_input, out);
-  const bool complex_max =
-      std::is_same_v<Primitive, Maximum> &&
+  const bool complex_max = std::is_same_v<Primitive, Maximum> &&
       is_same_complex_max(a_input, b_input, out);
-  const bool complex_min =
-      std::is_same_v<Primitive, Minimum> &&
+  const bool complex_min = std::is_same_v<Primitive, Minimum> &&
       is_same_complex_min(a_input, b_input, out);
   if (!float_case && !integer_case && !bool_add && !mixed_numeric_div &&
       !complex_add && !complex_sub && !complex_scalar_mul &&
@@ -960,14 +965,14 @@ bool try_eval_binary_op_vulkan(
       (input_broadcast_scalar_b != nullptr && a_input.size() > 1);
   const bool scalar_is_a = scalar_vector_case &&
       (a_input.data_size() == 1 || input_broadcast_scalar_a != nullptr);
-  const array* vector_input = scalar_vector_case
-      ? (scalar_is_a ? &b_input : &a_input)
-      : nullptr;
-  const bool can_donate_scalar_vector_input =
-      scalar_vector_case && std::is_same_v<Primitive, Multiply> &&
-      vector_input != nullptr && has_vulkan_buffer(*vector_input) &&
-      is_donatable(*vector_input, out) && vector_input->dtype() == out.dtype() &&
-      vector_input->shape() == out.shape() && vector_input->flags().row_contiguous &&
+  const array* vector_input =
+      scalar_vector_case ? (scalar_is_a ? &b_input : &a_input) : nullptr;
+  const bool can_donate_scalar_vector_input = scalar_vector_case &&
+      std::is_same_v<Primitive, Multiply> && vector_input != nullptr &&
+      has_vulkan_buffer(*vector_input) && is_donatable(*vector_input, out) &&
+      vector_input->dtype() == out.dtype() &&
+      vector_input->shape() == out.shape() &&
+      vector_input->flags().row_contiguous &&
       vector_input->flags().contiguous &&
       vector_input->size() == vector_input->data_size() &&
       vector_input->offset() == 0 && vector_input->ndim() == 1 &&
@@ -979,10 +984,10 @@ bool try_eval_binary_op_vulkan(
   if ((a.data_size() == 1 && a.has_primitive()) ||
       (b.data_size() == 1 && b.has_primitive())) {
     if (a.data_size() == 1 && a.has_primitive()) {
-      ensure_materialized_scalar_input(a);
+      schedule_materialized_scalar_input(a);
     }
     if (b.data_size() == 1 && b.has_primitive()) {
-      ensure_materialized_scalar_input(b);
+      schedule_materialized_scalar_input(b);
     }
   }
 
@@ -1089,8 +1094,7 @@ bool try_eval_binary_op_vulkan(
     array& scalar = scalar_is_a ? a : b;
     if (scalar.shape() != Shape{} && scalar.data_size() == 1) {
       array scalar_base(Shape{}, scalar.dtype(), nullptr, {});
-      scalar_base.copy_shared_buffer(
-          scalar, Strides{}, {true, true, true}, 1);
+      scalar_base.copy_shared_buffer(scalar, Strides{}, {true, true, true}, 1);
       scalar = scalar_base;
     }
   }
@@ -1103,57 +1107,57 @@ bool try_eval_binary_op_vulkan(
   bool b_materialized = false;
   auto materialize_broadcast_input =
       [&](array& in, bool& was_materialized, bool allow_scalar_view) {
-    if (in.shape() == out.shape()) {
-      if (in.data_size() == 1 && in.size() != 1) {
-        if (allow_scalar_view) {
-          array view(out.shape(), in.dtype(), nullptr, {});
-          broadcast(in, view);
-          in = view;
+        if (in.shape() == out.shape()) {
+          if (in.data_size() == 1 && in.size() != 1) {
+            if (allow_scalar_view) {
+              array view(out.shape(), in.dtype(), nullptr, {});
+              broadcast(in, view);
+              in = view;
+              was_materialized = true;
+              return true;
+            }
+            if (in.has_primitive()) {
+              schedule_materialized_scalar_input(in);
+            }
+            array materialized_arr(out.shape(), in.dtype(), nullptr, {});
+            copy_gpu(in, materialized_arr, CopyType::Scalar, s);
+            in = materialized_arr;
+            was_materialized = true;
+          }
+          return true;
+        }
+        if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
+          return false;
+        }
+        if (in.data_size() == 1) {
+          if (allow_scalar_view) {
+            array view(out.shape(), in.dtype(), nullptr, {});
+            broadcast(in, view);
+            in = view;
+            was_materialized = true;
+            return true;
+          }
+          array broadcast_arr(
+              out.shape(),
+              in.dtype(),
+              std::make_shared<Broadcast>(s, out.shape()),
+              {in});
+          schedule_materialized_scalar_input(broadcast_arr);
+          array materialized_arr(out.shape(), in.dtype(), nullptr, {});
+          copy_gpu(broadcast_arr, materialized_arr, CopyType::Scalar, s);
+          in = materialized_arr;
           was_materialized = true;
           return true;
         }
-        if (in.has_primitive()) {
-          ensure_materialized_scalar_input(in);
+        if (!ensure_vulkan_buffer(in, s)) {
+          return false;
         }
-        array materialized_arr(out.shape(), in.dtype(), nullptr, {});
-        copy_gpu(in, materialized_arr, CopyType::Scalar, s);
-        in = materialized_arr;
-        was_materialized = true;
-      }
-      return true;
-    }
-    if (broadcast_shapes(in.shape(), out.shape()) != out.shape()) {
-      return false;
-    }
-    if (in.data_size() == 1) {
-      if (allow_scalar_view) {
         array view(out.shape(), in.dtype(), nullptr, {});
         broadcast(in, view);
         in = view;
         was_materialized = true;
         return true;
-      }
-      array broadcast_arr(
-          out.shape(),
-          in.dtype(),
-          std::make_shared<Broadcast>(s, out.shape()),
-          {in});
-      ensure_materialized_scalar_input(broadcast_arr);
-      array materialized_arr(out.shape(), in.dtype(), nullptr, {});
-      copy_gpu(broadcast_arr, materialized_arr, CopyType::Scalar, s);
-      in = materialized_arr;
-      was_materialized = true;
-      return true;
-    }
-    if (!ensure_vulkan_buffer(in, s)) {
-      return false;
-    }
-    array view(out.shape(), in.dtype(), nullptr, {});
-    broadcast(in, view);
-    in = view;
-    was_materialized = true;
-    return true;
-  };
+      };
 
   const bool allow_subtract_scalar_rhs_view =
       std::is_same_v<Primitive, Subtract> && b.data_size() == 1;
@@ -1384,8 +1388,7 @@ VULKAN_BINARY_GPU(Multiply, "mul")
 
 void Remainder::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (!try_eval_remainder_vulkan(inputs, out, stream())) {
-    throw std::runtime_error(
-        "Remainder has no Vulkan implementation.");
+    throw std::runtime_error("Remainder has no Vulkan implementation.");
   }
 }
 

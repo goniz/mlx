@@ -11,6 +11,7 @@
 #include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
+#include "mlx/transforms.h"
 #include "mlx/utils.h"
 
 #include <array>
@@ -208,16 +209,14 @@ std::vector<vulkan::StaticShaderId> matvec_shader_candidates(
       return {
           vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16,
           vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16_subgroup,
-          vulkan::StaticShaderId::
-              mul_mat_vec_bf16_bf16_bf16_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16_subgroup_no_shmem,
       };
     }
     if (out_dtype == float32) {
       if (prefer_subgroup_matvec()) {
         return {
             vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32_subgroup,
-            vulkan::StaticShaderId::
-                mul_mat_vec_bf16_bf16_f32_subgroup_no_shmem,
+            vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32_subgroup_no_shmem,
             vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32,
         };
       }
@@ -811,6 +810,23 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   }
 
   if (arr.has_primitive()) {
+    auto data = arr.data_shared_ptr();
+    if (arr.status() != array::Status::unscheduled &&
+        (data == nullptr || data->buffer.ptr() == nullptr)) {
+      arr.set_status(array::Status::unscheduled);
+    }
+    async_eval(arr);
+    if (has_vulkan_buffer(arr)) {
+      return true;
+    }
+    if (!arr.has_primitive()) {
+      data = arr.data_shared_ptr();
+      if (data == nullptr || data->buffer.ptr() == nullptr) {
+        return false;
+      }
+      arr = contiguous_copy_gpu(arr, s);
+      return has_vulkan_buffer(arr);
+    }
     arr = contiguous_copy_gpu(arr, s);
     return has_vulkan_buffer(arr);
   }
@@ -824,7 +840,7 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   }
 
   auto data = arr.data_shared_ptr();
-  if (data == nullptr || !vulkan::is_vulkan_buffer(data->buffer)) {
+  if (data == nullptr || data->buffer.ptr() == nullptr) {
     return false;
   }
 
@@ -956,8 +972,7 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  const bool needs_out_copy =
-      !is_row_contiguous_zero_offset(out) ||
+  const bool needs_out_copy = !is_row_contiguous_zero_offset(out) ||
       (out.dtype() != float32 &&
        !(matrix.dtype() == bfloat16 &&
          (vec_shader_dtype == float16 || vec_shader_dtype == bfloat16) &&
@@ -1003,9 +1018,9 @@ bool try_eval_matvec_vulkan(
                   << " matrix_dtype=" << matrix.dtype()
                   << " vec_shape=" << vec.shape()
                   << " vec_dtype=" << vec.dtype()
-                  << " out_shape=" << out.shape() << " out_dtype="
-                  << out.dtype() << " needs_out_copy=" << needs_out_copy
-                  << "\n";
+                  << " out_shape=" << out.shape()
+                  << " out_dtype=" << out.dtype()
+                  << " needs_out_copy=" << needs_out_copy << "\n";
       }
       if (needs_out_copy) {
         vulkan::mark_scratch_array_written(s, kMatvecOutScratchLane);

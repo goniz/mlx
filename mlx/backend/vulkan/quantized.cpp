@@ -13,6 +13,10 @@
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms.h"
+#include "mlx/transforms_impl.h"
+
+#include <deque>
+#include <mutex>
 
 namespace mlx::core {
 namespace {
@@ -24,6 +28,143 @@ bool is_supported_quantized_bits(int bits) {
 
 bool is_supported_quantized_output_dtype(Dtype dtype) {
   return dtype == float16 || dtype == bfloat16 || dtype == float32;
+}
+
+constexpr size_t kDequantizedWeightCacheLimit = 8;
+
+struct CachedArrayIdentity {
+  std::weak_ptr<array::Data> data;
+  const array::Data* id{nullptr};
+  Shape shape;
+  Strides strides;
+  int64_t offset{0};
+  Dtype dtype;
+};
+
+struct DequantizedWeightCacheEntry {
+  CachedArrayIdentity w;
+  CachedArrayIdentity scales;
+  std::optional<CachedArrayIdentity> biases;
+  QuantizationMode mode;
+  int group_size{0};
+  int bits{0};
+  array dequantized;
+};
+
+std::mutex& dequantized_weight_cache_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::deque<DequantizedWeightCacheEntry>& dequantized_weight_cache() {
+  static std::deque<DequantizedWeightCacheEntry> cache;
+  return cache;
+}
+
+bool cacheable_dequant_source(const array& arr) {
+  return !arr.has_primitive() && arr.status() == array::Status::available &&
+      arr.data_shared_ptr() != nullptr;
+}
+
+std::optional<CachedArrayIdentity> make_cached_array_identity(
+    const array& arr) {
+  if (!cacheable_dequant_source(arr)) {
+    return std::nullopt;
+  }
+  auto data = arr.data_shared_ptr();
+  return CachedArrayIdentity{
+      data, data.get(), arr.shape(), arr.strides(), arr.offset(), arr.dtype()};
+}
+
+bool same_cached_array_identity(
+    const CachedArrayIdentity& cached,
+    const array& arr) {
+  auto data = arr.data_shared_ptr();
+  auto locked = cached.data.lock();
+  return data != nullptr && locked.get() == data.get() &&
+      cached.id == data.get() && cached.shape == arr.shape() &&
+      cached.strides == arr.strides() && cached.offset == arr.offset() &&
+      cached.dtype == arr.dtype();
+}
+
+bool dequantized_weight_cache_entry_alive(
+    const DequantizedWeightCacheEntry& entry) {
+  return !entry.w.data.expired() && !entry.scales.data.expired() &&
+      (!entry.biases.has_value() || !entry.biases->data.expired());
+}
+
+std::optional<array> find_cached_dequantized_weight(
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    QuantizationMode mode,
+    int group_size,
+    int bits) {
+  if (detail::in_tracing() || detail::retain_graph()) {
+    return std::nullopt;
+  }
+  std::lock_guard<std::mutex> lock(dequantized_weight_cache_mutex());
+  auto& cache = dequantized_weight_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (!dequantized_weight_cache_entry_alive(*it)) {
+      it = cache.erase(it);
+      continue;
+    }
+    const bool biases_match =
+        (!biases.has_value() && !it->biases.has_value()) ||
+        (biases.has_value() && it->biases.has_value() &&
+         same_cached_array_identity(*it->biases, *biases));
+    if (it->mode == mode && it->group_size == group_size &&
+        it->bits == bits && biases_match &&
+        same_cached_array_identity(it->w, w) &&
+        same_cached_array_identity(it->scales, scales)) {
+      auto cached = it->dequantized;
+      auto entry = std::move(*it);
+      cache.erase(it);
+      cache.push_back(std::move(entry));
+      return cached;
+    }
+    ++it;
+  }
+  return std::nullopt;
+}
+
+void cache_dequantized_weight(
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    QuantizationMode mode,
+    int group_size,
+    int bits,
+    const array& dequantized) {
+  if (detail::in_tracing() || detail::retain_graph() ||
+      dequantized.data_shared_ptr() == nullptr) {
+    return;
+  }
+  auto w_id = make_cached_array_identity(w);
+  auto scales_id = make_cached_array_identity(scales);
+  std::optional<CachedArrayIdentity> biases_id;
+  if (biases.has_value()) {
+    biases_id = make_cached_array_identity(*biases);
+  }
+  if (!w_id.has_value() || !scales_id.has_value() ||
+      (biases.has_value() && !biases_id.has_value())) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(dequantized_weight_cache_mutex());
+  auto& cache = dequantized_weight_cache();
+  cache.push_back(DequantizedWeightCacheEntry{
+      *w_id,
+      *scales_id,
+      biases_id,
+      mode,
+      group_size,
+      bits,
+      dequantized});
+  while (cache.size() > kDequantizedWeightCacheLimit) {
+    cache.pop_front();
+  }
 }
 
 bool fused_nvfp4_qqmm_enabled() {
@@ -1771,25 +1912,35 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   if (!fused_dispatched) {
     trace_qmm("dequant_fallback", "reason=fused_conditions_not_met");
-    array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
-    if (mode_ == QuantizationMode::Affine &&
-        !vulkan::affine_dequantize_to_float32(
-            w, scales, *biases, w_deq, s, group_size_, bits_)) {
-      throw std::runtime_error(
-          "[QuantizedMatmul::eval_gpu] Failed to dequantize weights on Vulkan.");
-    }
-    if (mode_ == QuantizationMode::Nvfp4 &&
-        !vulkan::nvfp4_dequantize_to_float32(
-            w, inputs[2], std::nullopt, w_deq, s)) {
-      throw std::runtime_error(
-          "[QuantizedMatmul::eval_gpu] Failed to dequantize FP weights on Vulkan.");
-    }
-    if ((mode_ == QuantizationMode::Mxfp4 ||
-         mode_ == QuantizationMode::Mxfp8) &&
-        !vulkan::fp_dequantize_to_float32(
-            w, inputs[2], w_deq, s, group_size_, bits_)) {
-      throw std::runtime_error(
-          "[QuantizedMatmul::eval_gpu] Failed to dequantize FP weights on Vulkan.");
+    std::optional<array> cache_biases =
+        mode_ == QuantizationMode::Affine ? biases : std::nullopt;
+    auto cached_w_deq = find_cached_dequantized_weight(
+        w, inputs[2], cache_biases, mode_, group_size_, bits_);
+    array w_deq = cached_w_deq.value_or(
+        array(expanded_quantized_shape(w, bits_), float32, nullptr, {}));
+    if (!cached_w_deq.has_value()) {
+      if (mode_ == QuantizationMode::Affine &&
+          !vulkan::affine_dequantize_to_float32(
+              w, scales, *biases, w_deq, s, group_size_, bits_)) {
+        throw std::runtime_error(
+            "[QuantizedMatmul::eval_gpu] Failed to dequantize weights on Vulkan.");
+      }
+      if (mode_ == QuantizationMode::Nvfp4 &&
+          !vulkan::nvfp4_dequantize_to_float32(
+              w, inputs[2], std::nullopt, w_deq, s)) {
+        throw std::runtime_error(
+            "[QuantizedMatmul::eval_gpu] Failed to dequantize FP weights on Vulkan.");
+      }
+      if ((mode_ == QuantizationMode::Mxfp4 ||
+           mode_ == QuantizationMode::Mxfp8) &&
+          !vulkan::fp_dequantize_to_float32(
+              w, inputs[2], w_deq, s, group_size_, bits_)) {
+        throw std::runtime_error(
+            "[QuantizedMatmul::eval_gpu] Failed to dequantize FP weights on Vulkan.");
+      }
+      w_deq.set_status(array::Status::evaluated);
+      cache_dequantized_weight(
+          w, inputs[2], cache_biases, mode_, group_size_, bits_, w_deq);
     }
 
     array rhs_f32 = transpose_ ? swapaxes_in_eval(w_deq, -1, -2) : w_deq;

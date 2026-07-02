@@ -188,6 +188,17 @@ std::string gather_index_suffix(Dtype dtype) {
   MLX_VK_BINARY_CASE(                                                      \
       OP, float32, bfloat16, bfloat16, true, PREFIX##_f32_bf16_bf16_rte)
 
+#define MLX_VK_BF16_DIVIDE_CASES()                                          \
+  MLX_VK_BF16_BINARY_CASES(Divide, div)                                     \
+  MLX_VK_BINARY_CASE(                                                       \
+      Divide, bfloat16, float32, float32, false, div_bf16_f32_f32)          \
+  MLX_VK_BINARY_CASE(                                                       \
+      Divide, bfloat16, float32, float32, true, div_bf16_f32_f32_rte)       \
+  MLX_VK_BINARY_CASE(                                                       \
+      Divide, float32, bfloat16, float32, false, div_f32_bf16_f32)          \
+  MLX_VK_BINARY_CASE(                                                       \
+      Divide, float32, bfloat16, float32, true, div_f32_bf16_f32_rte)
+
 #define MLX_VK_INTEGER_BINARY_CASES(OP, PREFIX)                               \
   MLX_VK_BINARY_CASE(OP, int32, int32, int32, false, PREFIX##_i32_i32_i32)    \
   MLX_VK_BINARY_CASE(OP, int64, int64, int64, false, PREFIX##_i64_i64_i64)    \
@@ -203,6 +214,7 @@ std::optional<vulkan::StaticShaderId> binary_shader_id(
   MLX_VK_FLOAT_BINARY_CASES(Add, add);
   MLX_VK_BF16_BINARY_CASES(Add, add);
   MLX_VK_FLOAT_BINARY_CASES(Divide, div);
+  MLX_VK_BF16_DIVIDE_CASES();
   MLX_VK_FLOAT_BINARY_CASES(Maximum, maximum);
   MLX_VK_BF16_BINARY_CASES(Maximum, maximum);
   MLX_VK_FLOAT_BINARY_CASES(Minimum, minimum);

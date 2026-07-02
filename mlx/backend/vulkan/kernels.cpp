@@ -241,7 +241,8 @@ PipelineCreationOptions pipeline_creation_options(
     const std::vector<uint32_t>& specialization_constants) {
   PipelineCreationOptions options;
 
-  if ((shader_name == "soft_max_f32" || shader_name == "soft_max_f32_f16") &&
+  if ((shader_name == "soft_max_f32" || shader_name == "soft_max_f32_f16" ||
+       shader_name == "soft_max_bf16") &&
       !specialization_constants.empty()) {
     options.required_subgroup_size = specialization_constants[0];
     return options;

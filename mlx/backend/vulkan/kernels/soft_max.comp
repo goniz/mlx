@@ -37,6 +37,38 @@ layout (binding = 3) buffer D {D_TYPE data_d[];};
 
 shared FLOAT_TYPE vals[BLOCK_SIZE];
 
+FLOAT_TYPE load_a(uint idx) {
+#if defined(DATA_A_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_a[idx])));
+#else
+    return FLOAT_TYPE(data_a[idx]);
+#endif
+}
+
+FLOAT_TYPE load_b(uint idx) {
+#if defined(DATA_B_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_b[idx])));
+#else
+    return FLOAT_TYPE(data_b[idx]);
+#endif
+}
+
+void store_d(uint idx, FLOAT_TYPE value) {
+#if defined(DATA_D_BF16)
+    data_d[idx] = D_TYPE(fp32_to_bf16(float(value)));
+#else
+    data_d[idx] = D_TYPE(value);
+#endif
+}
+
+FLOAT_TYPE load_d(uint idx) {
+#if defined(DATA_D_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_d[idx])));
+#else
+    return FLOAT_TYPE(data_d[idx]);
+#endif
+}
+
 bool use_subgroup_reduction() {
     return gl_NumSubgroups == 1;
 }
@@ -124,12 +156,12 @@ void soft_max(uint num_iters) {
 
         FLOAT_TYPE a = FLOAT_TYPE(0);
         if (col < p.KX) {
-            a = data_a[rowx * p.KX + col];
+            a = load_a(rowx * p.KX + col);
         }
 
         FLOAT_TYPE b = FLOAT_TYPE(0);
         if (p.KY > 0 && col < p.KX) {
-            b = data_b[rowy_start + col];
+            b = load_b(rowy_start + col);
         }
 
         FLOAT_TYPE v = a * p.scale + slope * b;
@@ -149,7 +181,7 @@ void soft_max(uint num_iters) {
         [[unroll]] for (uint col0 = 0; col0 < num_iters * BLOCK_SIZE; col0 += BLOCK_SIZE) {
             const uint col = col0 + tid;
             if (col < p.KX) {
-                data_d[rowx * p.KX + col] = D_TYPE(FLOAT_TYPE(0.0f));
+                store_d(rowx * p.KX + col, FLOAT_TYPE(0.0f));
             }
         }
         return;
@@ -173,8 +205,8 @@ void soft_max(uint num_iters) {
             const FLOAT_TYPE diff = data_cache[idx] - max_val;
             val = abs(diff) <= FLOAT_TYPE(1e-6f) ? FLOAT_TYPE(1.0f) : exp(diff);
         } else {
-            const FLOAT_TYPE diff = FLOAT_TYPE(data_a[i]) * p.scale +
-                (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0.0f)) -
+            const FLOAT_TYPE diff = load_a(i) * p.scale +
+                (p.KY > 0 ? slope * load_b(rowy_start + col) : FLOAT_TYPE(0.0f)) -
                 max_val;
             val = abs(diff) <= FLOAT_TYPE(1e-6f) ? FLOAT_TYPE(1.0f) : exp(diff);
         }
@@ -204,13 +236,13 @@ void soft_max(uint num_iters) {
         }
 
         const FLOAT_TYPE normalized =
-            (idx < DATA_CACHE_SIZE ? data_cache[idx] : FLOAT_TYPE(data_d[rowx*p.KX + col])) *
+            (idx < DATA_CACHE_SIZE ? data_cache[idx] : load_d(rowx*p.KX + col)) *
             rcpdivisor;
         normalized_sum += normalized;
         if (idx < DATA_CACHE_SIZE) {
-            data_d[rowx*p.KX + col] = D_TYPE(normalized);
+            store_d(rowx*p.KX + col, normalized);
         } else {
-            data_d[rowx*p.KX + col] = D_TYPE(normalized);
+            store_d(rowx*p.KX + col, normalized);
         }
     }
 
@@ -218,8 +250,9 @@ void soft_max(uint num_iters) {
     if (tid == 0 && p.KX > 0) {
         // Keep the row sum pinned to exactly 1 for finite rows while the
         // fully-masked case above still returns all zeros.
-        data_d[rowx * p.KX] =
-            D_TYPE(FLOAT_TYPE(data_d[rowx * p.KX]) + (FLOAT_TYPE(1.0f) - normalized_sum));
+        store_d(
+            rowx * p.KX,
+            load_d(rowx * p.KX) + (FLOAT_TYPE(1.0f) - normalized_sum));
     }
 }
 

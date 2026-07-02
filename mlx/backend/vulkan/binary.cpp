@@ -1067,8 +1067,7 @@ bool try_eval_binary_op_vulkan(
   const bool use_f32_staging_io =
       (std::string_view(op_name) == "div" &&
        (a.dtype() == float16 || b.dtype() == float16 ||
-        out.dtype() == float16 || a.dtype() == bfloat16 ||
-        b.dtype() == bfloat16 || out.dtype() == bfloat16)) ||
+        out.dtype() == float16)) ||
       mixed_bf16_f16;
   if (use_f32_staging_io) {
     array a_f32(a.shape(), float32, nullptr, {});

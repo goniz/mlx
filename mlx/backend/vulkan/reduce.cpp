@@ -448,7 +448,7 @@ bool try_eval_reduce_sum_rows_vulkan(
 
   const bool use_f32_staging_io =
       (sum_reduce || prod_reduce || max_reduce || min_reduce) &&
-      (f16_io || bf16_io || bool_sum || bool_prod);
+      (f16_io || bool_sum || bool_prod);
   const bool use_i32_staging_io = (sum_reduce || prod_reduce) &&
       ((in.dtype() == int8 || in.dtype() == int16) && out.dtype() == int32);
   const bool use_u8_staging_io = logic_reduce || bool_min_max;
@@ -725,12 +725,16 @@ bool try_eval_reduce_sum_rows_vulkan(
         }
         auto command_buffer = vulkan::begin_command_recording(s.index);
         const auto shader_id = integer_shader ? *integer_shader
-            : sum_reduce   ? vulkan::StaticShaderId::sum_rows_f32
-            : prod_reduce  ? vulkan::StaticShaderId::prod_rows_f32
+            : sum_reduce   ? (bf16_io ? vulkan::StaticShaderId::sum_rows_bf16
+                                      : vulkan::StaticShaderId::sum_rows_f32)
+            : prod_reduce  ? (bf16_io ? vulkan::StaticShaderId::prod_rows_bf16
+                                      : vulkan::StaticShaderId::prod_rows_f32)
             : bool_min_max ? (max_reduce ? vulkan::StaticShaderId::any_rows_u8
                                          : vulkan::StaticShaderId::all_rows_u8)
-            : max_reduce   ? vulkan::StaticShaderId::max_rows_f32
-            : min_reduce   ? vulkan::StaticShaderId::min_rows_f32
+            : max_reduce   ? (bf16_io ? vulkan::StaticShaderId::max_rows_bf16
+                                      : vulkan::StaticShaderId::max_rows_f32)
+            : min_reduce   ? (bf16_io ? vulkan::StaticShaderId::min_rows_bf16
+                                      : vulkan::StaticShaderId::min_rows_f32)
             : reduce_type == Reduce::And ? vulkan::StaticShaderId::all_rows_u8
                                          : vulkan::StaticShaderId::any_rows_u8;
         vulkan::dispatch_sum_rows_op(

@@ -36,6 +36,38 @@ layout (binding = 5) buffer S {float data_s[];};
 
 shared FLOAT_TYPE vals[BLOCK_SIZE];
 
+FLOAT_TYPE load_a(uint idx) {
+#if defined(DATA_A_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_a[idx])));
+#else
+    return FLOAT_TYPE(data_a[idx]);
+#endif
+}
+
+FLOAT_TYPE load_b(uint idx) {
+#if defined(DATA_B_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_b[idx])));
+#else
+    return FLOAT_TYPE(data_b[idx]);
+#endif
+}
+
+FLOAT_TYPE load_d(uint idx) {
+#if defined(DATA_D_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_d[idx])));
+#else
+    return FLOAT_TYPE(data_d[idx]);
+#endif
+}
+
+void store_d(uint idx, FLOAT_TYPE value) {
+#if defined(DATA_D_BF16)
+    data_d[idx] = D_TYPE(fp32_to_bf16(float(value)));
+#else
+    data_d[idx] = D_TYPE(value);
+#endif
+}
+
 float get_slope(uint rowx) {
     float slope = 1.0f;
 

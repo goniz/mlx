@@ -2041,10 +2041,6 @@ void process_shaders() {
            {std::string("f32"), std::string("f16"), std::string("bf16")}) {
         for (const auto& dst :
              {std::string("f32"), std::string("f16"), std::string("bf16")}) {
-          if (op == "div" &&
-              (src0 == "bf16" || src1 == "bf16" || dst == "bf16")) {
-            continue;
-          }
           if (op == "add_rms" &&
               (src0 == "bf16" || src1 == "bf16" || dst == "bf16")) {
             continue;
@@ -2860,6 +2856,16 @@ void process_shaders() {
           base_dict,
           {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
   string_to_spv(
+      "soft_max_bf16",
+      "soft_max.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"B_TYPE", "float"},
+           {"D_TYPE", "uint16_t"},
+           {"DATA_A_BF16", "1"},
+           {"DATA_D_BF16", "1"}}));
+  string_to_spv(
       "soft_max_back_f32",
       "soft_max_back.comp",
       merge_maps(
@@ -2921,6 +2927,36 @@ void process_shaders() {
       merge_maps(
           base_dict,
           {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
+  string_to_spv(
+      "soft_max_large1_bf16",
+      "soft_max_large1.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"B_TYPE", "float"},
+           {"D_TYPE", "uint16_t"},
+           {"DATA_A_BF16", "1"},
+           {"DATA_D_BF16", "1"}}));
+  string_to_spv(
+      "soft_max_large2_bf16",
+      "soft_max_large2.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"B_TYPE", "float"},
+           {"D_TYPE", "uint16_t"},
+           {"DATA_A_BF16", "1"},
+           {"DATA_D_BF16", "1"}}));
+  string_to_spv(
+      "soft_max_large3_bf16",
+      "soft_max_large3.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"B_TYPE", "float"},
+           {"D_TYPE", "uint16_t"},
+           {"DATA_A_BF16", "1"},
+           {"DATA_D_BF16", "1"}}));
 
   string_to_spv(
       "rope_norm_f32",
@@ -3076,17 +3112,53 @@ void process_shaders() {
       "sum_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv(
+      "sum_rows_bf16",
+      "sum_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"D_TYPE", "uint16_t"},
+           {"DATA_A_BF16", "1"},
+           {"DATA_D_BF16", "1"}}));
+  string_to_spv(
       "prod_rows_f32",
       "prod_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv(
+      "prod_rows_bf16",
+      "prod_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"D_TYPE", "uint16_t"},
+           {"DATA_A_BF16", "1"},
+           {"DATA_D_BF16", "1"}}));
   string_to_spv(
       "max_rows_f32",
       "max_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv(
+      "max_rows_bf16",
+      "max_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"D_TYPE", "uint16_t"},
+           {"DATA_A_BF16", "1"},
+           {"DATA_D_BF16", "1"}}));
+  string_to_spv(
       "min_rows_f32",
       "min_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv(
+      "min_rows_bf16",
+      "min_rows.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "uint16_t"},
+           {"D_TYPE", "uint16_t"},
+           {"DATA_A_BF16", "1"},
+           {"DATA_D_BF16", "1"}}));
   string_to_spv(
       "sum_rows_u8_u32",
       "integer_rows.comp",

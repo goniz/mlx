@@ -220,18 +220,26 @@ size_t cache_pool_limit(size_t active_memory, size_t max_pool_size) {
   return max_pool_size;
 }
 
+struct PreferredMemoryType {
+  vk::MemoryPropertyFlags required;
+  vk::MemoryPropertyFlags forbidden;
+};
+
 uint32_t find_memory_type_index(
     const VulkanContext& ctx,
     uint32_t type_filter,
-    const std::vector<vk::MemoryPropertyFlags>& preferred_flags) {
-  for (auto flags : preferred_flags) {
-    try {
-      // Convert vk::MemoryPropertyFlags to VkMemoryPropertyFlags
-      // This is safe since they're the same underlying type
-      VkMemoryPropertyFlags vk_flags =
-          static_cast<VkMemoryPropertyFlags>(flags);
-      return ctx.find_memory_type(type_filter, vk_flags);
-    } catch (const std::runtime_error&) {
+    const std::vector<PreferredMemoryType>& preferred_types) {
+  const auto mem_props = ctx.memory_properties();
+  for (const auto& preference : preferred_types) {
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+      if ((type_filter & (1u << i)) == 0) {
+        continue;
+      }
+      const auto flags = mem_props.memoryTypes[i].propertyFlags;
+      if ((flags & preference.required) == preference.required &&
+          (flags & preference.forbidden) == vk::MemoryPropertyFlags{}) {
+        return i;
+      }
     }
   }
   throw std::runtime_error("[vulkan::malloc] No suitable memory type found.");
@@ -248,7 +256,11 @@ void clear_alloc_trace_primitive() {
 }
 
 VulkanAllocator::VulkanAllocator()
-    : buffer_cache_(
+    : device_buffer_cache_(
+          query_page_size(),
+          [](VulkanBuffer* buf) { return buf->allocation_size; },
+          [this](VulkanBuffer* buf) { free_vulkan_buffer(buf); }),
+      host_visible_buffer_cache_(
           query_page_size(),
           [](VulkanBuffer* buf) { return buf->allocation_size; },
           [this](VulkanBuffer* buf) { free_vulkan_buffer(buf); }) {
@@ -286,8 +298,8 @@ size_t VulkanAllocator::set_cache_limit(size_t limit) {
   std::swap(limit, max_pool_size_);
   max_cacheable_size_ = default_max_cacheable_size(max_pool_size_);
   if (get_cache_memory() > max_pool_size_) {
-    num_resources_ -= buffer_cache_.release_cached_buffers(
-        get_cache_memory() - max_pool_size_);
+    num_resources_ -=
+        release_cached_buffers(get_cache_memory() - max_pool_size_);
   }
   return limit;
 }
@@ -314,7 +326,8 @@ size_t VulkanAllocator::set_wired_limit(size_t limit) {
 
 void VulkanAllocator::clear_cache() {
   std::unique_lock lk(mutex_);
-  num_resources_ -= buffer_cache_.clear();
+  num_resources_ -= device_buffer_cache_.clear();
+  num_resources_ -= host_visible_buffer_cache_.clear();
 }
 
 bool VulkanAllocator::owns(Buffer buffer) const {
@@ -327,18 +340,58 @@ bool VulkanAllocator::owns(Buffer buffer) const {
   return live_buffers_.contains(vk_buffer);
 }
 
+size_t VulkanAllocator::get_cache_memory() const {
+  return device_buffer_cache_.cache_size() +
+      host_visible_buffer_cache_.cache_size();
+}
+
+size_t VulkanAllocator::release_cached_buffers(size_t min_bytes_to_free) {
+  if (min_bytes_to_free == 0) {
+    return 0;
+  }
+  size_t released = 0;
+  const size_t device_cache_memory = device_buffer_cache_.cache_size();
+  if (device_cache_memory > 0) {
+    const size_t device_bytes_to_free =
+        std::min(min_bytes_to_free, device_cache_memory);
+    released +=
+        device_buffer_cache_.release_cached_buffers(device_bytes_to_free);
+  }
+  const size_t remaining = min_bytes_to_free > device_cache_memory
+      ? min_bytes_to_free - device_cache_memory
+      : 0;
+  if (remaining > 0 && host_visible_buffer_cache_.cache_size() > 0) {
+    released += host_visible_buffer_cache_.release_cached_buffers(remaining);
+  }
+  return released;
+}
+
 Buffer VulkanAllocator::malloc(size_t size) {
+  return malloc_impl(size, false);
+}
+
+Buffer VulkanAllocator::malloc_host_visible(size_t size) {
+  return malloc_impl(size, true);
+}
+
+Buffer VulkanAllocator::malloc_impl(size_t size, bool require_host_visible) {
   if (size == 0) {
     return Buffer{nullptr};
   }
 
+  auto& ctx = VulkanContext::get();
+  const bool use_device_local_cache =
+      !require_host_visible && !ctx.is_unified_memory();
+  auto& buffer_cache = use_device_local_cache ? device_buffer_cache_
+                                              : host_visible_buffer_cache_;
+
   // Try to reuse a buffer from the cache.
   {
     std::unique_lock lk(mutex_);
-    auto* cached = buffer_cache_.reuse_from_cache(size);
+    auto* cached = buffer_cache.reuse_from_cache(size);
     if (cached) {
-      if (cached->allocation_size > size + buffer_cache_.page_size()) {
-        buffer_cache_.recycle_to_cache(cached);
+      if (cached->allocation_size > size + buffer_cache.page_size()) {
+        buffer_cache.recycle_to_cache(cached);
       } else {
         cached->size = size;
         reset_buffer_sync_state(cached);
@@ -354,12 +407,11 @@ Buffer VulkanAllocator::malloc(size_t size) {
     int64_t mem_to_free =
         get_active_memory() + get_cache_memory() + size - gc_limit_;
     if (mem_to_free > 0) {
-      num_resources_ -= buffer_cache_.release_cached_buffers(mem_to_free);
+      num_resources_ -= release_cached_buffers(mem_to_free);
     }
 
     if (num_resources_ >= resource_limit_) {
-      num_resources_ -=
-          buffer_cache_.release_cached_buffers(get_cache_memory());
+      num_resources_ -= release_cached_buffers(get_cache_memory());
       if (num_resources_ >= resource_limit_) {
         std::ostringstream msg;
         msg << "[vulkan::malloc] Resource limit (" << resource_limit_
@@ -369,7 +421,6 @@ Buffer VulkanAllocator::malloc(size_t size) {
     }
   }
 
-  auto& ctx = VulkanContext::get();
   auto vk_device = ctx.device();
 
   // Use C++ Vulkan API for buffer creation
@@ -405,24 +456,53 @@ Buffer VulkanAllocator::malloc(size_t size) {
     }
   }
 
-  std::vector<vk::MemoryPropertyFlags> preferred_memory_types;
-  if (ctx.is_unified_memory()) {
+  std::vector<PreferredMemoryType> preferred_memory_types;
+  if (require_host_visible && ctx.is_unified_memory()) {
     preferred_memory_types = {
-        vk::MemoryPropertyFlagBits::eDeviceLocal |
-            vk::MemoryPropertyFlagBits::eHostVisible |
-            vk::MemoryPropertyFlagBits::eHostCoherent,
-        vk::MemoryPropertyFlagBits::eHostVisible |
-            vk::MemoryPropertyFlagBits::eHostCoherent};
+        {vk::MemoryPropertyFlagBits::eDeviceLocal |
+             vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent,
+         {}},
+        {vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent,
+         {}}};
+  } else if (require_host_visible) {
+    preferred_memory_types = {
+        {vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent |
+             vk::MemoryPropertyFlagBits::eHostCached,
+         {}},
+        {vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent,
+         {}},
+        {vk::MemoryPropertyFlagBits::eDeviceLocal |
+             vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent,
+         {}}};
+  } else if (ctx.is_unified_memory()) {
+    preferred_memory_types = {
+        {vk::MemoryPropertyFlagBits::eDeviceLocal |
+             vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent,
+         {}},
+        {vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent,
+         {}}};
   } else {
     preferred_memory_types = {
-        vk::MemoryPropertyFlagBits::eDeviceLocal |
-            vk::MemoryPropertyFlagBits::eHostVisible |
-            vk::MemoryPropertyFlagBits::eHostCoherent,
-        vk::MemoryPropertyFlagBits::eHostVisible |
-            vk::MemoryPropertyFlagBits::eHostCoherent,
-        vk::MemoryPropertyFlagBits::eHostVisible |
-            vk::MemoryPropertyFlagBits::eHostCoherent |
-            vk::MemoryPropertyFlagBits::eHostCached};
+        {vk::MemoryPropertyFlagBits::eDeviceLocal,
+         vk::MemoryPropertyFlagBits::eHostVisible},
+        {vk::MemoryPropertyFlagBits::eDeviceLocal |
+             vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent,
+         {}},
+        {vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent,
+         {}},
+        {vk::MemoryPropertyFlagBits::eHostVisible |
+             vk::MemoryPropertyFlagBits::eHostCoherent |
+             vk::MemoryPropertyFlagBits::eHostCached,
+         {}}};
   }
 
   uint32_t memory_type_index = 0;
@@ -469,8 +549,7 @@ Buffer VulkanAllocator::malloc(size_t size) {
     // Maintain the cache below the requested limit.
     const auto pool_limit = cache_pool_limit(active_memory_, max_pool_size_);
     if (get_cache_memory() > pool_limit) {
-      num_resources_ -= buffer_cache_.release_cached_buffers(
-          get_cache_memory() - pool_limit);
+      num_resources_ -= release_cached_buffers(get_cache_memory() - pool_limit);
     }
   }
 
@@ -497,7 +576,11 @@ void VulkanAllocator::free(Buffer buffer) {
     if (buf->allocation_size <= cacheable_limit &&
         get_cache_memory() + buf->allocation_size <= pool_limit) {
       reset_buffer_sync_state(buf);
-      buffer_cache_.recycle_to_cache(buf);
+      if (buf->memory_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        host_visible_buffer_cache_.recycle_to_cache(buf);
+      } else {
+        device_buffer_cache_.recycle_to_cache(buf);
+      }
       trace_free(buf->size, true);
       return;
     }
@@ -511,6 +594,9 @@ void VulkanAllocator::free(Buffer buffer) {
 
 void VulkanAllocator::free_vulkan_buffer(VulkanBuffer* buf) {
   auto vk_device = VulkanContext::get().device();
+  if (buf->mapped_ptr != nullptr) {
+    vk_device.unmapMemory(buf->memory);
+  }
   vk_device.destroyBuffer(buf->buffer);
   vk_device.freeMemory(buf->memory);
   delete buf;

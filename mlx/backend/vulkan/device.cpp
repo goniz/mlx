@@ -532,7 +532,8 @@ constexpr size_t kStagingArenaAlignment = 256;
 constexpr size_t kDefaultStagingArenaBytes = 1 << 20;
 
 std::shared_ptr<array::Data> make_owned_staging_allocation(size_t size) {
-  auto data = std::make_shared<array::Data>(allocator::malloc(size));
+  auto data =
+      std::make_shared<array::Data>(allocator().malloc_host_visible(size));
   auto* buffer = static_cast<VulkanBuffer*>(data->buffer.ptr());
   if (buffer == nullptr || !buffer->buffer || buffer->mapped_ptr == nullptr) {
     throw std::runtime_error(

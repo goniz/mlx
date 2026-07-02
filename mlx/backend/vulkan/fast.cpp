@@ -1446,6 +1446,11 @@ bool is_supported_sdpa_rowwise_layout(const array& arr) {
       arr.strides().back() == 1;
 }
 
+bool is_supported_sdpa_matvec_layout(const array& arr) {
+  return arr.flags().row_contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
+      arr.strides().back() == 1;
+}
+
 bool has_vulkan_buffer_fast(const array& arr) {
   auto data = arr.data_shared_ptr();
   return data != nullptr && data->buffer.ptr() != nullptr;
@@ -1943,14 +1948,10 @@ bool try_eval_sdpa_heads_vulkan(
       // q: scale + cast to f32
       array q_f32 =
           cast_to_f32_sdpa(multiply(array(scale, q_in.dtype()), q_in, s), s);
-      // K/V: cast original (bf16/f16) directly to f16 for NC matvec.
-      array k_f16(k_in.shape(), float16, nullptr, {});
-      copy_gpu(k_in, k_f16, CopyType::General, s);
-      k_f16.set_status(array::Status::evaluated);
-
-      array v_f16(v_in.shape(), float16, nullptr, {});
-      copy_gpu(v_in, v_f16, CopyType::General, s);
-      v_f16.set_status(array::Status::evaluated);
+      // K: reuse f16 KV cache buffers directly when possible. bf16 still needs
+      // one conversion pass because the NC matvec kernel consumes f16 matrices.
+      array k_f16 =
+          cast_flash_attention_kv_to_f16(k_in, kFlashAttnKCastScratchLane, s);
 
       // q in head layout, must be contiguous for matvec
       stage = "reshape_q_decode";
@@ -1959,9 +1960,9 @@ bool try_eval_sdpa_heads_vulkan(
       q_heads = ensure_sdpa_rowwise_layout(q_heads, s);
       q_heads.set_status(array::Status::evaluated);
 
-      // k is already in [batch, n_kv_heads, kv_len, q_dim] f16.
-      // Ensure k is row-contiguous so matvec strides are trivial.
-      if (!is_supported_sdpa_rowwise_layout(k_f16)) {
+      // k is already in [batch, n_kv_heads, kv_len, q_dim] f16. The NC matvec
+      // accepts explicit outer strides, so only require a dense inner row.
+      if (!is_supported_sdpa_matvec_layout(k_f16)) {
         k_f16 = contiguous_copy_gpu(k_f16, s);
       }
       k_f16.set_status(array::Status::evaluated);
@@ -2068,16 +2069,12 @@ bool try_eval_sdpa_heads_vulkan(
       // --- Scores×V matvec via NC dispatch (matrix = v_f16, vec = probs)
       // ------
       stage = "result_matmul_decode";
-      // Ensure v_f16 is contiguous before swapaxes
-      if (!is_supported_sdpa_rowwise_layout(v_f16)) {
-        v_f16 = contiguous_copy_gpu(v_f16, s);
-      }
-      v_f16.set_status(array::Status::evaluated);
-
-      array v_t = swapaxes_in_eval(v_f16, -1, -2);
-      if (!is_supported_sdpa_rowwise_layout(v_t)) {
-        v_t = contiguous_copy_gpu(v_t, s);
-      }
+      Shape v_t_shape = v_in.shape();
+      std::swap(v_t_shape[v_t_shape.size() - 2], v_t_shape.back());
+      array v_src = swap_sdpa_last_two_dims_view(v_in);
+      array v_t = vulkan::acquire_scratch_array(
+          s, kFlashAttnVCastScratchLane, v_t_shape, float16);
+      copy_gpu(v_src, v_t, CopyType::General, s);
       v_t.set_status(array::Status::evaluated);
 
       {

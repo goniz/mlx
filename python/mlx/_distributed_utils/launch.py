@@ -49,7 +49,7 @@ class RemoteProcess(CommandProcess):
         is_local = host == "127.0.0.1"
         cmd = RemoteProcess.make_launch_script(rank, cwd, files, env, command, is_local)
         if not is_local:
-            cmd = f"ssh -tt -o LogLevel=QUIET {host} {shlex.quote(cmd)}"
+            cmd = f"ssh -tt -o LogLevel=QUIET {shlex.quote(host)} {shlex.quote(cmd)}"
 
         self._host = host
         self._pidfile = None
@@ -91,7 +91,7 @@ class RemoteProcess(CommandProcess):
         # Kill the remote program if possible
         cmd = RemoteProcess.make_kill_script(self._pidfile)
         if not self._is_local:
-            cmd = f"ssh {self._host} {shlex.quote(cmd)}"
+            cmd = f"ssh {shlex.quote(self._host)} {shlex.quote(cmd)}"
         c = run(
             cmd,
             check=True,
@@ -541,11 +541,11 @@ def main():
         args.backend = "nccl" if mx.cuda.is_available() else "ring"
     args.env = hostfile.envs + args.env
 
-    # Check if the script is a file and convert it to a full path
-    if (script := Path(rest[0])).exists() and script.is_file():
-        rest[0:1] = [args.python, str(script.resolve())]
-    elif (command := shutil.which(rest[0])) is not None:
-        rest[0] = command
+    # Add terminal size
+    cols, lines = shutil.get_terminal_size((0, 0))
+    if cols > 0 and not any(e.startswith("COLUMNS=") for e in args.env):
+        args.env.append(f"COLUMNS={cols}")
+        args.env.append(f"LINES={lines}")
 
     # Launch
     if args.backend == "ring":

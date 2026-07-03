@@ -1,7 +1,9 @@
-// Copyright © 2023 Apple Inc.
+// Copyright © 2023-2026 Apple Inc.
 
 #include "mlx/scheduler.h"
+#include "mlx/backend/cpu/eval.h"
 #include "mlx/backend/gpu/eval.h"
+#include "mlx/utils.h"
 
 namespace mlx::core {
 
@@ -25,12 +27,14 @@ void synchronize() {
 }
 
 void clear_streams() {
+  cpu::clear_streams();
   gpu::clear_streams();
 }
 
 namespace scheduler {
 
 Scheduler::Scheduler() {
+  is_main_thread();
   gpu::init();
 }
 
@@ -56,12 +60,12 @@ void Scheduler::enqueue(Stream s, std::function<void()> task) {
   st->enqueue(std::move(task));
 }
 
-/** A singleton scheduler to manage devices, streams, and task execution. */
+// Leak the scheduler singleton on all platforms. During static destruction,
+// worker threads may still be executing JIT-compiled code that has been
+// unmapped, causing SIGSEGV (macOS/Linux) or join() deadlocks (Windows/MSVC
+// CRT).
+// The OS reclaims all resources at process exit anyway.
 Scheduler& scheduler() {
-  // Intentionally leaked to avoid the "static destruction order fiasco":
-  // background threads (e.g. command buffer completion handlers) may
-  // reference this singleton after other static objects are destroyed
-  // during process teardown.
   static Scheduler* scheduler = new Scheduler;
   return *scheduler;
 }

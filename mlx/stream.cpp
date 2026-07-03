@@ -2,6 +2,7 @@
 
 #include "mlx/stream.h"
 #include "mlx/backend/cpu/device_info.h"
+#include "mlx/backend/cpu/eval.h"
 #include "mlx/backend/gpu/device_info.h"
 #include "mlx/backend/gpu/eval.h"
 
@@ -70,6 +71,21 @@ Stream new_stream(Device d) {
   auto& s = streams.emplace_back(index, d);
   if (d == Device::gpu) {
     gpu::new_stream(s);
+  } else {
+    cpu::new_stream(s);
+  }
+  return s;
+}
+
+Stream new_thread_unsafe_stream(Device d) {
+  auto& [streams, mtx] = all_streams();
+  std::unique_lock lock(mtx);
+  int index = streams.size();
+  auto& s = streams.emplace_back(index, d);
+  if (d == Device::gpu) {
+    gpu::new_thread_unsafe_stream(s);
+  } else {
+    cpu::new_thread_unsafe_stream(s);
   }
   return s;
 }

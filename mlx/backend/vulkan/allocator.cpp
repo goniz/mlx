@@ -65,6 +65,8 @@ void* Buffer::raw_ptr() {
   }
   if (auto* host_buf =
           static_cast<vulkan::VulkanBuffer*>(buf->host_readback.ptr())) {
+    std::lock_guard<std::mutex> lock(buf->queue_affinity_mutex);
+    buf->host_readback_dirty = true;
     return host_buf->mapped_ptr;
   }
   return nullptr;
@@ -85,6 +87,7 @@ void reset_buffer_sync_state(VulkanBuffer* buf) {
   buf->last_semaphore = vk::Semaphore();
   buf->last_timeline_value = 0;
   buf->queue_affinity = VulkanBuffer::QueueAffinity::None;
+  buf->host_readback_dirty = false;
 }
 
 constexpr size_t min_cache_pool_size = 4096 * 4;
@@ -547,13 +550,15 @@ Buffer VulkanAllocator::malloc_impl(size_t size, bool require_host_visible) {
     mapped_ptr = vk_device.mapMemory(vk_memory, 0, VK_WHOLE_SIZE);
   }
 
-  auto* buf = new VulkanBuffer{mapped_ptr,
-                               Buffer{nullptr},
-                               vk_buffer,
-                               vk_memory,
-                               size,
-                               allocation_size,
-                               memory_flags};
+  auto* buf = new VulkanBuffer{
+      mapped_ptr,
+      Buffer{nullptr},
+      false,
+      vk_buffer,
+      vk_memory,
+      size,
+      allocation_size,
+      memory_flags};
 
   {
     std::unique_lock lk(mutex_);

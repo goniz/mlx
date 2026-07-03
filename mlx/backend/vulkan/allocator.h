@@ -25,6 +25,7 @@ struct VulkanBuffer {
 
   void* mapped_ptr{nullptr};
   Buffer host_readback{nullptr};
+  bool host_readback_dirty{false};
   // Use C++ Vulkan API types
   vk::Buffer buffer;
   vk::DeviceMemory memory;

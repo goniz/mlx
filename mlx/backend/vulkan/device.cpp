@@ -417,7 +417,7 @@ void pop_sync_label() {
   }
 }
 
-void sync_copy_buffer_to_host(vk::Buffer src, vk::Buffer dst, size_t size) {
+void sync_copy_buffer(vk::Buffer src, vk::Buffer dst, size_t size) {
   if (size == 0 || !src || !dst) {
     return;
   }
@@ -425,9 +425,8 @@ void sync_copy_buffer_to_host(vk::Buffer src, vk::Buffer dst, size_t size) {
   auto& ctx = VulkanContext::get();
   auto device = ctx.device();
   const bool use_transfer = ctx.has_separate_transfer_queue();
-  const uint32_t queue_family = use_transfer
-      ? ctx.transfer_queue_family_index()
-      : ctx.compute_queue_family_index();
+  const uint32_t queue_family = use_transfer ? ctx.transfer_queue_family_index()
+                                             : ctx.compute_queue_family_index();
   const vk::Queue queue =
       use_transfer ? ctx.transfer_queue() : ctx.compute_queue();
 
@@ -439,8 +438,9 @@ void sync_copy_buffer_to_host(vk::Buffer src, vk::Buffer dst, size_t size) {
       pool, vk::CommandBufferLevel::ePrimary, 1);
   vk::CommandBuffer cmd = device.allocateCommandBuffers(alloc_info).front();
 
-  cmd.begin(vk::CommandBufferBeginInfo(
-      vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+  cmd.begin(
+      vk::CommandBufferBeginInfo(
+          vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
   vk::BufferCopy copy_region(0, 0, size);
   cmd.copyBuffer(src, dst, copy_region);
   cmd.end();
@@ -455,6 +455,14 @@ void sync_copy_buffer_to_host(vk::Buffer src, vk::Buffer dst, size_t size) {
 
   device.destroyFence(fence);
   device.destroyCommandPool(pool);
+}
+
+void sync_copy_buffer_to_host(vk::Buffer src, vk::Buffer dst, size_t size) {
+  sync_copy_buffer(src, dst, size);
+}
+
+void sync_copy_buffer_to_device(vk::Buffer src, vk::Buffer dst, size_t size) {
+  sync_copy_buffer(src, dst, size);
 }
 
 void ensure_host_readback_mirror(VulkanBuffer* buffer) {
@@ -480,6 +488,8 @@ void ensure_host_readback_mirror(VulkanBuffer* buffer) {
   }
 
   sync_copy_buffer_to_host(buffer->buffer, host_buf->buffer, buffer->size);
+  std::lock_guard<std::mutex> lock(buffer->queue_affinity_mutex);
+  buffer->host_readback_dirty = false;
 }
 
 } // namespace
@@ -1427,6 +1437,7 @@ class VulkanDevice {
     // Release references held by already-completed submissions before backend
     // primitives decide whether input buffers are uniquely owned and donatable.
     retire_submissions(stream, false);
+    flush_host_readback_writes(inputs);
 
     if (!deferred_submission_enabled()) {
       return;
@@ -1790,6 +1801,40 @@ class VulkanDevice {
     }
 
     return ranges;
+  }
+
+  void flush_host_readback_writes(const std::vector<array>& arrays) {
+    for (const auto& arr : arrays) {
+      auto data = arr.data_shared_ptr();
+      auto* buffer = referenced_vulkan_buffer(data);
+      if (buffer == nullptr || !buffer->buffer ||
+          buffer->mapped_ptr != nullptr) {
+        continue;
+      }
+
+      bool dirty = false;
+      {
+        std::lock_guard<std::mutex> lock(buffer->queue_affinity_mutex);
+        dirty = buffer->host_readback_dirty;
+      }
+      if (!dirty) {
+        continue;
+      }
+
+      auto* host_buf = static_cast<VulkanBuffer*>(buffer->host_readback.ptr());
+      if (host_buf == nullptr || host_buf->mapped_ptr == nullptr ||
+          !host_buf->buffer) {
+        continue;
+      }
+
+      std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+      sync_copy_buffer_to_device(
+          host_buf->buffer, buffer->buffer, buffer->size);
+      {
+        std::lock_guard<std::mutex> lock(buffer->queue_affinity_mutex);
+        buffer->host_readback_dirty = false;
+      }
+    }
   }
 
   static std::vector<BufferAccessRange> make_potential_donation_writes(

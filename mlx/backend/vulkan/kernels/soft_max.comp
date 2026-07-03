@@ -214,7 +214,7 @@ void soft_max(uint num_iters) {
         if (idx < DATA_CACHE_SIZE) {
             data_cache[idx] = val;
         } else {
-            data_d[i] = D_TYPE(val);
+            store_d(i, val);
         }
     }
 

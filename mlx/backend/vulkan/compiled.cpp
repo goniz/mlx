@@ -1187,6 +1187,11 @@ void Compiled::eval_gpu(
 
   const bool use_push_descriptor = pipeline->supports_push_descriptor;
 
+  // Get command buffer before retaining descriptor buffers so temporary runtime
+  // params are kept alive by the submission that reads them.
+  auto cmd_buffer = vulkan::begin_command_recording(s.index);
+  const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
+
   // Prepare descriptor writes
   std::vector<VkWriteDescriptorSet> writes;
   std::vector<VkDescriptorBufferInfo> buffer_infos;
@@ -1326,10 +1331,6 @@ void Compiled::eval_gpu(
       }
     }
   }
-
-  // Get command buffer
-  auto cmd_buffer = vulkan::begin_command_recording(s.index);
-  const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
 
   auto update_descriptor_set_for_chunk = [&](uint64_t chunk_base_elements,
                                              uint64_t chunk_elements) {

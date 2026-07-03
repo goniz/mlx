@@ -849,6 +849,16 @@ class VulkanDevice {
       submit_commands(stream, "finalize");
     }
     retire_submissions(stream, false);
+    if (stream->in_flight_submissions.size() > max_inflight_submissions()) {
+      if (trace_sync_enabled()) {
+        std::ostringstream oss;
+        oss << "finalize(stream=" << s.index << ") action=drain-inflight"
+            << " inflight=" << stream->in_flight_submissions.size()
+            << " limit=" << max_inflight_submissions();
+        trace_sync(oss.str());
+      }
+      retire_submissions(stream, true);
+    }
     if (trace_sync_enabled()) {
       std::ostringstream oss;
       oss << "finalize(stream=" << s.index
@@ -2218,6 +2228,7 @@ class VulkanDevice {
       VkPhysicalDeviceProperties props{};
       vkGetPhysicalDeviceProperties(
           VulkanContext::get().physical_device(), &props);
+      auto recent_primitives = stream->recent_primitives;
 
       stream->recording = false;
       stream->recording_epoch = 0;
@@ -2267,13 +2278,13 @@ class VulkanDevice {
               << " submit_reason='" << submit_reason << "'"
               << " reset_pool=" << format_vk_result(reset_pool_result)
               << " device='" << props.deviceName << "'";
-      if (!stream->recent_primitives.empty()) {
+      if (!recent_primitives.empty()) {
         details << " recent_primitives='";
-        for (size_t i = 0; i < stream->recent_primitives.size(); ++i) {
+        for (size_t i = 0; i < recent_primitives.size(); ++i) {
           if (i > 0) {
             details << ",";
           }
-          details << stream->recent_primitives[i];
+          details << recent_primitives[i];
         }
         details << "'";
       }

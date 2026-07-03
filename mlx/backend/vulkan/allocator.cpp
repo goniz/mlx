@@ -579,6 +579,7 @@ void VulkanAllocator::free(Buffer buffer) {
     return;
   }
 
+  Buffer host_readback{nullptr};
   {
     std::unique_lock lk(mutex_);
     if (live_buffers_.find(buf) == live_buffers_.end()) {
@@ -586,7 +587,16 @@ void VulkanAllocator::free(Buffer buffer) {
     }
     live_buffers_.erase(buf);
     active_memory_ -= std::min(active_memory_, buf->size);
+    host_readback = buf->host_readback;
+    buf->host_readback = Buffer{nullptr};
+  }
 
+  if (host_readback.ptr() != nullptr) {
+    free(host_readback);
+  }
+
+  {
+    std::unique_lock lk(mutex_);
     const auto cacheable_limit =
         cacheable_size_limit(active_memory_, max_cacheable_size_);
     const auto pool_limit = cache_pool_limit(active_memory_, max_pool_size_);
@@ -610,9 +620,10 @@ void VulkanAllocator::free(Buffer buffer) {
 }
 
 void VulkanAllocator::free_vulkan_buffer(VulkanBuffer* buf) {
-  if (buf->host_readback.ptr() != nullptr) {
-    free(buf->host_readback);
+  if (auto* host_readback =
+          static_cast<VulkanBuffer*>(buf->host_readback.ptr())) {
     buf->host_readback = Buffer{nullptr};
+    free_vulkan_buffer(host_readback);
   }
 
   auto vk_device = VulkanContext::get().device();

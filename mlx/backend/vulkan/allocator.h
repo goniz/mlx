@@ -24,6 +24,8 @@ struct VulkanBuffer {
   };
 
   void* mapped_ptr{nullptr};
+  Buffer host_readback{nullptr};
+  bool host_readback_dirty{false};
   // Use C++ Vulkan API types
   vk::Buffer buffer;
   vk::DeviceMemory memory;
@@ -47,6 +49,7 @@ struct VulkanBuffer {
 class VulkanAllocator : public allocator::Allocator {
  public:
   Buffer malloc(size_t size) override;
+  Buffer malloc_host_visible(size_t size);
   void free(Buffer buffer) override;
   size_t size(Buffer buffer) const override;
   Buffer make_buffer(void* ptr, size_t size) override;
@@ -62,9 +65,7 @@ class VulkanAllocator : public allocator::Allocator {
     std::unique_lock lk(mutex_);
     peak_memory_ = 0;
   }
-  size_t get_cache_memory() const {
-    return buffer_cache_.cache_size();
-  }
+  size_t get_cache_memory() const;
   size_t set_cache_limit(size_t limit);
   size_t set_memory_limit(size_t limit);
   size_t get_memory_limit() const;
@@ -77,6 +78,8 @@ class VulkanAllocator : public allocator::Allocator {
   ~VulkanAllocator() = default;
   friend VulkanAllocator& allocator();
 
+  Buffer malloc_impl(size_t size, bool require_host_visible);
+  size_t release_cached_buffers(size_t min_bytes_to_free);
   void free_vulkan_buffer(VulkanBuffer* buf);
 
   size_t block_limit_{0};
@@ -90,7 +93,8 @@ class VulkanAllocator : public allocator::Allocator {
   size_t max_cacheable_size_{0};
   std::unordered_set<VulkanBuffer*> live_buffers_;
 
-  BufferCache<VulkanBuffer> buffer_cache_;
+  BufferCache<VulkanBuffer> device_buffer_cache_;
+  BufferCache<VulkanBuffer> host_visible_buffer_cache_;
 
   mutable std::mutex mutex_;
 };

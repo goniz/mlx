@@ -30,12 +30,12 @@ void main() {
 
         FLOAT_TYPE a = FLOAT_TYPE(0);
         if (col < p.KX) {
-            a = data_a[rowx * p.KX + col];
+            a = load_a(rowx * p.KX + col);
         }
 
         FLOAT_TYPE b = FLOAT_TYPE(0);
         if (p.KY > 0 && col < p.KX) {
-            b = data_b[rowy_start + col];
+            b = load_b(rowy_start + col);
         }
 
         FLOAT_TYPE v = a * p.scale + slope * b;

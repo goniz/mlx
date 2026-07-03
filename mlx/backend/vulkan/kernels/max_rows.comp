@@ -14,6 +14,22 @@ layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 
 shared FLOAT_TYPE tmp[BLOCK_SIZE];
 
+FLOAT_TYPE load_a(uint idx) {
+#if defined(DATA_A_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_a[idx])));
+#else
+    return FLOAT_TYPE(data_a[idx]);
+#endif
+}
+
+void store_d(uint idx, FLOAT_TYPE value) {
+#if defined(DATA_D_BF16)
+    data_d[idx] = D_TYPE(fp32_to_bf16(float(value)));
+#else
+    data_d[idx] = D_TYPE(value);
+#endif
+}
+
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint col = gl_LocalInvocationID.x;
@@ -28,7 +44,7 @@ void main() {
 
     tmp[col] = FLOAT_TYPE(-3.402823466e+38);
     for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
-        const FLOAT_TYPE value = FLOAT_TYPE(data_a[src_idx + i]);
+        const FLOAT_TYPE value = load_a(src_idx + i);
         if (isnan(value)) {
             tmp[col] = value;
             break;
@@ -50,6 +66,6 @@ void main() {
     }
 
     if (col == 0) {
-        data_d[dst_idx] = D_TYPE(tmp[0]);
+        store_d(dst_idx, tmp[0]);
     }
 }

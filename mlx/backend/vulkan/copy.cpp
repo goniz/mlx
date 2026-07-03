@@ -10,6 +10,8 @@
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
 #include "mlx/stream.h"
+#include "mlx/transforms.h"
+#include "mlx/transforms_impl.h"
 
 #include <algorithm>
 #include <cstring>
@@ -278,6 +280,19 @@ std::string build_dynamic_general_copy_shader(
   if (use_u32_indices) {
     os << "  uint input_base;\n";
     os << "  uint output_base;\n";
+    os << "  uint rank;\n";
+    os << "  uint shape0;\n";
+    os << "  uint shape1;\n";
+    os << "  uint shape2;\n";
+    os << "  uint shape3;\n";
+    os << "  uint input_stride0;\n";
+    os << "  uint input_stride1;\n";
+    os << "  uint input_stride2;\n";
+    os << "  uint input_stride3;\n";
+    os << "  uint output_stride0;\n";
+    os << "  uint output_stride1;\n";
+    os << "  uint output_stride2;\n";
+    os << "  uint output_stride3;\n";
   } else {
     os << "  int64_t input_base;\n";
     os << "  int64_t output_base;\n";
@@ -297,6 +312,28 @@ std::string build_dynamic_general_copy_shader(
   if (has_dynamic_o_offset) {
     os << "layout(set = 0, binding = 3) readonly buffer DynamicOutputOffset {int64_t data[];} dynamic_o_offset_buf;\n";
   }
+  if (use_u32_indices) {
+    os << R"(
+uint shape_dim(uint dim) {
+  if (dim == 0u) return pc.shape0;
+  if (dim == 1u) return pc.shape1;
+  if (dim == 2u) return pc.shape2;
+  return pc.shape3;
+}
+uint input_stride_dim(uint dim) {
+  if (dim == 0u) return pc.input_stride0;
+  if (dim == 1u) return pc.input_stride1;
+  if (dim == 2u) return pc.input_stride2;
+  return pc.input_stride3;
+}
+uint output_stride_dim(uint dim) {
+  if (dim == 0u) return pc.output_stride0;
+  if (dim == 1u) return pc.output_stride1;
+  if (dim == 2u) return pc.output_stride2;
+  return pc.output_stride3;
+}
+)";
+  }
   os << "\nvoid main() {\n";
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
   os << "  if (linear_idx >= pc.total_elements) {\n";
@@ -312,24 +349,27 @@ std::string build_dynamic_general_copy_shader(
   if (has_dynamic_o_offset) {
     os << "  output_index += dynamic_o_offset_buf.data[uint(pc.dynamic_o_base)];\n";
   }
-  if (!shape.empty()) {
+  if (use_u32_indices) {
+    os << "  uint remaining = linear_idx;\n";
+    os << "  for (int dim = int(pc.rank) - 1; dim >= 0; --dim) {\n";
+    os << "    uint dim_u = uint(dim);\n";
+    os << "    uint extent = shape_dim(dim_u);\n";
+    os << "    uint coord = remaining % extent;\n";
+    os << "    remaining /= extent;\n";
+    os << "    input_index += coord * input_stride_dim(dim_u);\n";
+    os << "    output_index += coord * output_stride_dim(dim_u);\n";
+    os << "  }\n";
+  } else if (!shape.empty()) {
     os << "  uint remaining = linear_idx;\n";
     for (int dim = static_cast<int>(shape.size()) - 1; dim >= 0; --dim) {
       os << "  {\n";
       os << "    uint coord = remaining % " << static_cast<uint32_t>(shape[dim])
          << "u;\n";
       os << "    remaining /= " << static_cast<uint32_t>(shape[dim]) << "u;\n";
-      if (use_u32_indices) {
-        os << "    input_index += coord * "
-           << static_cast<uint32_t>(i_strides[dim]) << "u;\n";
-        os << "    output_index += coord * "
-           << static_cast<uint32_t>(o_strides[dim]) << "u;\n";
-      } else {
-        os << "    input_index += int64_t(coord) * "
-           << glsl_i64_literal(i_strides[dim]) << ";\n";
-        os << "    output_index += int64_t(coord) * "
-           << glsl_i64_literal(o_strides[dim]) << ";\n";
-      }
+      os << "    input_index += int64_t(coord) * "
+         << glsl_i64_literal(i_strides[dim]) << ";\n";
+      os << "    output_index += int64_t(coord) * "
+         << glsl_i64_literal(o_strides[dim]) << ";\n";
       os << "  }\n";
     }
   }
@@ -458,11 +498,15 @@ bool dispatch_dynamic_general_copy(
              << use_u32_indices << ':'
              << dynamic_i_offset.has_value() << ':'
              << dynamic_o_offset.has_value() << ':';
-  append_layout_key(layout_key, shape);
-  layout_key << ':';
-  append_layout_key(layout_key, i_strides);
-  layout_key << ':';
-  append_layout_key(layout_key, o_strides);
+  if (use_u32_indices) {
+    layout_key << "rank=" << shape.size();
+  } else {
+    append_layout_key(layout_key, shape);
+    layout_key << ':';
+    append_layout_key(layout_key, i_strides);
+    layout_key << ':';
+    append_layout_key(layout_key, o_strides);
+  }
 
   const std::string shader_name = "dynamic_general_copy_" +
       copy_dtype_suffix(in.dtype()) + "_" + copy_dtype_suffix(out.dtype()) +
@@ -492,6 +536,10 @@ bool dispatch_dynamic_general_copy(
     uint32_t total_elements;
     uint32_t input_base;
     uint32_t output_base;
+    uint32_t rank;
+    uint32_t shape[4];
+    uint32_t input_strides[4];
+    uint32_t output_strides[4];
   };
   struct PushConstants64 {
     uint32_t total_elements;
@@ -516,6 +564,12 @@ bool dispatch_dynamic_general_copy(
     pc.total_elements = static_cast<uint32_t>(total_elements);
     pc.input_base = static_cast<uint32_t>(input_base);
     pc.output_base = static_cast<uint32_t>(output_base);
+    pc.rank = static_cast<uint32_t>(shape.size());
+    for (size_t i = 0; i < shape.size(); ++i) {
+      pc.shape[i] = static_cast<uint32_t>(shape[i]);
+      pc.input_strides[i] = static_cast<uint32_t>(i_strides[i]);
+      pc.output_strides[i] = static_cast<uint32_t>(o_strides[i]);
+    }
     vkCmdPushConstants(
         dispatch.command_buffer,
         dispatch.pipeline->layout,
@@ -1412,8 +1466,17 @@ void copy_gpu_inplace(
   const array* source = &in;
   if (in.has_primitive()) {
     materialized_in.emplace(in);
-    if (materialized_in->status() == array::Status::unscheduled) {
-      materialized_in->eval();
+    if (detail::in_tracing() || detail::retain_graph()) {
+      if (materialized_in->status() == array::Status::unscheduled) {
+        materialized_in->eval();
+      }
+    } else {
+      auto data = materialized_in->data_shared_ptr();
+      if (materialized_in->status() != array::Status::unscheduled &&
+          (data == nullptr || data->buffer.ptr() == nullptr)) {
+        materialized_in->set_status(array::Status::unscheduled);
+      }
+      async_eval(*materialized_in);
     }
     source = &*materialized_in;
   } else {

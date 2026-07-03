@@ -521,6 +521,29 @@ array cast_flash_attention_q_to_f32(const array& x, Stream s) {
   return out;
 }
 
+array make_flash_attention_output_target(
+    array& out,
+    Stream s,
+    bool& uses_out_storage) {
+  const Shape kernel_shape = {
+      out.shape(0), out.shape(2), out.shape(1), out.shape(3)};
+  uses_out_storage = out.dtype() == float32;
+  if (!uses_out_storage) {
+    return vulkan::acquire_scratch_array(
+        s, kFlashAttnOutScratchLane, kernel_shape, float32);
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  array out_storage(kernel_shape, float32, nullptr, {});
+  out_storage.copy_shared_buffer(
+      out,
+      make_contiguous_strides(kernel_shape),
+      {true, true, false},
+      out.data_size(),
+      out.offset());
+  return out_storage;
+}
+
 struct FlashAttentionTuningParams {
   enum class Path {
     Scalar,
@@ -1213,7 +1236,6 @@ bool try_dispatch_flash_attention_native_vulkan(
       vulkan::mark_scratch_array_written(s, kFlashAttnSplitKScratchLane);
     }
 
-    vulkan::set_force_immediate_submit(s);
     vulkan::end_command_recording(s.index);
     return true;
   } catch (const std::runtime_error& e) {
@@ -1355,11 +1377,9 @@ bool try_eval_flash_attention_vulkan(
   try {
     const bool use_causal_shader = do_causal && q_len > 1;
 
-    array out_storage = vulkan::acquire_scratch_array(
-        s,
-        kFlashAttnOutScratchLane,
-        {out.shape(0), out.shape(2), out.shape(1), out.shape(3)},
-        float32);
+    bool uses_out_storage = false;
+    array out_storage =
+        make_flash_attention_output_target(out, s, uses_out_storage);
 
     if (!try_dispatch_flash_attention_native_vulkan(
             q,
@@ -1375,12 +1395,23 @@ bool try_eval_flash_attention_vulkan(
             scale)) {
       return false;
     }
-    vulkan::mark_scratch_array_written(s, kFlashAttnOutScratchLane);
+    if (!uses_out_storage) {
+      vulkan::mark_scratch_array_written(s, kFlashAttnOutScratchLane);
+    }
 
     array out_transposed = swapaxes_in_eval(out_storage, 1, 2);
     trace_flash_attention_array("out_storage", out_storage);
     trace_flash_attention_array("out_transposed", out_transposed);
-    copy_gpu(out_transposed, out, CopyType::General, s);
+    if (uses_out_storage) {
+      out.copy_shared_buffer(
+          out_transposed,
+          out_transposed.strides(),
+          out_transposed.flags(),
+          out_transposed.data_size(),
+          out_transposed.offset());
+    } else {
+      copy_gpu(out_transposed, out, CopyType::General, s);
+    }
     out.set_status(array::Status::evaluated);
     return true;
   } catch (const std::runtime_error& e) {
@@ -1444,6 +1475,11 @@ bool sdpa_vulkan_supported(
 
 bool is_supported_sdpa_rowwise_layout(const array& arr) {
   return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
+      arr.strides().back() == 1;
+}
+
+bool is_supported_sdpa_matvec_layout(const array& arr) {
+  return arr.flags().row_contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
       arr.strides().back() == 1;
 }
 
@@ -1699,9 +1735,8 @@ void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
         "SDPA softmax requires float16 or float32 tensors.");
   }
 
-  array in_work = use_f16_variant ? cast_to_f32_sdpa(in, s) : in;
-  array out_work =
-      use_f16_variant ? array(out.shape(), float32, nullptr, {}) : out;
+  array in_work = in;
+  array out_work = out;
 
   in_work = ensure_sdpa_rowwise_layout(in_work, s);
   out_work.set_data(allocator::malloc(out_work.nbytes()));
@@ -1717,11 +1752,11 @@ void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
       vulkan::dispatch_softmax_large_op(
           in_work,
           out_work,
-          use_f16_variant ? vulkan::StaticShaderId::soft_max_large1_f32_f16
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large1_f16
                           : vulkan::StaticShaderId::soft_max_large1_f32,
-          use_f16_variant ? vulkan::StaticShaderId::soft_max_large2_f32_f16
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large2_f16
                           : vulkan::StaticShaderId::soft_max_large2_f32,
-          use_f16_variant ? vulkan::StaticShaderId::soft_max_large3_f32_f16
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large3_f16
                           : vulkan::StaticShaderId::soft_max_large3_f32,
           command_buffer,
           s);
@@ -1729,7 +1764,7 @@ void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
       vulkan::dispatch_softmax_op(
           in_work,
           out_work,
-          use_f16_variant ? vulkan::StaticShaderId::soft_max_f32_f16
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_f16
                           : vulkan::StaticShaderId::soft_max_f32,
           command_buffer,
           s);
@@ -1740,9 +1775,6 @@ void eval_sdpa_softmax_vulkan(array in, array& out, Stream s) {
     throw;
   }
   end_tracked_manual_op(s, tracked_inputs, tracked_outputs);
-  if (use_f16_variant) {
-    copy_gpu(out_work, out, CopyType::General, s);
-  }
   out.set_status(array::Status::evaluated);
 }
 
@@ -1944,14 +1976,10 @@ bool try_eval_sdpa_heads_vulkan(
       // q: scale + cast to f32
       array q_f32 =
           cast_to_f32_sdpa(multiply(array(scale, q_in.dtype()), q_in, s), s);
-      // K/V: cast original (bf16/f16) directly to f16 for NC matvec.
-      array k_f16(k_in.shape(), float16, nullptr, {});
-      copy_gpu(k_in, k_f16, CopyType::General, s);
-      k_f16.set_status(array::Status::evaluated);
-
-      array v_f16(v_in.shape(), float16, nullptr, {});
-      copy_gpu(v_in, v_f16, CopyType::General, s);
-      v_f16.set_status(array::Status::evaluated);
+      // K: reuse f16 KV cache buffers directly when possible. bf16 still needs
+      // one conversion pass because the NC matvec kernel consumes f16 matrices.
+      array k_f16 =
+          cast_flash_attention_kv_to_f16(k_in, kFlashAttnKCastScratchLane, s);
 
       // q in head layout, must be contiguous for matvec
       stage = "reshape_q_decode";
@@ -1960,9 +1988,9 @@ bool try_eval_sdpa_heads_vulkan(
       q_heads = ensure_sdpa_rowwise_layout(q_heads, s);
       q_heads.set_status(array::Status::evaluated);
 
-      // k is already in [batch, n_kv_heads, kv_len, q_dim] f16.
-      // Ensure k is row-contiguous so matvec strides are trivial.
-      if (!is_supported_sdpa_rowwise_layout(k_f16)) {
+      // k is already in [batch, n_kv_heads, kv_len, q_dim] f16. The NC matvec
+      // accepts explicit outer strides, so only require a dense inner row.
+      if (!is_supported_sdpa_matvec_layout(k_f16)) {
         k_f16 = contiguous_copy_gpu(k_f16, s);
       }
       k_f16.set_status(array::Status::evaluated);
@@ -2069,16 +2097,12 @@ bool try_eval_sdpa_heads_vulkan(
       // --- Scores×V matvec via NC dispatch (matrix = v_f16, vec = probs)
       // ------
       stage = "result_matmul_decode";
-      // Ensure v_f16 is contiguous before swapaxes
-      if (!is_supported_sdpa_rowwise_layout(v_f16)) {
-        v_f16 = contiguous_copy_gpu(v_f16, s);
-      }
-      v_f16.set_status(array::Status::evaluated);
-
-      array v_t = swapaxes_in_eval(v_f16, -1, -2);
-      if (!is_supported_sdpa_rowwise_layout(v_t)) {
-        v_t = contiguous_copy_gpu(v_t, s);
-      }
+      Shape v_t_shape = v_in.shape();
+      std::swap(v_t_shape[v_t_shape.size() - 2], v_t_shape.back());
+      array v_src = swap_sdpa_last_two_dims_view(v_in);
+      array v_t = vulkan::acquire_scratch_array(
+          s, kFlashAttnVCastScratchLane, v_t_shape, float16);
+      copy_gpu(v_src, v_t, CopyType::General, s);
       v_t.set_status(array::Status::evaluated);
 
       {

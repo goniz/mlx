@@ -11,10 +11,11 @@
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/shader_compiler.h"
+#include "mlx/transforms.h"
 
 #include <algorithm>
-#include <sstream>
 #include <memory>
+#include <sstream>
 #include <utility>
 
 namespace mlx::core {
@@ -66,7 +67,11 @@ namespace mlx::core {
 namespace {
 
 template <typename Fn>
-array eval_with_optional_f32_promotion(array x, Stream s, Dtype out_dtype, Fn&& fn) {
+array eval_with_optional_f32_promotion(
+    array x,
+    Stream s,
+    Dtype out_dtype,
+    Fn&& fn) {
   if (out_dtype == float16 || out_dtype == bfloat16) {
     auto y = fn(astype(x, float32, s), float32);
     return astype(y, out_dtype, s);
@@ -157,7 +162,8 @@ void main() {
 }
 
 void extract_complex_real_key_gpu(const array& in, array& out, Stream s) {
-  if (in.dtype() != complex64 || out.dtype() != float32 || in.size() != out.size()) {
+  if (in.dtype() != complex64 || out.dtype() != float32 ||
+      in.size() != out.size()) {
     throw std::runtime_error("Invalid complex sort key extraction.");
   }
 
@@ -194,7 +200,8 @@ void extract_complex_real_key_gpu(const array& in, array& out, Stream s) {
       0,
       sizeof(PushConstants),
       &pc);
-  vkCmdDispatch(dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
+  vkCmdDispatch(
+      dispatch.command_buffer, (pc.total_elements + 255u) / 256u, 1, 1);
   vulkan::end_command_recording(s.index);
 }
 
@@ -297,6 +304,19 @@ bool ensure_vulkan_buffer_power(array& arr, Stream s) {
     return true;
   }
   if (arr.has_primitive()) {
+    if (arr.status() != array::Status::unscheduled &&
+        (data == nullptr || data->buffer.ptr() == nullptr)) {
+      arr.set_status(array::Status::unscheduled);
+    }
+    async_eval(arr);
+    data = arr.data_shared_ptr();
+    if (data != nullptr && vulkan::is_vulkan_buffer(data->buffer)) {
+      return true;
+    }
+    if (!arr.has_primitive() &&
+        (data == nullptr || data->buffer.ptr() == nullptr)) {
+      return false;
+    }
     arr = contiguous_copy_gpu(arr, s);
     data = arr.data_shared_ptr();
     return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
@@ -317,6 +337,19 @@ bool ensure_vulkan_buffer_compare(array& arr, Stream s) {
     return true;
   }
   if (arr.has_primitive()) {
+    if (arr.status() != array::Status::unscheduled &&
+        (data == nullptr || data->buffer.ptr() == nullptr)) {
+      arr.set_status(array::Status::unscheduled);
+    }
+    async_eval(arr);
+    data = arr.data_shared_ptr();
+    if (data != nullptr && vulkan::is_vulkan_buffer(data->buffer)) {
+      return true;
+    }
+    if (!arr.has_primitive() &&
+        (data == nullptr || data->buffer.ptr() == nullptr)) {
+      return false;
+    }
     arr = contiguous_copy_gpu(arr, s);
     data = arr.data_shared_ptr();
     return data != nullptr && vulkan::is_vulkan_buffer(data->buffer);
@@ -651,7 +684,8 @@ std::string build_equal_shader(
         uses_bfloat16 || uses_float16 || a_dtype == float32 ||
         b_dtype == float32) {
       os << " || (isnan(" << equal_input_expr(a_dtype, "a_buf", "a_idx")
-         << ") && isnan(" << equal_input_expr(b_dtype, "b_buf", "b_idx") << "))";
+         << ") && isnan(" << equal_input_expr(b_dtype, "b_buf", "b_idx")
+         << "))";
     }
   }
   os << ";\n";
@@ -1729,7 +1763,8 @@ bool try_eval_bitwise_invert_vulkan(
     return true;
   }
 
-  const auto in_offset = static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
+  const auto in_offset =
+      static_cast<uint64_t>(in.offset() / size_of(in.dtype()));
   const auto out_offset =
       static_cast<uint64_t>(out_kernel.offset() / size_of(out_kernel.dtype()));
   const auto total = static_cast<uint64_t>(out_kernel.data_size());
@@ -1938,8 +1973,7 @@ bool try_eval_select_vulkan(
   array y_kernel = collapse_select_leading_dims(y, s);
   array out_kernel = collapse_select_leading_dims(out_storage, s);
 
-  const bool can_use_static_select =
-      condition.shape() == inputs[0].shape() &&
+  const bool can_use_static_select = condition.shape() == inputs[0].shape() &&
       is_supported_elementwise_layout(cond_kernel) &&
       is_supported_elementwise_layout(x_kernel) &&
       is_supported_elementwise_layout(y_kernel) &&
@@ -2345,10 +2379,7 @@ void ArcSinh::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   auto s = stream();
   auto y = eval_with_optional_f32_promotion(
-      inputs[0],
-      s,
-      out.dtype(),
-      [&](array x, Dtype calc_dtype) {
+      inputs[0], s, out.dtype(), [&](array x, Dtype calc_dtype) {
         auto one = array(1.0f, calc_dtype);
         return log(add(x, sqrt(add(multiply(x, x, s), one, s), s), s), s);
       });
@@ -2370,7 +2401,8 @@ void Cosh::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   auto s = stream();
   auto x = inputs[0];
-  auto y = multiply(add(exp(x, s), exp(negative(x, s), s), s), array(0.5f, out.dtype()), s);
+  auto y = multiply(
+      add(exp(x, s), exp(negative(x, s), s), s), array(0.5f, out.dtype()), s);
   copy_gpu(y, out, CopyType::General, s);
 }
 void Hadamard::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -2378,7 +2410,8 @@ void Hadamard::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto s = stream();
   auto in = inputs[0];
 
-  if (in.dtype() != float32 && in.dtype() != float16 && in.dtype() != bfloat16) {
+  if (in.dtype() != float32 && in.dtype() != float16 &&
+      in.dtype() != bfloat16) {
     throw std::runtime_error("Hadamard has no Vulkan implementation.");
   }
 
@@ -2524,7 +2557,10 @@ void Sinh::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   auto s = stream();
   auto x = inputs[0];
-  auto y = multiply(subtract(exp(x, s), exp(negative(x, s), s), s), array(0.5f, out.dtype()), s);
+  auto y = multiply(
+      subtract(exp(x, s), exp(negative(x, s), s), s),
+      array(0.5f, out.dtype()),
+      s);
   copy_gpu(y, out, CopyType::General, s);
 }
 

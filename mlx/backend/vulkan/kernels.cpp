@@ -54,6 +54,7 @@ namespace {
 constexpr char kSoftmaxLargeMaxScratchLane[] = "softmax.large.tmp_max";
 constexpr char kSoftmaxLargeSumScratchLane[] = "softmax.large.tmp_sum";
 constexpr char kCumsumMultipassScratchLane[] = "cumsum.multipass.tmp";
+constexpr char kArgsortLargeScratchLane[] = "argsort.large.tmp";
 constexpr uint32_t kDescriptorSetBatchSize = 32;
 constexpr uint32_t kVendorIdAmd = 0x1002u;
 constexpr uint32_t kVendorIdIntel = 0x8086u;
@@ -241,7 +242,8 @@ PipelineCreationOptions pipeline_creation_options(
     const std::vector<uint32_t>& specialization_constants) {
   PipelineCreationOptions options;
 
-  if ((shader_name == "soft_max_f32" || shader_name == "soft_max_f32_f16") &&
+  if ((shader_name == "soft_max_f32" || shader_name == "soft_max_f32_f16" ||
+       shader_name == "soft_max_bf16") &&
       !specialization_constants.empty()) {
     options.required_subgroup_size = specialization_constants[0];
     return options;
@@ -1398,14 +1400,6 @@ ComputePipeline* KernelManager::get_pipeline(
     pipeline_key.bindings.push_back(make_descriptor_binding_key(binding));
   }
 
-  {
-    std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
-    auto it = pipelines_.find(pipeline_key);
-    if (it != pipelines_.end()) {
-      return it->second.get();
-    }
-  }
-
   VkDevice device = VulkanContext::get().device();
   const auto pipeline_options =
       pipeline_creation_options(shader_id, specialization_constants);
@@ -1413,6 +1407,12 @@ ComputePipeline* KernelManager::get_pipeline(
   if (!shader) {
     throw std::runtime_error(
         std::string("Shader not found: ") + static_shader_name(shader_id));
+  }
+
+  std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
+  auto it = pipelines_.find(pipeline_key);
+  if (it != pipelines_.end()) {
+    return it->second.get();
   }
 
   const bool use_push_descriptor =
@@ -1543,19 +1543,7 @@ ComputePipeline* KernelManager::get_pipeline(
   pipeline_ptr->supports_push_descriptor = use_push_descriptor;
 
   auto* result = pipeline_ptr.get();
-  {
-    std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
-    auto it = pipelines_.find(pipeline_key);
-    if (it != pipelines_.end()) {
-      vkDestroyPipeline(device, pipeline, nullptr);
-      vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
-      if (descriptor_layout != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
-      }
-      return it->second.get();
-    }
-    pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
-  }
+  pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
 
   return result;
 }
@@ -1599,14 +1587,6 @@ ComputePipeline* KernelManager::get_pipeline(
     pipeline_key.bindings.push_back(make_descriptor_binding_key(binding));
   }
 
-  {
-    std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
-    auto it = pipelines_.find(pipeline_key);
-    if (it != pipelines_.end()) {
-      return it->second.get();
-    }
-  }
-
   VkDevice device = VulkanContext::get().device();
   const auto pipeline_options =
       pipeline_creation_options(shader_name, specialization_constants);
@@ -1615,6 +1595,12 @@ ComputePipeline* KernelManager::get_pipeline(
   ShaderModule* shader = get_shader(shader_name);
   if (!shader) {
     throw std::runtime_error("Shader not found: " + shader_name);
+  }
+
+  std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
+  auto it = pipelines_.find(pipeline_key);
+  if (it != pipelines_.end()) {
+    return it->second.get();
   }
 
   // Create descriptor set layout
@@ -1748,19 +1734,7 @@ ComputePipeline* KernelManager::get_pipeline(
   pipeline_ptr->supports_push_descriptor = use_push_descriptor;
 
   auto* result = pipeline_ptr.get();
-  {
-    std::lock_guard<std::mutex> lock(pipeline_cache_mutex_);
-    auto it = pipelines_.find(pipeline_key);
-    if (it != pipelines_.end()) {
-      vkDestroyPipeline(device, pipeline, nullptr);
-      vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
-      if (descriptor_layout != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
-      }
-      return it->second.get();
-    }
-    pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
-  }
+  pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
 
   return result;
 }
@@ -1836,6 +1810,7 @@ vk::DescriptorSet KernelManager::allocate_descriptor_set(
     allocInfo.setSetLayouts(layouts);
 
     try {
+      std::lock_guard<std::mutex> pool_lock(descriptor_pool_mutex_);
       auto descriptor_sets = device.allocateDescriptorSets(allocInfo);
       if (descriptor_sets.empty()) {
         throw std::runtime_error("Failed to allocate descriptor set batch.");
@@ -1895,6 +1870,7 @@ void KernelManager::free_descriptor_set(VkDescriptorSet set) {
       descriptor_set_layouts_.erase(set);
     }
     VkDevice device = VulkanContext::get().device();
+    std::lock_guard<std::mutex> pool_lock(descriptor_pool_mutex_);
     vkFreeDescriptorSets(device, descriptor_pool_, 1, &set);
   }
 }
@@ -2004,6 +1980,7 @@ void KernelManager::reclaim_descriptor_set_epoch(
   }
   if (!freeable_sets.empty()) {
     VkDevice device = VulkanContext::get().device();
+    std::lock_guard<std::mutex> pool_lock(descriptor_pool_mutex_);
     vkFreeDescriptorSets(
         device,
         descriptor_pool_,
@@ -2078,6 +2055,7 @@ void KernelManager::reclaim_descriptor_sets(
   }
   if (!freeable_sets.empty()) {
     VkDevice device = VulkanContext::get().device();
+    std::lock_guard<std::mutex> pool_lock(descriptor_pool_mutex_);
     vkFreeDescriptorSets(
         device,
         descriptor_pool_,
@@ -2125,6 +2103,7 @@ void KernelManager::reclaim_all_descriptor_sets() {
   }
 
   VkDevice device = VulkanContext::get().device();
+  std::lock_guard<std::mutex> pool_lock(descriptor_pool_mutex_);
   vkFreeDescriptorSets(
       device,
       descriptor_pool_,
@@ -2204,6 +2183,7 @@ void KernelManager::purge_descriptor_sets_for_layouts(
   }
 
   VkDevice device = VulkanContext::get().device();
+  std::lock_guard<std::mutex> pool_lock(descriptor_pool_mutex_);
   vkFreeDescriptorSets(
       device,
       descriptor_pool_,
@@ -2758,12 +2738,11 @@ void dispatch_argsort_op(
 
   if (large_sort) {
     const uint32_t wg_unroll = ncols_padded / 1024u;
-    array tmp(
+    array tmp = acquire_scratch_array(
+        s,
+        kArgsortLargeScratchLane,
         {static_cast<int>(nrows), static_cast<int>(ncols_padded), 2},
-        int32,
-        nullptr,
-        {});
-    tmp.set_data(allocator::malloc(tmp.nbytes()));
+        int32);
 
     const std::array<BoundArray, 3> bound_arrays = {{
         {&in, "src0"},
@@ -2780,6 +2759,7 @@ void dispatch_argsort_op(
         s,
         grid,
         {1024u, wg_unroll});
+    mark_scratch_array_written(s, kArgsortLargeScratchLane);
     return;
   }
 

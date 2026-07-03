@@ -107,10 +107,10 @@ uint32_t max_adaptive_deferred_ops() {
         const int parsed = std::stoi(env);
         return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
       } catch (...) {
-        return 128u;
+        return 32u;
       }
     }
-    return 128u;
+    return 32u;
   }();
   return value;
 }
@@ -417,6 +417,81 @@ void pop_sync_label() {
   }
 }
 
+void sync_copy_buffer(vk::Buffer src, vk::Buffer dst, size_t size) {
+  if (size == 0 || !src || !dst) {
+    return;
+  }
+
+  auto& ctx = VulkanContext::get();
+  auto device = ctx.device();
+  const bool use_transfer = ctx.has_separate_transfer_queue();
+  const uint32_t queue_family = use_transfer ? ctx.transfer_queue_family_index()
+                                             : ctx.compute_queue_family_index();
+  const vk::Queue queue =
+      use_transfer ? ctx.transfer_queue() : ctx.compute_queue();
+
+  vk::CommandPoolCreateInfo pool_info(
+      vk::CommandPoolCreateFlagBits::eTransient, queue_family);
+  vk::CommandPool pool = device.createCommandPool(pool_info);
+
+  vk::CommandBufferAllocateInfo alloc_info(
+      pool, vk::CommandBufferLevel::ePrimary, 1);
+  vk::CommandBuffer cmd = device.allocateCommandBuffers(alloc_info).front();
+
+  cmd.begin(
+      vk::CommandBufferBeginInfo(
+          vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+  vk::BufferCopy copy_region(0, 0, size);
+  cmd.copyBuffer(src, dst, copy_region);
+  cmd.end();
+
+  vk::Fence fence = device.createFence(vk::FenceCreateInfo{});
+  vk::SubmitInfo submit_info;
+  submit_info.setCommandBuffers(cmd);
+  queue.submit(submit_info, fence);
+  throw_if_vk_error(
+      static_cast<VkResult>(device.waitForFences(fence, VK_TRUE, UINT64_MAX)),
+      "[vulkan::raw_ptr] Failed waiting for host readback copy");
+
+  device.destroyFence(fence);
+  device.destroyCommandPool(pool);
+}
+
+void sync_copy_buffer_to_host(vk::Buffer src, vk::Buffer dst, size_t size) {
+  sync_copy_buffer(src, dst, size);
+}
+
+void sync_copy_buffer_to_device(vk::Buffer src, vk::Buffer dst, size_t size) {
+  sync_copy_buffer(src, dst, size);
+}
+
+void ensure_host_readback_mirror(VulkanBuffer* buffer) {
+  if (buffer == nullptr || buffer->mapped_ptr != nullptr || buffer->size == 0 ||
+      !buffer->buffer) {
+    return;
+  }
+
+  auto* host_buf = static_cast<VulkanBuffer*>(buffer->host_readback.ptr());
+  if (host_buf == nullptr ||
+      host_buf->allocation_size < buffer->allocation_size) {
+    if (buffer->host_readback.ptr() != nullptr) {
+      allocator().free(buffer->host_readback);
+    }
+    buffer->host_readback =
+        allocator().malloc_host_visible(buffer->allocation_size);
+    host_buf = static_cast<VulkanBuffer*>(buffer->host_readback.ptr());
+  }
+  if (host_buf == nullptr || host_buf->mapped_ptr == nullptr ||
+      !host_buf->buffer) {
+    throw std::runtime_error(
+        "[vulkan::raw_ptr] Failed to allocate host readback mirror.");
+  }
+
+  sync_copy_buffer_to_host(buffer->buffer, host_buf->buffer, buffer->size);
+  std::lock_guard<std::mutex> lock(buffer->queue_affinity_mutex);
+  buffer->host_readback_dirty = false;
+}
+
 } // namespace
 
 // Stream data structure for Vulkan
@@ -532,7 +607,8 @@ constexpr size_t kStagingArenaAlignment = 256;
 constexpr size_t kDefaultStagingArenaBytes = 1 << 20;
 
 std::shared_ptr<array::Data> make_owned_staging_allocation(size_t size) {
-  auto data = std::make_shared<array::Data>(allocator::malloc(size));
+  auto data =
+      std::make_shared<array::Data>(allocator().malloc_host_visible(size));
   auto* buffer = static_cast<VulkanBuffer*>(data->buffer.ptr());
   if (buffer == nullptr || !buffer->buffer || buffer->mapped_ptr == nullptr) {
     throw std::runtime_error(
@@ -783,6 +859,16 @@ class VulkanDevice {
       submit_commands(stream, "finalize");
     }
     retire_submissions(stream, false);
+    if (stream->in_flight_submissions.size() > max_inflight_submissions()) {
+      if (trace_sync_enabled()) {
+        std::ostringstream oss;
+        oss << "finalize(stream=" << s.index << ") action=drain-inflight"
+            << " inflight=" << stream->in_flight_submissions.size()
+            << " limit=" << max_inflight_submissions();
+        trace_sync(oss.str());
+      }
+      retire_submissions(stream, true);
+    }
     if (trace_sync_enabled()) {
       std::ostringstream oss;
       oss << "finalize(stream=" << s.index
@@ -933,6 +1019,10 @@ class VulkanDevice {
     trace_sync(oss.str());
 
     if (!wait_semaphore || wait_timeline_value == 0) {
+      if (buffer->mapped_ptr == nullptr && buffer->size > 0) {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+        ensure_host_readback_mirror(buffer);
+      }
       return;
     }
 
@@ -955,6 +1045,11 @@ class VulkanDevice {
       buffer->last_semaphore = vk::Semaphore();
       buffer->last_timeline_value = 0;
       buffer->queue_affinity = VulkanBuffer::QueueAffinity::None;
+    }
+
+    if (buffer->mapped_ptr == nullptr) {
+      std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+      ensure_host_readback_mirror(buffer);
     }
   }
 
@@ -1342,6 +1437,7 @@ class VulkanDevice {
     // Release references held by already-completed submissions before backend
     // primitives decide whether input buffers are uniquely owned and donatable.
     retire_submissions(stream, false);
+    flush_host_readback_writes(inputs);
 
     if (!deferred_submission_enabled()) {
       return;
@@ -1705,6 +1801,40 @@ class VulkanDevice {
     }
 
     return ranges;
+  }
+
+  void flush_host_readback_writes(const std::vector<array>& arrays) {
+    for (const auto& arr : arrays) {
+      auto data = arr.data_shared_ptr();
+      auto* buffer = referenced_vulkan_buffer(data);
+      if (buffer == nullptr || !buffer->buffer ||
+          buffer->mapped_ptr != nullptr) {
+        continue;
+      }
+
+      bool dirty = false;
+      {
+        std::lock_guard<std::mutex> lock(buffer->queue_affinity_mutex);
+        dirty = buffer->host_readback_dirty;
+      }
+      if (!dirty) {
+        continue;
+      }
+
+      auto* host_buf = static_cast<VulkanBuffer*>(buffer->host_readback.ptr());
+      if (host_buf == nullptr || host_buf->mapped_ptr == nullptr ||
+          !host_buf->buffer) {
+        continue;
+      }
+
+      std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+      sync_copy_buffer_to_device(
+          host_buf->buffer, buffer->buffer, buffer->size);
+      {
+        std::lock_guard<std::mutex> lock(buffer->queue_affinity_mutex);
+        buffer->host_readback_dirty = false;
+      }
+    }
   }
 
   static std::vector<BufferAccessRange> make_potential_donation_writes(
@@ -2143,6 +2273,7 @@ class VulkanDevice {
       VkPhysicalDeviceProperties props{};
       vkGetPhysicalDeviceProperties(
           VulkanContext::get().physical_device(), &props);
+      auto recent_primitives = stream->recent_primitives;
 
       stream->recording = false;
       stream->recording_epoch = 0;
@@ -2192,13 +2323,13 @@ class VulkanDevice {
               << " submit_reason='" << submit_reason << "'"
               << " reset_pool=" << format_vk_result(reset_pool_result)
               << " device='" << props.deviceName << "'";
-      if (!stream->recent_primitives.empty()) {
+      if (!recent_primitives.empty()) {
         details << " recent_primitives='";
-        for (size_t i = 0; i < stream->recent_primitives.size(); ++i) {
+        for (size_t i = 0; i < recent_primitives.size(); ++i) {
           if (i > 0) {
             details << ",";
           }
-          details << stream->recent_primitives[i];
+          details << recent_primitives[i];
         }
         details << "'";
       }

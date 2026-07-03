@@ -61,6 +61,7 @@ void main() {
             continue;
         }
 
-        data_d[rowx*p.KX + col] *= D_TYPE(rcpdivisor);
+        const uint elem_idx = rowx*p.KX + col;
+        store_d(elem_idx, load_d(elem_idx) * rcpdivisor);
     }
 }

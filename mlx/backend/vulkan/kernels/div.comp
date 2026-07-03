@@ -7,6 +7,30 @@ const uint num_threads = 256;
 
 layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
 
+FLOAT_TYPE load_a(uint idx) {
+#if defined(DATA_A_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_a[idx])));
+#else
+    return FLOAT_TYPE(data_a[idx]);
+#endif
+}
+
+FLOAT_TYPE load_b(uint idx) {
+#if defined(DATA_B_BF16)
+    return FLOAT_TYPE(bf16_to_fp32(uint(data_b[idx])));
+#else
+    return FLOAT_TYPE(data_b[idx]);
+#endif
+}
+
+void store_d(uint idx, FLOAT_TYPE value) {
+#if defined(DATA_D_BF16)
+    data_d[idx] = D_TYPE(fp32_to_bf16(float(value)));
+#else
+    data_d[idx] = D_TYPE(value);
+#endif
+}
+
 void main() {
     uint idx = get_idx();
 
@@ -20,15 +44,15 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03);
 
-        precise FLOAT_TYPE x = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]);
-        precise FLOAT_TYPE y = FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
+        precise FLOAT_TYPE x = load_a(get_aoffset() + src0_idx(i00, i01, i02, i03));
+        precise FLOAT_TYPE y = load_b(get_boffset() + src1_idx(i00, i01, i02, i03));
         precise FLOAT_TYPE result = x / y;
 #if REFINE_DIV
         if (y != FLOAT_TYPE(0.0) && !isnan(result) && !isinf(result)) {
         result += (x - result * y) / y;
         }
 #endif
-        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(result);
+        store_d(get_doffset() + dst_idx(i00, i01, i02, i03), result);
 
         idx += num_threads;
     }

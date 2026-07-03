@@ -11,13 +11,17 @@
 #include "mlx/backend/vulkan/shader_compiler.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
+#include "mlx/transforms.h"
+#include "mlx/transforms_impl.h"
 #include "mlx/utils.h"
 
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -37,6 +41,33 @@ constexpr char kMulMmACastScratchLane[] = "mul_mm.a_f16";
 constexpr char kMulMmBCastScratchLane[] = "mul_mm.b_f16";
 constexpr char kMulMmOutScratchLane[] = "mul_mm.out_work";
 constexpr char kMulMmSplitKScratchLane[] = "mul_mm.split_k";
+constexpr size_t kMulMmTransposeCacheLimit = 16;
+
+struct MulMmTransposeCacheEntry {
+  std::weak_ptr<array::Data> source;
+  const array::Data* source_id{nullptr};
+  Shape source_shape;
+  Strides source_strides;
+  int64_t source_offset{0};
+  Dtype source_dtype;
+  array transposed;
+};
+
+std::mutex& mul_mm_transpose_cache_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::deque<MulMmTransposeCacheEntry>& mul_mm_transpose_cache() {
+  static std::deque<MulMmTransposeCacheEntry> cache;
+  return cache;
+}
+
+bool cacheable_mul_mm_transpose_source(const array& source) {
+  return !source.has_primitive() &&
+      source.status() == array::Status::available &&
+      (source.dtype() == float16 || source.dtype() == bfloat16);
+}
 constexpr char kBlockMaskedMMLhsScratchLane[] = "block_masked_mm.lhs";
 constexpr char kBlockMaskedMMRhsScratchLane[] = "block_masked_mm.rhs";
 
@@ -208,16 +239,14 @@ std::vector<vulkan::StaticShaderId> matvec_shader_candidates(
       return {
           vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16,
           vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16_subgroup,
-          vulkan::StaticShaderId::
-              mul_mat_vec_bf16_bf16_bf16_subgroup_no_shmem,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_bf16_subgroup_no_shmem,
       };
     }
     if (out_dtype == float32) {
       if (prefer_subgroup_matvec()) {
         return {
             vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32_subgroup,
-            vulkan::StaticShaderId::
-                mul_mat_vec_bf16_bf16_f32_subgroup_no_shmem,
+            vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32_subgroup_no_shmem,
             vulkan::StaticShaderId::mul_mat_vec_bf16_bf16_f32,
         };
       }
@@ -811,6 +840,23 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   }
 
   if (arr.has_primitive()) {
+    auto data = arr.data_shared_ptr();
+    if (arr.status() != array::Status::unscheduled &&
+        (data == nullptr || data->buffer.ptr() == nullptr)) {
+      arr.set_status(array::Status::unscheduled);
+    }
+    async_eval(arr);
+    if (has_vulkan_buffer(arr)) {
+      return true;
+    }
+    if (!arr.has_primitive()) {
+      data = arr.data_shared_ptr();
+      if (data == nullptr || data->buffer.ptr() == nullptr) {
+        return false;
+      }
+      arr = contiguous_copy_gpu(arr, s);
+      return has_vulkan_buffer(arr);
+    }
     arr = contiguous_copy_gpu(arr, s);
     return has_vulkan_buffer(arr);
   }
@@ -824,12 +870,103 @@ bool ensure_vulkan_buffer(array& arr, Stream s) {
   }
 
   auto data = arr.data_shared_ptr();
-  if (data == nullptr || !vulkan::is_vulkan_buffer(data->buffer)) {
+  if (data == nullptr || data->buffer.ptr() == nullptr) {
     return false;
   }
 
   arr = contiguous_copy_gpu(arr, s);
   return has_vulkan_buffer(arr);
+}
+
+bool same_mul_mm_transpose_source(
+    const MulMmTransposeCacheEntry& entry,
+    const std::shared_ptr<array::Data>& source_data,
+    const array& source) {
+  auto locked_source = entry.source.lock();
+  return locked_source.get() == source_data.get() &&
+      entry.source_id == source_data.get() &&
+      entry.source_shape == source.shape() &&
+      entry.source_strides == source.strides() &&
+      entry.source_offset == source.offset() &&
+      entry.source_dtype == source.dtype();
+}
+
+std::optional<array> find_cached_mul_mm_transpose(const array& source) {
+  auto source_data = source.data_shared_ptr();
+  if (source_data == nullptr) {
+    return std::nullopt;
+  }
+
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  auto& cache = mul_mm_transpose_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (it->source.expired()) {
+      it = cache.erase(it);
+      continue;
+    }
+    if (same_mul_mm_transpose_source(*it, source_data, source)) {
+      auto cached = it->transposed;
+      auto entry = std::move(*it);
+      cache.erase(it);
+      cache.push_back(std::move(entry));
+      return cached;
+    }
+    ++it;
+  }
+  return std::nullopt;
+}
+
+void cache_mul_mm_transpose(const array& source, const array& transposed) {
+  if (!cacheable_mul_mm_transpose_source(source)) {
+    return;
+  }
+  auto source_data = source.data_shared_ptr();
+  if (source_data == nullptr || transposed.data_shared_ptr() == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  auto& cache = mul_mm_transpose_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (it->source.expired() ||
+        same_mul_mm_transpose_source(*it, source_data, source)) {
+      it = cache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  cache.push_back(
+      MulMmTransposeCacheEntry{
+          source_data,
+          source_data.get(),
+          source.shape(),
+          source.strides(),
+          source.offset(),
+          source.dtype(),
+          transposed});
+  while (cache.size() > kMulMmTransposeCacheLimit) {
+    cache.pop_front();
+  }
+}
+
+array materialize_mul_mm_transpose(array b, Stream s, bool allow_cache = true) {
+  array b_t = swapaxes_in_eval(b, -1, -2);
+  if (is_row_contiguous_zero_offset(b_t)) {
+    return b_t;
+  }
+  if (!ensure_vulkan_buffer(b_t, s)) {
+    return b_t;
+  }
+  if (detail::in_tracing() || detail::retain_graph() || !allow_cache ||
+      !cacheable_mul_mm_transpose_source(b)) {
+    return contiguous_copy_gpu(b_t, s);
+  }
+  if (auto cached = find_cached_mul_mm_transpose(b)) {
+    return *cached;
+  }
+  b_t = contiguous_copy_gpu(b_t, s);
+  cache_mul_mm_transpose(b, b_t);
+  return b_t;
 }
 
 void zero_initialize_output(array& out, Stream s) {
@@ -956,8 +1093,7 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  const bool needs_out_copy =
-      !is_row_contiguous_zero_offset(out) ||
+  const bool needs_out_copy = !is_row_contiguous_zero_offset(out) ||
       (out.dtype() != float32 &&
        !(matrix.dtype() == bfloat16 &&
          (vec_shader_dtype == float16 || vec_shader_dtype == bfloat16) &&
@@ -1003,9 +1139,9 @@ bool try_eval_matvec_vulkan(
                   << " matrix_dtype=" << matrix.dtype()
                   << " vec_shape=" << vec.shape()
                   << " vec_dtype=" << vec.dtype()
-                  << " out_shape=" << out.shape() << " out_dtype="
-                  << out.dtype() << " needs_out_copy=" << needs_out_copy
-                  << "\n";
+                  << " out_shape=" << out.shape()
+                  << " out_dtype=" << out.dtype()
+                  << " needs_out_copy=" << needs_out_copy << "\n";
       }
       if (needs_out_copy) {
         vulkan::mark_scratch_array_written(s, kMatvecOutScratchLane);
@@ -1089,10 +1225,12 @@ bool try_eval_mul_mm_vulkan(
     return true;
   }
 
+  bool b_uses_cast_scratch = false;
   if (a.dtype() == bfloat16 &&
       !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
     a = cast_to_float16_scratch(a, s, kMulMmACastScratchLane);
     b = cast_to_float16_scratch(b, s, kMulMmBCastScratchLane);
+    b_uses_cast_scratch = true;
   }
 
   // Keep BF16 inputs in BF16 and dispatch matmul_bf16* directly.
@@ -1108,12 +1246,15 @@ bool try_eval_mul_mm_vulkan(
     return false;
   }
 
-  array b_t = swapaxes_in_eval(b, -1, -2);
+  array b_t = materialize_mul_mm_transpose(b, s, !b_uses_cast_scratch);
   if (!is_row_contiguous_zero_offset(b_t)) {
     if (!ensure_vulkan_buffer(b_t, s)) {
       return false;
     }
     b_t = contiguous_copy_gpu(b_t, s);
+    if (!b_uses_cast_scratch) {
+      cache_mul_mm_transpose(b, b_t);
+    }
   }
   if (!is_row_contiguous_zero_offset(b_t)) {
     return false;
@@ -2404,6 +2545,15 @@ bool apply_block_mask_vulkan(
 }
 
 } // namespace
+
+namespace vulkan {
+
+void clear_mul_mm_transpose_cache() {
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  mul_mm_transpose_cache().clear();
+}
+
+} // namespace vulkan
 
 bool try_eval_matmul_vulkan(
     const std::vector<array>& inputs,

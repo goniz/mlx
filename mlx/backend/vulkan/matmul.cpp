@@ -64,7 +64,8 @@ std::deque<MulMmTransposeCacheEntry>& mul_mm_transpose_cache() {
 }
 
 bool cacheable_mul_mm_transpose_source(const array& source) {
-  return !source.has_primitive() && source.status() == array::Status::available &&
+  return !source.has_primitive() &&
+      source.status() == array::Status::available &&
       (source.dtype() == float16 || source.dtype() == bfloat16);
 }
 constexpr char kBlockMaskedMMLhsScratchLane[] = "block_masked_mm.lhs";
@@ -934,20 +935,21 @@ void cache_mul_mm_transpose(const array& source, const array& transposed) {
       ++it;
     }
   }
-  cache.push_back(MulMmTransposeCacheEntry{
-      source_data,
-      source_data.get(),
-      source.shape(),
-      source.strides(),
-      source.offset(),
-      source.dtype(),
-      transposed});
+  cache.push_back(
+      MulMmTransposeCacheEntry{
+          source_data,
+          source_data.get(),
+          source.shape(),
+          source.strides(),
+          source.offset(),
+          source.dtype(),
+          transposed});
   while (cache.size() > kMulMmTransposeCacheLimit) {
     cache.pop_front();
   }
 }
 
-array materialize_mul_mm_transpose(array b, Stream s) {
+array materialize_mul_mm_transpose(array b, Stream s, bool allow_cache = true) {
   array b_t = swapaxes_in_eval(b, -1, -2);
   if (is_row_contiguous_zero_offset(b_t)) {
     return b_t;
@@ -955,7 +957,7 @@ array materialize_mul_mm_transpose(array b, Stream s) {
   if (!ensure_vulkan_buffer(b_t, s)) {
     return b_t;
   }
-  if (detail::in_tracing() || detail::retain_graph() ||
+  if (detail::in_tracing() || detail::retain_graph() || !allow_cache ||
       !cacheable_mul_mm_transpose_source(b)) {
     return contiguous_copy_gpu(b_t, s);
   }
@@ -1223,10 +1225,12 @@ bool try_eval_mul_mm_vulkan(
     return true;
   }
 
+  bool b_uses_cast_scratch = false;
   if (a.dtype() == bfloat16 &&
       !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
     a = cast_to_float16_scratch(a, s, kMulMmACastScratchLane);
     b = cast_to_float16_scratch(b, s, kMulMmBCastScratchLane);
+    b_uses_cast_scratch = true;
   }
 
   // Keep BF16 inputs in BF16 and dispatch matmul_bf16* directly.
@@ -1242,13 +1246,15 @@ bool try_eval_mul_mm_vulkan(
     return false;
   }
 
-  array b_t = materialize_mul_mm_transpose(b, s);
+  array b_t = materialize_mul_mm_transpose(b, s, !b_uses_cast_scratch);
   if (!is_row_contiguous_zero_offset(b_t)) {
     if (!ensure_vulkan_buffer(b_t, s)) {
       return false;
     }
     b_t = contiguous_copy_gpu(b_t, s);
-    cache_mul_mm_transpose(b, b_t);
+    if (!b_uses_cast_scratch) {
+      cache_mul_mm_transpose(b, b_t);
+    }
   }
   if (!is_row_contiguous_zero_offset(b_t)) {
     return false;

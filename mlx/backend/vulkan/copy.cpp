@@ -43,6 +43,7 @@ using vulkan::storage_buffer_layout_for_dtype;
 using vulkan::zero_literal_for_dtype;
 
 constexpr size_t kMinTransferQueueCopyBytes = 256 * 1024;
+constexpr size_t kMaxConcatCopyRegions = 4096;
 
 bool has_vulkan_storage(const array& arr) {
   return arr.data_shared_ptr() != nullptr &&
@@ -2097,39 +2098,43 @@ void concatenate_gpu(
         size_post *= out.shape(dim);
       }
 
-      const size_t itemsize = size_of(out.dtype());
-      const size_t out_axis_size = out.shape(axis);
+      // Fall through to the slice-copy path below instead of emitting millions
+      // of vk::BufferCopy regions for large inner-axis concatenations.
+      if (size_pre <= kMaxConcatCopyRegions) {
+        const size_t itemsize = size_of(out.dtype());
+        const size_t out_axis_size = out.shape(axis);
 
-      auto* out_buf =
-          static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
-      auto command_buffer = vulkan::begin_command_recording(s.index);
-      for (int i = 0; i < prepared_inputs.size(); ++i) {
-        const auto& in = prepared_inputs[i];
-        const size_t in_axis_size = in.shape(axis);
-        const size_t elements = in_axis_size * size_post;
-        if (elements == 0) {
-          continue;
+        auto* out_buf =
+            static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
+        auto command_buffer = vulkan::begin_command_recording(s.index);
+        for (int i = 0; i < prepared_inputs.size(); ++i) {
+          const auto& in = prepared_inputs[i];
+          const size_t in_axis_size = in.shape(axis);
+          const size_t elements = in_axis_size * size_post;
+          if (elements == 0) {
+            continue;
+          }
+          auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
+              const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
+          std::vector<vk::BufferCopy> copy_regions;
+          copy_regions.reserve(size_pre);
+          for (size_t prefix = 0; prefix < size_pre; ++prefix) {
+            vk::BufferCopy region{};
+            region.srcOffset = static_cast<VkDeviceSize>(
+                in.offset() + prefix * in_axis_size * size_post * itemsize);
+            region.dstOffset = static_cast<VkDeviceSize>(
+                ((prefix * out_axis_size + sizes[i]) * size_post) * itemsize);
+            region.size = static_cast<VkDeviceSize>(elements * itemsize);
+            copy_regions.push_back(region);
+          }
+          command_buffer.copyBuffer(
+              in_buf->buffer, out_buf->buffer, copy_regions);
+          vulkan::retain_array_for_stream(s, in);
         }
-        auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
-            const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
-        std::vector<vk::BufferCopy> copy_regions;
-        copy_regions.reserve(size_pre);
-        for (size_t prefix = 0; prefix < size_pre; ++prefix) {
-          vk::BufferCopy region{};
-          region.srcOffset = static_cast<VkDeviceSize>(
-              in.offset() + prefix * in_axis_size * size_post * itemsize);
-          region.dstOffset = static_cast<VkDeviceSize>(
-              ((prefix * out_axis_size + sizes[i]) * size_post) * itemsize);
-          region.size = static_cast<VkDeviceSize>(elements * itemsize);
-          copy_regions.push_back(region);
-        }
-        command_buffer.copyBuffer(
-            in_buf->buffer, out_buf->buffer, copy_regions);
-        vulkan::retain_array_for_stream(s, in);
+        vulkan::retain_array_for_stream(s, out);
+        vulkan::end_command_recording(s.index);
+        return;
       }
-      vulkan::retain_array_for_stream(s, out);
-      vulkan::end_command_recording(s.index);
-      return;
     }
   }
 

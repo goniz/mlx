@@ -135,6 +135,11 @@ if(Vulkan_FOUND)
     CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.comp"
   )
+  file(
+    GLOB SHADER_INCLUDE_FILES
+    CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.glsl"
+  )
   set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
   set(SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders.hpp")
   
@@ -152,7 +157,7 @@ if(Vulkan_FOUND)
         --output-dir ${SHADER_OUTPUT_DIR}
         --target-hpp ${SHADER_HEADER}
         --target-cpp ${shader_cpp}
-      DEPENDS ${shader_file} vulkan-shaders-gen
+      DEPENDS ${shader_file} ${SHADER_INCLUDE_FILES} vulkan-shaders-gen
       COMMENT "Generating shader variants for ${shader_name}"
     )
     

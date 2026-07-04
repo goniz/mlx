@@ -31,6 +31,7 @@
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/stream.h"
+#include "mlx/utils.h"
 
 namespace mlx::core::vulkan {
 
@@ -768,6 +769,7 @@ struct StreamData {
   bool last_op_budget_free{false};
   uint32_t submission_count{0};
   bool force_immediate_submit_{false};
+  bool thread_unsafe{false};
   uint32_t decode_barrier_count{0};
   uint32_t decode_hazard_barrier_count{0};
   uint32_t decode_hazard_submit_count{0};
@@ -786,21 +788,30 @@ class VulkanDevice {
     (void)get_stream(index);
   }
 
+  void ensure_thread_unsafe_stream(int index) {
+    (void)get_stream(index, true);
+  }
+
   void validate_stream_thread(Stream s) {
     auto* stream = get_stream(s.index);
+    if (stream->thread_unsafe) {
+      return;
+    }
     if (stream->owner_thread_id != std::this_thread::get_id()) {
       throw std::runtime_error(
           "[vulkan] Stream accessed from a different thread than the one that created it.");
     }
   }
 
-  StreamData* get_stream(int index) {
+  StreamData* get_stream(int index, bool thread_unsafe = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = streams_.find(index);
     if (it == streams_.end()) {
-      auto stream = create_stream(index);
+      auto stream = create_stream(index, thread_unsafe);
       auto [inserted, _] = streams_.emplace(index, std::move(stream));
       it = inserted;
+    } else if (thread_unsafe) {
+      it->second->thread_unsafe = true;
     }
     return it->second.get();
   }
@@ -830,6 +841,18 @@ class VulkanDevice {
     }
 
     retire_submissions(stream, true);
+    {
+      std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+      throw_if_vk_error(
+          wait_for_queue_idle_with_retry(VulkanContext::get().compute_queue()),
+          "[vulkan::synchronize] Failed waiting for compute queue idle");
+      if (VulkanContext::get().has_separate_transfer_queue()) {
+        throw_if_vk_error(
+            wait_for_queue_idle_with_retry(
+                VulkanContext::get().transfer_queue()),
+            "[vulkan::synchronize] Failed waiting for transfer queue idle");
+      }
+    }
     clear_scratch_barriers(stream);
     if (trace_sync_enabled()) {
       std::ostringstream oss;
@@ -923,6 +946,7 @@ class VulkanDevice {
 
   void clear_streams() {
     const auto current_thread = std::this_thread::get_id();
+    const bool clear_thread_unsafe_streams = is_main_thread();
     vk::Device device;
     vk::Queue compute_queue;
     vk::Queue transfer_queue;
@@ -936,7 +960,8 @@ class VulkanDevice {
     } catch (...) {
       std::lock_guard<std::mutex> lock(mutex_);
       for (auto it = streams_.begin(); it != streams_.end();) {
-        if (it->second->owner_thread_id == current_thread) {
+        if (it->second->owner_thread_id == current_thread ||
+            (clear_thread_unsafe_streams && it->second->thread_unsafe)) {
           it = streams_.erase(it);
         } else {
           ++it;
@@ -956,7 +981,8 @@ class VulkanDevice {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = streams_.begin(); it != streams_.end();) {
       auto& stream = it->second;
-      if (stream->owner_thread_id != current_thread) {
+      if (stream->owner_thread_id != current_thread &&
+          !(clear_thread_unsafe_streams && stream->thread_unsafe)) {
         ++it;
         continue;
       }
@@ -1505,6 +1531,8 @@ class VulkanDevice {
 
     auto reads = make_access_ranges(inputs);
     auto writes = make_access_ranges(outputs);
+    auto donation_writes = make_potential_donation_writes(inputs, outputs);
+    writes.insert(writes.end(), donation_writes.begin(), donation_writes.end());
     stream->unsynced_reads.insert(
         stream->unsynced_reads.end(), reads.begin(), reads.end());
     stream->unsynced_writes.insert(
@@ -2197,10 +2225,11 @@ class VulkanDevice {
     }
   }
 
-  std::unique_ptr<StreamData> create_stream(int index) {
+  std::unique_ptr<StreamData> create_stream(int index, bool thread_unsafe) {
     auto stream = std::make_unique<StreamData>();
     stream->stream_index = index;
     stream->owner_thread_id = std::this_thread::get_id();
+    stream->thread_unsafe = thread_unsafe;
 
     vk::SemaphoreTypeCreateInfo timeline_ci;
     timeline_ci.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
@@ -2223,6 +2252,20 @@ class VulkanDevice {
       bool submit_to_transfer_queue = false) {
     if (!stream->recording) {
       return;
+    }
+
+    retire_submissions(stream, false);
+    if (stream->in_flight_submissions.size() >= max_inflight_submissions()) {
+      if (trace_sync_enabled()) {
+        std::ostringstream oss;
+        oss << "submit action=drain-inflight-before-submit"
+            << " stream=" << stream->stream_index
+            << " inflight=" << stream->in_flight_submissions.size()
+            << " limit=" << max_inflight_submissions()
+            << " reason='" << submit_reason << "'";
+        trace_sync(oss.str());
+      }
+      retire_submissions(stream, true);
     }
 
     auto resources = std::move(stream->recording_resources);
@@ -2464,6 +2507,15 @@ class VulkanDevice {
         if (result != VK_TIMEOUT && result != VK_NOT_READY) {
           break;
         }
+        auto idle_result = wait_for_queue_idle_with_retry(queue);
+        if (idle_result != VK_SUCCESS && trace_sync_enabled()) {
+          std::ostringstream oss;
+          oss << "submit queue_idle retry=" << retry
+              << " result=" << format_vk_result(idle_result)
+              << " stream=" << stream->stream_index
+              << " rec_epoch=" << stream->recording_epoch;
+          trace_sync(oss.str());
+        }
         const auto backoff_ms = std::min(8, 1 << std::min(retry, 3));
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
       }
@@ -2572,6 +2624,13 @@ void init() {
 void new_stream(Stream s) {
   if (s.device == mlx::core::Device::gpu) {
     mlx::core::vulkan::VulkanDevice::get().ensure_stream(s.index);
+  }
+}
+
+void new_thread_unsafe_stream(Stream s) {
+  if (s.device == mlx::core::Device::gpu) {
+    mlx::core::vulkan::VulkanDevice::get().ensure_thread_unsafe_stream(
+        s.index);
   }
 }
 

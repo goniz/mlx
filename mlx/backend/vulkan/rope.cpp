@@ -254,8 +254,8 @@ bool try_eval_rope_vulkan(
       position_stride,
       true);
   const std::array<uint32_t, 3> grid = {
-      std::min(pc.nrows, 32768u),
-      std::max(1u, (pc.ne00 + 511u) / 512u),
+      std::max(1u, (std::min(pc.nrows, 32768u) + 15u) / 16u),
+      std::max(1u, (pc.ne00 + 31u) / 32u),
       std::max(1u, (pc.nrows + 32767u) / 32768u)};
 
   try {

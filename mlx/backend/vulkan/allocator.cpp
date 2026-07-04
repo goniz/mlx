@@ -72,6 +72,10 @@ void* Buffer::raw_ptr() {
   return nullptr;
 }
 
+bool can_reuse_alien_buffer(void*) {
+  return true;
+}
+
 } // namespace allocator
 
 namespace vulkan {
@@ -211,7 +215,7 @@ AllocTracePrinter alloc_trace_printer;
 
 size_t query_page_size() {
   auto props = VulkanContext::get().physical_device().getProperties();
-  return std::max<size_t>(props.limits.nonCoherentAtomSize, 1);
+  return std::max<size_t>(props.limits.nonCoherentAtomSize, 4096);
 }
 
 size_t default_max_cacheable_size(size_t max_pool_size) {
@@ -405,17 +409,13 @@ Buffer VulkanAllocator::malloc_impl(size_t size, bool require_host_visible) {
     std::unique_lock lk(mutex_);
     auto* cached = buffer_cache.reuse_from_cache(size);
     if (cached) {
-      if (cached->allocation_size > size + buffer_cache.page_size()) {
-        buffer_cache.recycle_to_cache(cached);
-      } else {
-        cached->size = size;
-        reset_buffer_sync_state(cached);
-        active_memory_ += cached->size;
-        peak_memory_ = std::max(peak_memory_, active_memory_);
-        live_buffers_.insert(cached);
-        trace_alloc(size, cached->allocation_size, true);
-        return Buffer{static_cast<void*>(cached)};
-      }
+      cached->size = size;
+      reset_buffer_sync_state(cached);
+      active_memory_ += cached->allocation_size;
+      peak_memory_ = std::max(peak_memory_, active_memory_);
+      live_buffers_.insert(cached);
+      trace_alloc(size, cached->allocation_size, true);
+      return Buffer{static_cast<void*>(cached)};
     }
 
     // If we have memory pressure, try to reclaim from the cache.
@@ -562,7 +562,7 @@ Buffer VulkanAllocator::malloc_impl(size_t size, bool require_host_visible) {
 
   {
     std::unique_lock lk(mutex_);
-    active_memory_ += buf->size;
+    active_memory_ += buf->allocation_size;
     peak_memory_ = std::max(peak_memory_, active_memory_);
     num_resources_++;
     live_buffers_.insert(buf);
@@ -591,7 +591,7 @@ void VulkanAllocator::free(Buffer buffer) {
       return;
     }
     live_buffers_.erase(buf);
-    active_memory_ -= std::min(active_memory_, buf->size);
+    active_memory_ -= std::min(active_memory_, buf->allocation_size);
     host_readback = buf->host_readback;
     buf->host_readback = Buffer{nullptr};
   }
@@ -642,7 +642,7 @@ void VulkanAllocator::free_vulkan_buffer(VulkanBuffer* buf) {
 
 size_t VulkanAllocator::size(Buffer buffer) const {
   auto* buf = static_cast<VulkanBuffer*>(buffer.ptr());
-  return buf ? buf->size : 0;
+  return buf ? buf->allocation_size : 0;
 }
 
 Buffer VulkanAllocator::make_buffer(void*, size_t) {

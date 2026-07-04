@@ -16,6 +16,7 @@
 #include "mlx/transforms_impl.h"
 
 #include <deque>
+#include <limits>
 #include <mutex>
 
 namespace mlx::core {
@@ -1829,7 +1830,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (x_mat.dtype() == bfloat16) {
     x_mat = ensure_float32_row_contiguous(x_mat, s);
   }
-  auto fused_shader = qmm_rows > 1 && fused_affine_qmm_prefill_enabled()
+  const bool large_qmm_edge_dim = x_mat.ndim() == 2 &&
+      (x_mat.shape(-2) > std::numeric_limits<int16_t>::max() ||
+       out.shape(-1) > std::numeric_limits<int16_t>::max());
+  auto fused_shader = large_qmm_edge_dim
+      ? std::optional<vulkan::StaticShaderId>{}
+      : qmm_rows > 1 && fused_affine_qmm_prefill_enabled()
       ? fused_affine_qmm_shader_id(x_mat.dtype())
       : (bits_ == 8 ? fused_affine_matvec8_shader_id(x_mat.dtype())
                     : fused_affine_matvec_shader_id(x_mat.dtype()));

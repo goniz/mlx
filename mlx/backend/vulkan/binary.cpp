@@ -920,6 +920,9 @@ bool try_eval_binary_op_vulkan(
   const bool bool_add = std::is_same_v<Primitive, Add> &&
       a_input.dtype() == bool_ && b_input.dtype() == bool_ &&
       out.dtype() == bool_;
+  const bool bool_mul = std::is_same_v<Primitive, Multiply> &&
+      a_input.dtype() == bool_ && b_input.dtype() == bool_ &&
+      out.dtype() == bool_;
   const bool small_signed_integer_case = a_input.dtype() == b_input.dtype() &&
       a_input.dtype() == out.dtype() &&
       (a_input.dtype() == int8 || a_input.dtype() == int16);
@@ -948,10 +951,10 @@ bool try_eval_binary_op_vulkan(
       is_same_complex_max(a_input, b_input, out);
   const bool complex_min = std::is_same_v<Primitive, Minimum> &&
       is_same_complex_min(a_input, b_input, out);
-  if (!float_case && !integer_case && !bool_add && !mixed_numeric_div &&
-      !complex_add && !complex_sub && !complex_scalar_mul &&
-      !complex_float_mul && !complex_mul && !complex_div && !complex_max &&
-      !complex_min) {
+  if (!float_case && !integer_case && !bool_add && !bool_mul &&
+      !mixed_numeric_div && !complex_add && !complex_sub &&
+      !complex_scalar_mul && !complex_float_mul && !complex_mul &&
+      !complex_div && !complex_max && !complex_min) {
     trace_binary_unsupported("unsupported_dtype_combo", a_input, b_input);
     return false;
   }
@@ -1027,7 +1030,7 @@ bool try_eval_binary_op_vulkan(
     return try_eval_complex_min_vulkan(a, b, out, s);
   }
 
-  if (bool_add) {
+  if (bool_add || bool_mul) {
     array a_u32(a.shape(), uint32, nullptr, {});
     array b_u32(b.shape(), uint32, nullptr, {});
     copy_gpu(a, a_u32, CopyType::General, s);
@@ -1178,17 +1181,26 @@ bool try_eval_binary_op_vulkan(
   const bool collapsed_rank = a.ndim() > 4 || b.ndim() > 4 || out.ndim() > 4;
   a = collapse_binary_leading_dims(a, s);
   b = collapse_binary_leading_dims(b, s);
+  if (!is_supported_binary_input_layout(a, 0xFFFFu)) {
+    a = contiguous_copy_gpu(a, s);
+  }
+  if (!is_supported_binary_input_layout(b, 0xFFu)) {
+    b = contiguous_copy_gpu(b, s);
+  }
 
-  const bool staged_output = use_f32_staging_io || small_signed_integer_case ||
-      small_unsigned_integer_case || !is_supported_elementwise_layout(out);
+  const bool staged_output = bool_mul || use_f32_staging_io ||
+      small_signed_integer_case || small_unsigned_integer_case ||
+      !is_supported_elementwise_layout(out);
   array out_work = staged_output
       ? array(
             out.shape(),
-            use_f32_staging_io
-                ? float32
-                : (small_signed_integer_case
-                       ? int32
-                       : (small_unsigned_integer_case ? uint32 : out.dtype())),
+            bool_mul ? uint32
+                     : (use_f32_staging_io ? float32
+                                           : (small_signed_integer_case
+                                                  ? int32
+                                                  : (small_unsigned_integer_case
+                                                         ? uint32
+                                                         : out.dtype()))),
             nullptr,
             {})
       : out;

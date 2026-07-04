@@ -2340,13 +2340,39 @@ bool try_eval_rms_norm_vulkan(
     array& out,
     float eps,
     Stream s) {
+  auto trace_rms_norm_unsupported = [&](std::string_view reason,
+                                        const array* x = nullptr,
+                                        const array* w = nullptr) {
+    if (!trace_fallback_enabled()) {
+      return;
+    }
+    std::ostringstream oss;
+    oss << "rms_norm_unsupported reason=" << reason
+        << " out_shape=" << out.shape() << " out_dtype=" << out.dtype();
+    if (x != nullptr) {
+      oss << " x_shape=" << x->shape() << " x_dtype=" << x->dtype()
+          << " x_strides=" << x->strides() << " x_offset=" << x->offset();
+    }
+    if (w != nullptr) {
+      oss << " w_shape=" << w->shape() << " w_dtype=" << w->dtype()
+          << " w_strides=" << w->strides() << " w_offset=" << w->offset();
+    }
+    trace_fallback(oss.str());
+  };
+
   if (inputs.size() != 2) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "rms_norm_unsupported reason=input_count count=" << inputs.size();
+      trace_fallback(oss.str());
+    }
     return false;
   }
 
   array x = inputs[0];
   array w = inputs[1];
   if (x.ndim() == 0 || x.shape() != out.shape()) {
+    trace_rms_norm_unsupported("shape", &x, &w);
     return false;
   }
 
@@ -2354,6 +2380,7 @@ bool try_eval_rms_norm_vulkan(
 
   if (!is_vulkan_float_dtype(x.dtype()) || !is_vulkan_float_dtype(w.dtype()) ||
       !is_vulkan_float_dtype(out.dtype())) {
+    trace_rms_norm_unsupported("dtype", &x, &w);
     return false;
   }
 
@@ -2377,16 +2404,18 @@ bool try_eval_rms_norm_vulkan(
   }
 
   if (w.ndim() > 4) {
+    trace_rms_norm_unsupported("weight_rank", &x, &w);
     return false;
   }
 
   const uint32_t axis_size =
       checked_u32_size(x.shape(x.ndim() - 1), "axis_size");
   if (axis_size == 0 || axis_size > 32u * 512u) {
+    trace_rms_norm_unsupported("axis_size", &x, &w);
     return false;
   }
 
-  if (!x.flags().contiguous || x.strides().back() != 1) {
+  if (!x.flags().contiguous || x.offset() != 0 || x.strides().back() != 1) {
     x = contiguous_copy_gpu(x, s);
   }
   if (has_weight && (!w.flags().row_contiguous || w.offset() != 0)) {
@@ -2394,6 +2423,7 @@ bool try_eval_rms_norm_vulkan(
   }
 
   if (!is_supported_unary_layout(x) || !is_supported_unary_layout(w)) {
+    trace_rms_norm_unsupported("input_layout", &x, &w);
     return false;
   }
 
@@ -2404,6 +2434,7 @@ bool try_eval_rms_norm_vulkan(
   set_unary_output_data(x, out_work);
   if (!out_work.flags().contiguous || out_work.offset() != 0 ||
       out_work.strides().back() != 1 || !is_supported_unary_layout(out_work)) {
+    trace_rms_norm_unsupported("output_layout", &x, &w);
     return false;
   }
 

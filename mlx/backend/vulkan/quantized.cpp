@@ -1749,9 +1749,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.group_size = static_cast<uint32_t>(group_size_);
           push_constants.num_groups = num_groups;
 
-          const bool use_decode_matvec = rows == 1;
-          const bool use_tiled_prefill = rows > 1 && group_size_ >= 32 &&
-              (group_size_ % 32) == 0 &&
+          const bool use_decode_matvec = rows == 1 || decode_lhs;
+          const bool use_tiled_prefill = rows > 1 && !decode_lhs &&
+              group_size_ >= 32 && (group_size_ % 32) == 0 &&
               fused_affine_bf16_tiled_prefill_enabled();
           const bool use_large_n_tile = use_tiled_prefill && cols >= 65536;
           const auto shader_id = use_decode_matvec

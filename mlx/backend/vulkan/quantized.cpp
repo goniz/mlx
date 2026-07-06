@@ -1678,6 +1678,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   const bool vector_lhs = x.ndim() == 1;
   const bool flatten_lhs_batches = x.ndim() > 2 && w.ndim() == 2;
+  const bool decode_lhs = flatten_lhs_batches && x.shape(-2) == 1;
   array x_mat = x;
   if (vector_lhs) {
     Shape mat_shape = {1, x.shape(0)};
@@ -1748,9 +1749,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.group_size = static_cast<uint32_t>(group_size_);
           push_constants.num_groups = num_groups;
 
-          const bool use_decode_matvec = rows == 1;
-          const bool use_tiled_prefill = rows > 1 && group_size_ >= 32 &&
-              (group_size_ % 32) == 0 &&
+          const bool use_decode_matvec = rows == 1 || decode_lhs;
+          const bool use_tiled_prefill = rows > 1 && !decode_lhs &&
+              group_size_ >= 32 && (group_size_ % 32) == 0 &&
               fused_affine_bf16_tiled_prefill_enabled();
           const bool use_large_n_tile = use_tiled_prefill && cols >= 65536;
           const auto shader_id = use_decode_matvec
@@ -1835,6 +1836,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
        out.shape(-1) > std::numeric_limits<int16_t>::max());
   auto fused_shader = large_qmm_edge_dim
       ? std::optional<vulkan::StaticShaderId>{}
+      : decode_lhs ? (bits_ == 8 ? fused_affine_matvec8_shader_id(x_mat.dtype())
+                                 : fused_affine_matvec_shader_id(x_mat.dtype()))
       : qmm_rows > 1 && fused_affine_qmm_prefill_enabled()
       ? fused_affine_qmm_shader_id(x_mat.dtype())
       : (bits_ == 8 ? fused_affine_matvec8_shader_id(x_mat.dtype())
@@ -1861,9 +1864,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     const uint32_t cols = static_cast<uint32_t>(out_work.shape(-1));
     const uint32_t k = static_cast<uint32_t>(x_mat.shape(-1));
     const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
-    const bool decode_like_rows = rows == 1;
+    const bool decode_like_rows = rows == 1 || decode_lhs;
     const bool prefill_like_rows =
-        rows > 1 && fused_affine_qmm_prefill_enabled();
+        rows > 1 && !decode_lhs && fused_affine_qmm_prefill_enabled();
 
     if ((decode_like_rows || prefill_like_rows) &&
         rows == static_cast<uint32_t>(x_mat.shape(-2)) &&

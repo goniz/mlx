@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include <cmath>
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/allocator.h"

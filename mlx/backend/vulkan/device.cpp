@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include "mlx/device.h"
 
 #include <vulkan/vulkan.hpp>

@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include "mlx/backend/vulkan/vulkan.h"
 
 #include "mlx/backend/gpu/copy.h"

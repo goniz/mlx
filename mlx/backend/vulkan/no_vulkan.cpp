@@ -1,5 +1,3 @@
-// Copyright © 2023-2024 Apple Inc.
-
 #include "mlx/primitives.h"
 #include "mlx/backend/vulkan/vulkan_api.h"
 #include "mlx/distributed/primitives.h"

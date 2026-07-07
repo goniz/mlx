@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/primitives_utils.h"

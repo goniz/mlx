@@ -1,4 +1,3 @@
-
 // vk_op_sum_rows_push_constants
 layout (push_constant) uniform parameter
 {

@@ -1,4 +1,3 @@
-
 // Helper to load A_TYPE as float (handles bf16 which is stored as uint16_t)
 #if defined(BF16_TYPE)
 // bfloat16 path - need conversion from uint16_t

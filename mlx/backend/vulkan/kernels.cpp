@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include "mlx/backend/vulkan/kernels.h"
 #include <algorithm>
 #include <array>

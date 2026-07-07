@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include <algorithm>
 #include <limits>
 #include <sstream>

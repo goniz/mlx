@@ -1,5 +1,3 @@
-// Copyright © 2023-2024 Apple Inc.
-
 #include "mlx/backend/vulkan/allocator.h"
 
 #include <algorithm>

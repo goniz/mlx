@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/cpu/copy.h"

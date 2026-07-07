@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>

@@ -1,5 +1,3 @@
-// Copyright © 2024 Apple Inc.
-
 #include "mlx/backend/common/matmul.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/gpu/copy.h"

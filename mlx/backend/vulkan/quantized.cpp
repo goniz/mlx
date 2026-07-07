@@ -1,5 +1,3 @@
-// Copyright © 2026 Apple Inc.
-
 #include "mlx/backend/vulkan/quantized.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"

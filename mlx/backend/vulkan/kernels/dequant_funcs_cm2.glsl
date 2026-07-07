@@ -1,4 +1,3 @@
-
 #include "types.glsl"
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer decodeBufF32 {

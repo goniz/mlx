@@ -4,11 +4,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
-#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
-#include <unordered_map>
 
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/utils.h"
@@ -36,7 +34,6 @@ namespace {
 constexpr char kFlashAttnMaskOptScratchLane[] = "flash_attn.mask_opt";
 constexpr char kFlashAttnSplitKScratchLane[] = "flash_attn.split_k";
 constexpr char kFlashAttnOutScratchLane[] = "flash_attn.out_storage";
-constexpr char kFlashAttnCausalMaskScratchLane[] = "flash_attn.causal_mask";
 constexpr char kFlashAttnQCastScratchLane[] = "flash_attn.q_cast";
 constexpr char kFlashAttnKCastScratchLane[] = "flash_attn.k_cast";
 constexpr char kFlashAttnVCastScratchLane[] = "flash_attn.v_cast";
@@ -313,15 +310,6 @@ CustomKernelFunction make_vulkan_kernel(
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
 array ensure_sdpa_rowwise_layout(array arr, Stream s);
 void eval_sdpa_binary_add_vulkan(array lhs, array rhs, array& out, Stream s);
-
-struct FlashAttentionCausalMaskCacheEntry {
-  Shape shape;
-  bool valid{false};
-};
-
-std::mutex flash_attention_causal_mask_cache_mutex;
-std::unordered_map<int, FlashAttentionCausalMaskCacheEntry>
-    flash_attention_causal_mask_cache;
 
 std::optional<bool> experimental_flash_attention_override() {
   static const std::optional<bool> enabled = []() -> std::optional<bool> {
@@ -953,41 +941,6 @@ void insert_compute_barrier(VkCommandBuffer command_buffer) {
       nullptr,
       0,
       nullptr);
-}
-
-array make_flash_attention_causal_mask(
-    const array& q,
-    const array& k,
-    Stream s) {
-  Shape shape = {q.shape(0), 1, q.shape(2), k.shape(2)};
-  array mask = vulkan::acquire_scratch_array(
-      s, kFlashAttnCausalMaskScratchLane, shape, float16);
-
-  bool needs_refresh = true;
-  {
-    std::lock_guard<std::mutex> lock(flash_attention_causal_mask_cache_mutex);
-    auto& entry = flash_attention_causal_mask_cache[s.index];
-    needs_refresh = !entry.valid || entry.shape != shape;
-    entry.shape = shape;
-    entry.valid = true;
-  }
-
-  if (!needs_refresh) {
-    mask.set_status(array::Status::available);
-    return mask;
-  }
-
-  array mask_f16 = zeros(shape, float16, s);
-  if (mask_f16.dtype() != float16) {
-    throw std::runtime_error("Unexpected causal mask dtype.");
-  }
-  const int n_past = k.shape(2) - q.shape(2);
-  mask_f16 = apply_diag_mask_inf_vulkan(mask_f16, n_past, s);
-  eval(mask_f16);
-  copy_gpu_inplace(mask_f16, mask, CopyType::General, s);
-  mask.set_status(array::Status::evaluated);
-  vulkan::mark_scratch_array_written(s, kFlashAttnCausalMaskScratchLane);
-  return mask;
 }
 
 bool try_dispatch_flash_attention_native_vulkan(
@@ -2101,6 +2054,7 @@ bool try_eval_sdpa_heads_vulkan(
       array v_t = vulkan::acquire_scratch_array(
           s, kFlashAttnVCastScratchLane, v_t_shape, float16);
       copy_gpu(v_src, v_t, CopyType::General, s);
+      vulkan::mark_scratch_array_written(s, kFlashAttnVCastScratchLane);
       v_t.set_status(array::Status::evaluated);
 
       {

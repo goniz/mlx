@@ -29,6 +29,23 @@ bool is_supported_quantized_output_dtype(Dtype dtype) {
   return dtype == float16 || dtype == bfloat16 || dtype == float32;
 }
 
+// Match matmul.cpp: Vulkan requires workgroup counts <= 65535 on common GPUs.
+constexpr uint32_t kMaxComputeWorkGroupCount = 65535;
+
+bool dispatch_grid_within_limits(uint32_t x, uint32_t y = 1, uint32_t z = 1) {
+  const auto limits = vulkan::VulkanContext::get()
+                          .physical_device()
+                          .getProperties()
+                          .limits;
+  const uint32_t max_x = std::min(
+      kMaxComputeWorkGroupCount, limits.maxComputeWorkGroupCount[0]);
+  const uint32_t max_y = std::min(
+      kMaxComputeWorkGroupCount, limits.maxComputeWorkGroupCount[1]);
+  const uint32_t max_z = std::min(
+      kMaxComputeWorkGroupCount, limits.maxComputeWorkGroupCount[2]);
+  return x > 0 && y > 0 && z > 0 && x <= max_x && y <= max_y && z <= max_z;
+}
+
 constexpr size_t kDequantizedWeightCacheLimit = 8;
 
 struct CachedArrayIdentity {
@@ -61,7 +78,8 @@ std::deque<DequantizedWeightCacheEntry>& dequantized_weight_cache() {
 }
 
 bool cacheable_dequant_source(const array& arr) {
-  return !arr.has_primitive() && arr.status() == array::Status::available &&
+  return !arr.has_primitive() && !arr.is_donatable() &&
+      arr.status() == array::Status::available &&
       arr.data_shared_ptr() != nullptr;
 }
 
@@ -364,46 +382,16 @@ Shape expanded_quantized_shape(const array& w, int bits) {
   return out_shape;
 }
 
-array nvfp4_quantize_dequantize(
-    const array& in,
-    Stream s,
-    const std::optional<array>& global_scale) {
-  array xhat = reshape(in, {-1, 16}, s);
-  array scales =
-      divide(max(abs(xhat, s), -1, true, s), array(6.0f, in.dtype()), s);
-  array scale_encode = global_scale.has_value()
-      ? divide(array(448.0f * 6.0f, float32), *global_scale, s)
-      : array(1.0f, float32);
-  array scales_enc = to_fp8(multiply(scales, scale_encode, s), s);
-  array scale = divide(from_fp8(scales_enc, in.dtype(), s), scale_encode, s);
+Shape packed_quantized_shape(const array& x, int bits) {
+  auto out_shape = x.shape();
+  out_shape.back() = x.shape(-1) * bits / 32;
+  return out_shape;
+}
 
-  array lut = astype(
-      array(
-          {+0.0f,
-           +0.5f,
-           +1.0f,
-           +1.5f,
-           +2.0f,
-           +3.0f,
-           +4.0f,
-           +6.0f,
-           -0.0f,
-           -0.5f,
-           -1.0f,
-           -1.5f,
-           -2.0f,
-           -3.0f,
-           -4.0f,
-           -6.0f}),
-      in.dtype(),
-      s);
-  array idx = argmin(
-      abs(subtract(expand_dims(divide(xhat, scale, s), -1, s), lut, s), s),
-      -1,
-      false,
-      s);
-  array dequant = multiply(gather(lut, idx, 0, {1}, s), scale, s);
-  return reshape(dequant, in.shape(), s);
+Shape quantized_scales_shape(const array& x, int group_size) {
+  auto out_shape = x.shape();
+  out_shape.back() = x.shape(-1) / group_size;
+  return out_shape;
 }
 
 bool fp_dequantize_to_float32_fallback(
@@ -783,6 +771,10 @@ void main() {
           bits == 4 ? "dynamic_gather_mxfp4_qmm" : "dynamic_gather_mxfp8_qmm") +
       "_x" + std::to_string(static_cast<int>(x.dtype().val())) + "_o" +
       std::to_string(static_cast<int>(out.dtype().val()));
+  const uint32_t grid_x = (pc.total + 255u) / 256u;
+  if (!dispatch_grid_within_limits(grid_x)) {
+    return false;
+  }
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name, os.str(), 6, arrays, sizeof(PushConstants), s);
   vkCmdPushConstants(
@@ -792,7 +784,7 @@ void main() {
       0,
       sizeof(PushConstants),
       &pc);
-  vkCmdDispatch(dispatch.command_buffer, (pc.total + 255u) / 256u, 1, 1);
+  vkCmdDispatch(dispatch.command_buffer, grid_x, 1, 1);
   vulkan::end_command_recording(s.index);
   return true;
 }
@@ -1035,6 +1027,10 @@ void main() {
                     : "dynamic_gather_mxfp8_qmm_matvec_wg64") +
       "_x" + std::to_string(static_cast<int>(x.dtype().val())) + "_o" +
       std::to_string(static_cast<int>(out.dtype().val()));
+  // One workgroup per output element (col, row, batch)
+  if (!dispatch_grid_within_limits(cols, rows, batches)) {
+    return false;
+  }
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name, os.str(), 6, arrays, sizeof(PushConstants), s);
   vkCmdPushConstants(
@@ -1044,7 +1040,6 @@ void main() {
       0,
       sizeof(PushConstants),
       &pc);
-  // One workgroup per output element (col, row, batch)
   vkCmdDispatch(dispatch.command_buffer, cols, rows, batches);
   vulkan::end_command_recording(s.index);
   return true;
@@ -1806,13 +1801,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
               make_contiguous_strides(out.shape()),
               flags,
               out.size());
-          out.detach();
+          if (!detail::in_tracing() && !detail::retain_graph()) {
+            out.detach();
+          }
           out.set_status(array::Status::evaluated);
           trace_qmm("fused_bf16", "reshaped_output=1");
           return;
         }
 
         out.copy_shared_buffer(out_work);
+        out.set_status(array::Status::evaluated);
         trace_qmm("fused_bf16", "reshaped_output=0");
         return;
       }
@@ -1924,8 +1922,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   if (!fused_dispatched) {
     trace_qmm("dequant_fallback", "reason=fused_conditions_not_met");
-    std::optional<array> cache_biases =
-        mode_ == QuantizationMode::Affine ? biases : std::nullopt;
+    std::optional<array> cache_biases = mode_ == QuantizationMode::Affine
+        ? std::make_optional(inputs[3])
+        : std::nullopt;
     auto cached_w_deq = find_cached_dequantized_weight(
         w, inputs[2], cache_biases, mode_, group_size_, bits_);
     array w_deq = cached_w_deq.value_or(
@@ -2001,7 +2000,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     if (out_work.dtype() == out.dtype()) {
       out.copy_shared_buffer(
           out_work, make_contiguous_strides(out.shape()), flags, out.size());
-      out.detach();
+      if (!detail::in_tracing() && !detail::retain_graph()) {
+        out.detach();
+      }
       out.set_status(array::Status::evaluated);
       return;
     }
@@ -2011,13 +2012,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         out_work, make_contiguous_strides(out.shape()), flags, out.size());
     out.set_data(allocator::malloc(out.nbytes()));
     copy_gpu(out_view, out, CopyType::GeneralGeneral, s);
-    out.detach();
+    if (!detail::in_tracing() && !detail::retain_graph()) {
+      out.detach();
+    }
     out.set_status(array::Status::evaluated);
     return;
   }
 
   if (out_work.dtype() == out.dtype()) {
     out.copy_shared_buffer(out_work);
+    out.set_status(array::Status::evaluated);
     return;
   }
 
@@ -2136,6 +2140,7 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       }
       if (out_work.dtype() == out.dtype()) {
         out.copy_shared_buffer(out_work);
+        out.set_status(array::Status::evaluated);
         return;
       }
       out.set_data(allocator::malloc(out.nbytes()));
@@ -2145,6 +2150,19 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   array x_f32 = ensure_float32_row_contiguous(inputs[0], s);
+  array x_packed(packed_quantized_shape(x_f32, bits_), uint32, nullptr, {});
+  array x_scales(quantized_scales_shape(x_f32, group_size_), uint8, nullptr, {});
+  if (!vulkan::nvfp4_quantize_from_float32(
+          x_f32, x_packed, x_scales, global_scale_x, s)) {
+    throw std::runtime_error(
+        "[QQMatmul::eval_gpu] Failed to quantize lhs on Vulkan.");
+  }
+  array xhat(x_f32.shape(), float32, nullptr, {});
+  if (!vulkan::nvfp4_dequantize_to_float32(
+          x_packed, x_scales, global_scale_x, xhat, s)) {
+    throw std::runtime_error(
+        "[QQMatmul::eval_gpu] Failed to quantize-dequantize lhs on Vulkan.");
+  }
 
   array what(expanded_quantized_shape(inputs[1], bits_), float32, nullptr, {});
   if (!vulkan::nvfp4_dequantize_to_float32(
@@ -2156,7 +2174,7 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   array rhs =
       ensure_row_contiguous_zero_offset(swapaxes_in_eval(what, -1, -2), s);
   array result(out.shape(), float32, nullptr, {});
-  if (!try_eval_matmul_vulkan({x_f32, rhs}, result, s)) {
+  if (!try_eval_matmul_vulkan({xhat, rhs}, result, s)) {
     throw std::runtime_error(
         "[QQMatmul::eval_gpu] Failed to dispatch Vulkan fallback matmul.");
   }
@@ -2364,6 +2382,15 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     push_constants.group_size = static_cast<uint32_t>(group_size_);
     push_constants.num_groups = num_groups;
 
+    const std::array<uint32_t, 3> grid = matvec8_shader.has_value()
+        ? std::array<uint32_t, 3>{cols, rows, batches}
+        : std::array<uint32_t, 3>{
+              (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
+    if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
+      throw std::runtime_error(
+          "[GatherQMM::eval_gpu] Gather dispatch grid exceeds Vulkan workgroup count limits.");
+    }
+
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_gather_affine_matmul_op(
         w,
@@ -2377,15 +2404,13 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         command_buffer,
         s,
         push_constants,
-        matvec8_shader.has_value()
-            ? std::array<uint32_t, 3>{cols, rows, batches}
-            : std::array<uint32_t, 3>{
-                  (cols + 15u) / 16u, (rows + 15u) / 16u, batches});
+        grid);
     vulkan::end_command_recording(s.index);
   }
 
   if (out.dtype() == out_work.dtype()) {
     out.copy_shared_buffer(out_work);
+    out.set_status(array::Status::evaluated);
     return;
   }
   out.set_data(allocator::malloc(out.nbytes()));

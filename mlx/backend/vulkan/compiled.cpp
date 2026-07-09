@@ -943,8 +943,9 @@ void Compiled::eval_gpu(
   int work_per_thread = 16 / max_itemsize;
   work_per_thread = std::max(work_per_thread, 1);
 
-  // Collapse contiguous dims to route to a faster kernel if possible
-  auto [contiguous, shape, strides] =
+  // Collapse contiguous dims to route to a faster kernel if possible. Also
+  // handle all broadcasting.
+  auto [contiguous, negative_strides, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
   auto dispatch_inputs = inputs;
   std::vector<array> pending_inputs;
@@ -1009,8 +1010,10 @@ void Compiled::eval_gpu(
     throw std::runtime_error(msg.str());
   }
 
-  // Use large index if needed
-  bool large = compiled_use_large_index(dispatch_inputs, outputs, contiguous) ||
+  // Use large index if needed (also true for negative strides).
+  bool large =
+      negative_strides ||
+      compiled_use_large_index(dispatch_inputs, outputs, contiguous) ||
       outputs[0].data_size() > std::numeric_limits<uint32_t>::max();
   if (large && !contiguous) {
     throw std::runtime_error(

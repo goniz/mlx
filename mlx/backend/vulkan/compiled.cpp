@@ -397,6 +397,16 @@ std::string get_glsl_operator(const std::string& primitive_name) {
   return primitive_name; // Function call style
 }
 
+// Pack a possibly-negative stride into the uint params buffer as int32 bits.
+inline uint32_t pack_param_stride(int64_t stride) {
+  if (stride > static_cast<int64_t>(std::numeric_limits<int32_t>::max()) ||
+      stride < static_cast<int64_t>(std::numeric_limits<int32_t>::min())) {
+    throw std::runtime_error(
+        "Compiled kernel failed on Vulkan (stride does not fit in int32).");
+  }
+  return static_cast<uint32_t>(static_cast<int32_t>(stride));
+}
+
 // Build GLSL kernel source for the compiled tape
 inline void build_glsl_kernel(
     std::string& os,
@@ -407,6 +417,7 @@ inline void build_glsl_kernel(
     const std::function<bool(size_t)>& is_constant,
     const std::unordered_set<uintptr_t>& constant_ids,
     bool contiguous,
+    bool signed_strides,
     int ndim,
     int work_per_thread,
     uint32_t params_binding) {
@@ -550,6 +561,11 @@ layout(push_constant) uniform PushConstants {
  
 )";
 
+  if (signed_strides) {
+    // Same-size uint->int conversion preserves the bit pattern in GLSL.
+    os += "int as_int(uint u) { return int(u); }\n";
+  }
+
   // Main kernel function
   os += "void main() {\n";
   os += fmt::format("  uint base_idx = gl_GlobalInvocationID.x * {};\n", wpt);
@@ -637,31 +653,62 @@ layout(push_constant) uniform PushConstants {
         }
       }
       uint32_t input_strides_offset = input_strides_base + stride_set * ndim;
-      os += fmt::format("    uint loc_{} = p[{}u];\n", xname, param_offset);
-      for (int axis = ndim - 1; axis >= 0; --axis) {
+      if (signed_strides) {
         os += fmt::format(
-            "    loc_{0} += coord_{1} * p[{2}u];\n",
-            xname,
-            axis,
-            input_strides_offset + axis);
-      }
-      if (x.dtype() == bool_) {
-        os += fmt::format(
-            "    {} t_{} = ({}[loc_{}] != uint8_t(0));\n",
-            type_str,
-            xname,
-            xname,
-            xname);
-      } else if (x.dtype() == bfloat16) {
-        os += fmt::format(
-            "    {} t_{} = bf16_to_fp32(uint({}[loc_{}]));\n",
-            type_str,
-            xname,
-            xname,
-            xname);
+            "    int loc_{} = as_int(p[{}u]);\n", xname, param_offset);
+        for (int axis = ndim - 1; axis >= 0; --axis) {
+          os += fmt::format(
+              "    loc_{0} += int(coord_{1}) * as_int(p[{2}u]);\n",
+              xname,
+              axis,
+              input_strides_offset + axis);
+        }
+        os += fmt::format("    uint uloc_{0} = uint(loc_{0});\n", xname);
+        if (x.dtype() == bool_) {
+          os += fmt::format(
+              "    {} t_{} = ({}[uloc_{}] != uint8_t(0));\n",
+              type_str,
+              xname,
+              xname,
+              xname);
+        } else if (x.dtype() == bfloat16) {
+          os += fmt::format(
+              "    {} t_{} = bf16_to_fp32(uint({}[uloc_{}]));\n",
+              type_str,
+              xname,
+              xname,
+              xname);
+        } else {
+          os += fmt::format(
+              "    {} t_{} = {}[uloc_{}];\n", type_str, xname, xname, xname);
+        }
       } else {
-        os += fmt::format(
-            "    {} t_{} = {}[loc_{}];\n", type_str, xname, xname, xname);
+        os += fmt::format("    uint loc_{} = p[{}u];\n", xname, param_offset);
+        for (int axis = ndim - 1; axis >= 0; --axis) {
+          os += fmt::format(
+              "    loc_{0} += coord_{1} * p[{2}u];\n",
+              xname,
+              axis,
+              input_strides_offset + axis);
+        }
+        if (x.dtype() == bool_) {
+          os += fmt::format(
+              "    {} t_{} = ({}[loc_{}] != uint8_t(0));\n",
+              type_str,
+              xname,
+              xname,
+              xname);
+        } else if (x.dtype() == bfloat16) {
+          os += fmt::format(
+              "    {} t_{} = bf16_to_fp32(uint({}[loc_{}]));\n",
+              type_str,
+              xname,
+              xname,
+              xname);
+        } else {
+          os += fmt::format(
+              "    {} t_{} = {}[loc_{}];\n", type_str, xname, xname, xname);
+        }
       }
     }
   }
@@ -872,28 +919,59 @@ layout(push_constant) uniform PushConstants {
             "    {}[idx + p[{}u]] = t_{};\n", xname, param_offset, xname);
       }
     } else {
-      os += fmt::format("    uint loc_out_{} = p[{}u];\n", xname, param_offset);
-      for (int axis = ndim - 1; axis >= 0; --axis) {
+      if (signed_strides) {
         os += fmt::format(
-            "    loc_out_{0} += coord_{1} * p[{2}u];\n",
-            xname,
-            axis,
-            output_strides_base + axis);
-      }
-      if (x.dtype() == bool_) {
-        os += fmt::format(
-            "    {}[loc_out_{}] = uint8_t(t_{} ? 1 : 0);\n",
-            xname,
-            xname,
-            xname);
-      } else if (x.dtype() == bfloat16) {
-        os += fmt::format(
-            "    {}[loc_out_{}] = uint16_t(fp32_to_bf16(t_{}));\n",
-            xname,
-            xname,
-            xname);
+            "    int loc_out_{} = as_int(p[{}u]);\n", xname, param_offset);
+        for (int axis = ndim - 1; axis >= 0; --axis) {
+          os += fmt::format(
+              "    loc_out_{0} += int(coord_{1}) * as_int(p[{2}u]);\n",
+              xname,
+              axis,
+              output_strides_base + axis);
+        }
+        os += fmt::format("    uint uloc_out_{0} = uint(loc_out_{0});\n", xname);
+        if (x.dtype() == bool_) {
+          os += fmt::format(
+              "    {}[uloc_out_{}] = uint8_t(t_{} ? 1 : 0);\n",
+              xname,
+              xname,
+              xname);
+        } else if (x.dtype() == bfloat16) {
+          os += fmt::format(
+              "    {}[uloc_out_{}] = uint16_t(fp32_to_bf16(t_{}));\n",
+              xname,
+              xname,
+              xname);
+        } else {
+          os += fmt::format(
+              "    {}[uloc_out_{}] = t_{};\n", xname, xname, xname);
+        }
       } else {
-        os += fmt::format("    {}[loc_out_{}] = t_{};\n", xname, xname, xname);
+        os += fmt::format(
+            "    uint loc_out_{} = p[{}u];\n", xname, param_offset);
+        for (int axis = ndim - 1; axis >= 0; --axis) {
+          os += fmt::format(
+              "    loc_out_{0} += coord_{1} * p[{2}u];\n",
+              xname,
+              axis,
+              output_strides_base + axis);
+        }
+        if (x.dtype() == bool_) {
+          os += fmt::format(
+              "    {}[loc_out_{}] = uint8_t(t_{} ? 1 : 0);\n",
+              xname,
+              xname,
+              xname);
+        } else if (x.dtype() == bfloat16) {
+          os += fmt::format(
+              "    {}[loc_out_{}] = uint16_t(fp32_to_bf16(t_{}));\n",
+              xname,
+              xname,
+              xname);
+        } else {
+          os += fmt::format(
+              "    {}[loc_out_{}] = t_{};\n", xname, xname, xname);
+        }
       }
     }
   }
@@ -1010,14 +1088,18 @@ void Compiled::eval_gpu(
     throw std::runtime_error(msg.str());
   }
 
-  // Use large index if needed (also true for negative strides).
+  // Use large index if needed. Negative strides use a signed int32 strided
+  // path instead of the contiguous large-index chunking path.
   bool large =
-      negative_strides ||
       compiled_use_large_index(dispatch_inputs, outputs, contiguous) ||
       outputs[0].data_size() > std::numeric_limits<uint32_t>::max();
   if (large && !contiguous) {
     throw std::runtime_error(
         "Compiled kernel failed on Vulkan (arrays >2^32 elements are only supported for contiguous layouts).");
+  }
+  if (negative_strides && contiguous) {
+    throw std::runtime_error(
+        "Compiled kernel failed on Vulkan (negative strides require a strided layout).");
   }
   // Build kernel name based on configuration
   std::string kernel_name = kernel_lib_;
@@ -1025,6 +1107,9 @@ void Compiled::eval_gpu(
     kernel_name += "_contiguous";
   } else {
     kernel_name += fmt::format("_strided_{}", shape.size());
+    if (negative_strides) {
+      kernel_name += "_signed";
+    }
   }
   // Check if we already have this kernel compiled (simple cache check)
   auto& manager = vulkan::KernelManager::get();
@@ -1033,7 +1118,8 @@ void Compiled::eval_gpu(
   if (trace_compiled_compile_flow_enabled()) {
     std::cerr << "[vulkan-compiled-flow] eval_gpu enter: " << kernel_name
               << " tape_size=" << tape_.size() << " contiguous=" << contiguous
-              << " large=" << large << " inputs=" << inputs_.size()
+              << " large=" << large << " negative_strides=" << negative_strides
+              << " inputs=" << inputs_.size()
               << " outputs=" << outputs_.size()
               << " cached=" << (existing_shader != nullptr) << "\n";
   } else if (trace_compiled_timing_enabled()) {
@@ -1065,6 +1151,7 @@ void Compiled::eval_gpu(
           is_constant_,
           constant_ids_,
           contiguous,
+          negative_strides,
           static_cast<int>(shape.size()),
           work_per_thread,
           params_binding);
@@ -1262,7 +1349,9 @@ void Compiled::eval_gpu(
     }
     const auto& out_strides = strides[0];
     for (int d = 0; d < static_cast<int>(shape.size()); ++d) {
-      params_data.push_back(static_cast<uint32_t>(out_strides[d]));
+      params_data.push_back(
+          negative_strides ? pack_param_stride(out_strides[d])
+                           : static_cast<uint32_t>(out_strides[d]));
     }
     for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
       if (is_constant_(i) || is_scalar(dispatch_inputs[i])) {
@@ -1276,7 +1365,9 @@ void Compiled::eval_gpu(
       }
       const auto& in_strides = strides[stride_idx];
       for (int d = 0; d < static_cast<int>(shape.size()); ++d) {
-        params_data.push_back(static_cast<uint32_t>(in_strides[d]));
+        params_data.push_back(
+            negative_strides ? pack_param_stride(in_strides[d])
+                             : static_cast<uint32_t>(in_strides[d]));
       }
     }
     for (size_t i = 0; i < dispatch_inputs.size(); ++i) {

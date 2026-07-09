@@ -616,6 +616,7 @@ struct Nvfp4DequantPushConstants {
 struct Nvfp4QuantPushConstants {
   uint32_t ne;
   uint32_t has_global_scale;
+  uint32_t base_group;
 };
 
 struct FusedAffineMatmulPushConstants {

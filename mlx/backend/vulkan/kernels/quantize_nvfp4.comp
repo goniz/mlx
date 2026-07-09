@@ -6,6 +6,7 @@
 layout(push_constant) uniform parameter {
     uint ne;
     uint has_global_scale;
+    uint base_group;
 } p;
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
@@ -61,7 +62,7 @@ uint quant_nvfp4(float x) {
 }
 
 void main() {
-    const uint group = gl_GlobalInvocationID.x;
+    const uint group = p.base_group + gl_GlobalInvocationID.x;
     const uint group_base = group * 16u;
     if (group_base >= p.ne) {
         return;

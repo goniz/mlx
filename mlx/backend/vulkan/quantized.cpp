@@ -1611,19 +1611,35 @@ bool nvfp4_quantize_from_float32(
   push_constants.ne = static_cast<uint32_t>(in.size());
   push_constants.has_global_scale = global_scale.has_value() ? 1u : 0u;
   const uint32_t num_groups = static_cast<uint32_t>(scales.size());
+  if (static_cast<size_t>(num_groups) != scales.size()) {
+    return false;
+  }
 
-  auto command_buffer = vulkan::begin_command_recording(s.index);
-  dispatch_nvfp4_quant_op(
-      in_work,
-      w,
-      scales,
-      global_scale_work,
-      StaticShaderId::quantize_nvfp4_f32,
-      command_buffer,
-      s,
-      push_constants,
-      {num_groups, 1, 1});
-  vulkan::end_command_recording(s.index);
+  const auto limits = VulkanContext::get()
+                          .physical_device()
+                          .getProperties()
+                          .limits;
+  const uint32_t max_groups_x = std::min(
+      kMaxComputeWorkGroupCount, limits.maxComputeWorkGroupCount[0]);
+
+  auto command_buffer = begin_command_recording(s.index);
+  for (uint32_t base_group = 0; base_group < num_groups;
+       base_group += max_groups_x) {
+    const uint32_t chunk =
+        std::min(max_groups_x, num_groups - base_group);
+    push_constants.base_group = base_group;
+    dispatch_nvfp4_quant_op(
+        in_work,
+        w,
+        scales,
+        global_scale_work,
+        StaticShaderId::quantize_nvfp4_f32,
+        command_buffer,
+        s,
+        push_constants,
+        {chunk, 1, 1});
+  }
+  end_command_recording(s.index);
   return true;
 }
 

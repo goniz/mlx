@@ -203,6 +203,101 @@ void extract_complex_real_key_gpu(const array& in, array& out, Stream s) {
   vulkan::end_command_recording(s.index);
 }
 
+std::string build_complex_scalar_logaddexp_shader() {
+  std::ostringstream os;
+  os << vulkan::emit_dynamic_shader_preamble(complex64, complex64, false);
+  os << R"(
+layout(push_constant) uniform PushConstants {
+  uint x_offset;
+  uint y_offset;
+  uint out_offset;
+} pc;
+layout(set = 0, binding = 0) readonly buffer InputX { vec2 data[]; } x_buf;
+layout(set = 0, binding = 1) readonly buffer InputY { vec2 data[]; } y_buf;
+layout(set = 0, binding = 2) writeonly buffer Output { vec2 data[]; } out_buf;
+
+vec2 complex_exp(vec2 z) {
+  float magnitude = exp(z.x);
+  return vec2(magnitude * cos(z.y), magnitude * sin(z.y));
+}
+
+vec2 complex_log(vec2 z) {
+  return vec2(log(length(z)), atan(z.y, z.x));
+}
+
+void main() {
+  vec2 x = x_buf.data[pc.x_offset];
+  vec2 y = y_buf.data[pc.y_offset];
+  float neginf = -1.0 / 0.0;
+  if (all(equal(y, vec2(neginf)))) {
+    out_buf.data[pc.out_offset] = x;
+  } else if (all(equal(x, vec2(neginf)))) {
+    out_buf.data[pc.out_offset] = y;
+  } else {
+    out_buf.data[pc.out_offset] = complex_log(complex_exp(x) + complex_exp(y));
+  }
+}
+)";
+  return os.str();
+}
+
+bool ensure_vulkan_buffer_compare(array& arr, Stream s);
+
+void eval_complex_scalar_logaddexp_gpu(
+    array x,
+    array y,
+    array& out,
+    Stream s) {
+  if (!ensure_vulkan_buffer_compare(x, s) ||
+      !ensure_vulkan_buffer_compare(y, s)) {
+    throw std::runtime_error(
+        "Complex scalar LogAddExp requires Vulkan-backed inputs.");
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  const auto x_offset = static_cast<uint64_t>(x.offset() / size_of(x.dtype()));
+  const auto y_offset = static_cast<uint64_t>(y.offset() / size_of(y.dtype()));
+  const auto out_offset =
+      static_cast<uint64_t>(out.offset() / size_of(out.dtype()));
+  if (x_offset > std::numeric_limits<uint32_t>::max() ||
+      y_offset > std::numeric_limits<uint32_t>::max() ||
+      out_offset > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        "Complex scalar LogAddExp offset exceeds Vulkan shader limits.");
+  }
+
+  struct PushConstants {
+    uint32_t x_offset;
+    uint32_t y_offset;
+    uint32_t out_offset;
+  } pc{
+      static_cast<uint32_t>(x_offset),
+      static_cast<uint32_t>(y_offset),
+      static_cast<uint32_t>(out_offset),
+  };
+  vulkan::DynamicArrayRef arrays[] = {
+      {&x, 0},
+      {&y, 1},
+      {&out, 2},
+  };
+  auto dispatch = vulkan::dispatch_dynamic_compute_begin(
+      "dynamic_logaddexp_c64_scalar",
+      build_complex_scalar_logaddexp_shader(),
+      3,
+      arrays,
+      sizeof(PushConstants),
+      s);
+  vkCmdPushConstants(
+      dispatch.command_buffer,
+      dispatch.pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(PushConstants),
+      &pc);
+  vkCmdDispatch(dispatch.command_buffer, 1, 1, 1);
+  vulkan::end_command_recording(s.index);
+}
+
 template <const uint8_t scalar_size>
 void swap_endianness(uint8_t* data_bytes, size_t N) {
   struct Elem {
@@ -2501,19 +2596,7 @@ void LogAddExp::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (x.dtype() == complex64 && y.dtype() == complex64 &&
       out.dtype() == complex64 && x.size() == 1 && y.size() == 1 &&
       out.size() == 1) {
-    constexpr float neginf = -std::numeric_limits<float>::infinity();
-    const auto xv = x.item<complex64_t>();
-    const auto yv = y.item<complex64_t>();
-    complex64_t result;
-    if (yv.real() == neginf && yv.imag() == neginf) {
-      result = xv;
-    } else if (xv.real() == neginf && xv.imag() == neginf) {
-      result = yv;
-    } else {
-      result = std::log(std::exp(xv) + std::exp(yv));
-    }
-    auto scalar = array(result);
-    copy_gpu(scalar, out, CopyType::General, s);
+    eval_complex_scalar_logaddexp_gpu(x, y, out, s);
     return;
   }
 

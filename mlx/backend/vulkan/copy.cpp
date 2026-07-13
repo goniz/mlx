@@ -18,8 +18,10 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "mlx/backend/vulkan/shader_compiler.h"
 
@@ -262,6 +264,7 @@ std::string build_dynamic_general_copy_shader(
     bool has_dynamic_i_offset,
     bool has_dynamic_o_offset,
     bool use_u32_indices) {
+  const bool use_layout_buffer = use_u32_indices && shape.size() > 4;
   auto glsl_i64_literal = [](int64_t value) {
     if (value < 0) {
       return std::string("(-") + std::to_string(static_cast<uint64_t>(-value)) +
@@ -280,18 +283,20 @@ std::string build_dynamic_general_copy_shader(
     os << "  uint input_base;\n";
     os << "  uint output_base;\n";
     os << "  uint rank;\n";
-    os << "  uint shape0;\n";
-    os << "  uint shape1;\n";
-    os << "  uint shape2;\n";
-    os << "  uint shape3;\n";
-    os << "  uint input_stride0;\n";
-    os << "  uint input_stride1;\n";
-    os << "  uint input_stride2;\n";
-    os << "  uint input_stride3;\n";
-    os << "  uint output_stride0;\n";
-    os << "  uint output_stride1;\n";
-    os << "  uint output_stride2;\n";
-    os << "  uint output_stride3;\n";
+    if (!use_layout_buffer) {
+      os << "  uint shape0;\n";
+      os << "  uint shape1;\n";
+      os << "  uint shape2;\n";
+      os << "  uint shape3;\n";
+      os << "  uint input_stride0;\n";
+      os << "  uint input_stride1;\n";
+      os << "  uint input_stride2;\n";
+      os << "  uint input_stride3;\n";
+      os << "  uint output_stride0;\n";
+      os << "  uint output_stride1;\n";
+      os << "  uint output_stride2;\n";
+      os << "  uint output_stride3;\n";
+    }
   } else {
     os << "  int64_t input_base;\n";
     os << "  int64_t output_base;\n";
@@ -300,19 +305,37 @@ std::string build_dynamic_general_copy_shader(
   }
   os << "} pc;\n";
   os << storage_buffer_layout_for_dtype(in_dtype, 0)
-     << " readonly buffer InputBuffer {"
-     << dtype_to_glsl_storage_type(in_dtype) << " data[];} input_buf;\n";
+     << " readonly buffer InputBuffer {" << dtype_to_glsl_storage_type(in_dtype)
+     << " data[];} input_buf;\n";
   os << storage_buffer_layout_for_dtype(out_dtype, 1)
-     << " buffer OutputBuffer {"
-     << dtype_to_glsl_storage_type(out_dtype) << " data[];} output_buf;\n";
+     << " buffer OutputBuffer {" << dtype_to_glsl_storage_type(out_dtype)
+     << " data[];} output_buf;\n";
+  if (use_layout_buffer) {
+    os << "layout(set = 0, binding = 2) readonly buffer CopyLayout {uint data[];} copy_layout;\n";
+  }
   if (has_dynamic_i_offset) {
-    os << "layout(set = 0, binding = 2) readonly buffer DynamicInputOffset {int64_t data[];} dynamic_i_offset_buf;\n";
+    os << "layout(set = 0, binding = " << (use_layout_buffer ? 3 : 2)
+       << ") readonly buffer DynamicInputOffset {int64_t data[];} dynamic_i_offset_buf;\n";
   }
   if (has_dynamic_o_offset) {
-    os << "layout(set = 0, binding = 3) readonly buffer DynamicOutputOffset {int64_t data[];} dynamic_o_offset_buf;\n";
+    os << "layout(set = 0, binding = " << (use_layout_buffer ? 4 : 3)
+       << ") readonly buffer DynamicOutputOffset {int64_t data[];} dynamic_o_offset_buf;\n";
   }
   if (use_u32_indices) {
-    os << R"(
+    if (use_layout_buffer) {
+      os << R"(
+uint shape_dim(uint dim) {
+  return copy_layout.data[dim];
+}
+uint input_stride_dim(uint dim) {
+  return copy_layout.data[pc.rank + dim];
+}
+uint output_stride_dim(uint dim) {
+  return copy_layout.data[2u * pc.rank + dim];
+}
+)";
+    } else {
+      os << R"(
 uint shape_dim(uint dim) {
   if (dim == 0u) return pc.shape0;
   if (dim == 1u) return pc.shape1;
@@ -332,6 +355,7 @@ uint output_stride_dim(uint dim) {
   return pc.output_stride3;
 }
 )";
+    }
   }
   os << "\nvoid main() {\n";
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
@@ -475,9 +499,6 @@ bool dispatch_dynamic_general_copy(
     throw std::runtime_error(
         "Dynamic Vulkan copy does not support tensors with more than 2^32 elements.");
   }
-  if (shape.size() > 4) {
-    return false;
-  }
 
   const int64_t in_base_offset = element_offset(in);
   const int64_t out_base_offset = element_offset(out);
@@ -491,11 +512,11 @@ bool dispatch_dynamic_general_copy(
       !dynamic_o_offset.has_value() &&
       index_bounds_fit_u32(input_base, shape, i_strides) &&
       index_bounds_fit_u32(output_base, shape, o_strides);
+  const bool use_layout_buffer = use_u32_indices && shape.size() > 4;
 
   std::ostringstream layout_key;
-  layout_key << static_cast<int>(in.dtype().val()) << ':'
-             << use_u32_indices << ':'
-             << dynamic_i_offset.has_value() << ':'
+  layout_key << static_cast<int>(in.dtype().val()) << ':' << use_u32_indices
+             << ':' << dynamic_i_offset.has_value() << ':'
              << dynamic_o_offset.has_value() << ':';
   if (use_u32_indices) {
     layout_key << "rank=" << shape.size();
@@ -524,11 +545,46 @@ bool dispatch_dynamic_general_copy(
   std::vector<vulkan::DynamicArrayRef> arrays;
   arrays.push_back({&in, 0});
   arrays.push_back({&out, 1});
+  std::optional<array> layout_array;
+  if (use_layout_buffer) {
+    // Keep the shader cache keyed only by rank. Per-dispatch shape and stride
+    // metadata is packed as [shape, input strides, output strides].
+    std::vector<uint32_t> layout_data;
+    layout_data.reserve(shape.size() * 3);
+    for (auto dim : shape) {
+      layout_data.push_back(static_cast<uint32_t>(dim));
+    }
+    for (size_t i = 0; i < shape.size(); ++i) {
+      layout_data.push_back(
+          shape[i] <= 1 ? 0u : static_cast<uint32_t>(i_strides[i]));
+    }
+    for (size_t i = 0; i < shape.size(); ++i) {
+      layout_data.push_back(
+          shape[i] <= 1 ? 0u : static_cast<uint32_t>(o_strides[i]));
+    }
+
+    layout_array.emplace(
+        Shape{static_cast<mlx::core::ShapeElem>(layout_data.size())},
+        mlx::core::uint32,
+        nullptr,
+        std::vector<array>{});
+    layout_array->set_data(
+        vulkan::allocator().malloc_host_visible(layout_array->nbytes()));
+    auto* layout_buffer =
+        static_cast<vulkan::VulkanBuffer*>(layout_array->buffer().ptr());
+    if (layout_buffer == nullptr || layout_buffer->mapped_ptr == nullptr) {
+      throw std::runtime_error(
+          "Dynamic Vulkan copy failed to allocate host-visible layout metadata.");
+    }
+    std::memcpy(
+        layout_buffer->mapped_ptr, layout_data.data(), layout_array->nbytes());
+    arrays.push_back({&*layout_array, 2});
+  }
   if (dynamic_i_offset.has_value()) {
-    arrays.push_back({&*dynamic_i_offset, 2});
+    arrays.push_back({&*dynamic_i_offset, use_layout_buffer ? 3u : 2u});
   }
   if (dynamic_o_offset.has_value()) {
-    arrays.push_back({&*dynamic_o_offset, 3});
+    arrays.push_back({&*dynamic_o_offset, use_layout_buffer ? 4u : 3u});
   }
 
   struct PushConstants32 {
@@ -547,9 +603,16 @@ bool dispatch_dynamic_general_copy(
     int64_t dynamic_i_base;
     int64_t dynamic_o_base;
   };
-  const uint32_t push_constant_size = use_u32_indices
-      ? static_cast<uint32_t>(sizeof(PushConstants32))
-      : static_cast<uint32_t>(sizeof(PushConstants64));
+  struct PushConstantsLayout {
+    uint32_t total_elements;
+    uint32_t input_base;
+    uint32_t output_base;
+    uint32_t rank;
+  };
+  const uint32_t push_constant_size = use_layout_buffer
+      ? static_cast<uint32_t>(sizeof(PushConstantsLayout))
+      : use_u32_indices ? static_cast<uint32_t>(sizeof(PushConstants32))
+                        : static_cast<uint32_t>(sizeof(PushConstants64));
   auto dispatch = vulkan::dispatch_dynamic_compute_begin(
       shader_name,
       glsl_source,
@@ -558,7 +621,21 @@ bool dispatch_dynamic_general_copy(
       push_constant_size,
       s);
 
-  if (use_u32_indices) {
+  if (use_layout_buffer) {
+    PushConstantsLayout pc{
+        static_cast<uint32_t>(total_elements),
+        static_cast<uint32_t>(input_base),
+        static_cast<uint32_t>(output_base),
+        static_cast<uint32_t>(shape.size()),
+    };
+    vkCmdPushConstants(
+        dispatch.command_buffer,
+        dispatch.pipeline->layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        push_constant_size,
+        &pc);
+  } else if (use_u32_indices) {
     PushConstants32 pc{};
     pc.total_elements = static_cast<uint32_t>(total_elements);
     pc.input_base = static_cast<uint32_t>(input_base);
@@ -630,8 +707,8 @@ bool dispatch_dynamic_scalar_fill(
      << " readonly buffer InputBuffer {"
      << dtype_to_glsl_storage_type(in.dtype()) << " data[];} input_buf;\n";
   os << storage_buffer_layout_for_dtype(out.dtype(), 1)
-     << " buffer OutputBuffer {"
-     << dtype_to_glsl_storage_type(out.dtype()) << " data[];} output_buf;\n\n";
+     << " buffer OutputBuffer {" << dtype_to_glsl_storage_type(out.dtype())
+     << " data[];} output_buf;\n\n";
   os << "void main() {\n";
   os << "  uint idx = gl_GlobalInvocationID.x;\n";
   os << "  if (idx >= pc.total_elements) return;\n";
@@ -700,11 +777,11 @@ std::string build_dynamic_vector_cast_shader(Dtype in_dtype, Dtype out_dtype) {
 
   os << "layout(push_constant) uniform PushConstants { uint in_offset; uint out_offset; uint total_elements; } pc;\n";
   os << storage_buffer_layout_for_dtype(in_dtype, 0)
-     << " readonly buffer InputBuffer {"
-     << dtype_to_glsl_storage_type(in_dtype) << " data[];} input_buf;\n";
+     << " readonly buffer InputBuffer {" << dtype_to_glsl_storage_type(in_dtype)
+     << " data[];} input_buf;\n";
   os << storage_buffer_layout_for_dtype(out_dtype, 1)
-     << " buffer OutputBuffer {"
-     << dtype_to_glsl_storage_type(out_dtype) << " data[];} output_buf;\n\n";
+     << " buffer OutputBuffer {" << dtype_to_glsl_storage_type(out_dtype)
+     << " data[];} output_buf;\n\n";
   os << "void main() {\n";
   os << "  uint linear_idx = gl_GlobalInvocationID.x;\n";
   os << "  if (linear_idx >= pc.total_elements) {\n";
@@ -1436,30 +1513,6 @@ void copy_gpu_inplace(
             dispatch_shape, dispatch_i_strides, dispatch_o_strides);
   }
 
-  if (dispatch_shape.size() > 4) {
-    Shape sub_shape(dispatch_shape.begin() + 1, dispatch_shape.end());
-    Strides sub_i_strides(
-        dispatch_i_strides.begin() + 1, dispatch_i_strides.end());
-    Strides sub_o_strides(
-        dispatch_o_strides.begin() + 1, dispatch_o_strides.end());
-
-    for (int64_t i = 0; i < dispatch_shape[0]; ++i) {
-      copy_gpu_inplace(
-          in,
-          out,
-          sub_shape,
-          sub_i_strides,
-          sub_o_strides,
-          i_offset + i * dispatch_i_strides[0],
-          o_offset + i * dispatch_o_strides[0],
-          ctype,
-          s,
-          dynamic_i_offset,
-          dynamic_o_offset);
-    }
-    return;
-  }
-
   const auto dispatch_elements = num_elements(dispatch_shape);
   std::optional<array> materialized_in;
   const array* source = &in;
@@ -1555,7 +1608,7 @@ void copy_gpu_inplace(
       ctype == CopyType::GeneralGeneral ||
       (ctype == CopyType::Vector && !same_dtype);
 
-  const bool shader_copy = shader_copy_type &&
+  const bool shader_copy = dispatch_shape.size() <= 4 && shader_copy_type &&
       is_supported_copy_layout(in_view) && is_supported_copy_layout(out_view) &&
       shader_id.has_value();
 
@@ -1620,8 +1673,7 @@ void copy_gpu_inplace(
   const bool dynamic_general_copy = !raw_buffer_copy && !shader_copy &&
       !is_slice_copy &&
       (ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
-      dispatch_shape.size() <= 4 && is_vulkan_storage_array(in_view) &&
-      is_vulkan_storage_array(out_view) &&
+      is_vulkan_storage_array(in_view) && is_vulkan_storage_array(out_view) &&
       supports_dynamic_gpu_cast_pair(in_view.dtype(), out_view.dtype());
   const bool large_shader_offset = (shader_copy || is_slice_copy) &&
       (has_large_element_offset(in_view) || has_large_element_offset(out_view));

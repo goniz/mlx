@@ -335,6 +335,17 @@ bool fused_affine_bf16_tiled_prefill_enabled() {
   return enabled;
 }
 
+bool dequantized_bf16_prefill_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_DEQUANT_BF16_PREFILL");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
 bool is_row_contiguous_zero_offset(const array& arr) {
   if (arr.ndim() == 0) {
     return arr.offset() == 0;
@@ -1154,6 +1165,57 @@ bool affine_dequantize_to_float32(
   return true;
 }
 
+bool affine_dequantize_to_bfloat16(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    Stream s,
+    int group_size,
+    int bits) {
+  if (w.dtype() != uint32 || scales.dtype() != bfloat16 ||
+      biases.dtype() != bfloat16 || out.dtype() != bfloat16) {
+    return false;
+  }
+  if (!is_supported_quantized_bits(bits)) {
+    return false;
+  }
+
+  array w_work = ensure_row_contiguous_zero_offset(w, s);
+  array scales_work = ensure_row_contiguous_zero_offset(scales, s);
+  array biases_work = ensure_row_contiguous_zero_offset(biases, s);
+
+  if (!is_row_contiguous_zero_offset(w_work) ||
+      !is_row_contiguous_zero_offset(scales_work) ||
+      !is_row_contiguous_zero_offset(biases_work)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  AffineDequantPushConstants push_constants{};
+  push_constants.ne = static_cast<uint32_t>(out.size());
+  push_constants.bits = static_cast<uint32_t>(bits);
+  push_constants.group_size = static_cast<uint32_t>(group_size);
+
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  dispatch_affine_dequant_op(
+      w_work,
+      scales_work,
+      biases_work,
+      out,
+      StaticShaderId::affine_dequantize_bf16,
+      command_buffer,
+      s,
+      push_constants,
+      {(push_constants.ne + 255u) / 256u, 1, 1});
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 bool nvfp4_dequantize_to_float32(
     const array& w,
     const array& scales,
@@ -1704,6 +1766,34 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   const uint32_t qmm_rows =
       x_mat.ndim() == 2 ? static_cast<uint32_t>(x_mat.shape(-2)) : 0u;
 
+  auto finalize_bf16_output = [&](array& out_work) {
+    if (vector_lhs || flatten_lhs_batches) {
+      array::Flags flags = out.flags();
+      flags.contiguous = true;
+      flags.row_contiguous = true;
+      if (vector_lhs) {
+        flags.col_contiguous = true;
+      } else {
+        auto max_dim = std::max_element(out.shape().begin(), out.shape().end());
+        flags.col_contiguous =
+            out.size() <= 1 || out.size() == *max_dim;
+      }
+      out.copy_shared_buffer(
+          out_work,
+          make_contiguous_strides(out.shape()),
+          flags,
+          out.size());
+      if (!detail::in_tracing() && !detail::retain_graph()) {
+        out.detach();
+      }
+      out.set_status(array::Status::evaluated);
+      return;
+    }
+
+    out.copy_shared_buffer(out_work);
+    out.set_status(array::Status::evaluated);
+  };
+
   const bool enable_fused_decode_qmm = []() {
     if (const char* env = std::getenv("MLX_VULKAN_FUSED_AFFINE_QMM");
         env != nullptr) {
@@ -1731,6 +1821,44 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           static_cast<uint32_t>(w.shape(-1) * 32 / bits_) == k &&
           num_groups ==
               static_cast<uint32_t>((k + group_size_ - 1) / group_size_)) {
+        const bool use_dequantized_prefill = rows >= 256 && !decode_lhs &&
+            dequantized_bf16_prefill_enabled();
+        if (use_dequantized_prefill) {
+          array w_deq(
+              expanded_quantized_shape(w, bits_), bfloat16, nullptr, {});
+          if (!vulkan::affine_dequantize_to_bfloat16(
+                  w,
+                  scales_bf16,
+                  biases_bf16,
+                  w_deq,
+                  s,
+                  group_size_,
+                  bits_)) {
+            throw std::runtime_error(
+                "[QuantizedMatmul::eval_gpu] Failed to dequantize BF16 weights on Vulkan.");
+          }
+          w_deq.set_status(array::Status::evaluated);
+
+          array rhs_bf16 = swapaxes_in_eval(w_deq, -1, -2);
+          array out_work(
+              (vector_lhs || flatten_lhs_batches)
+                  ? Shape{static_cast<int>(rows), out.shape(-1)}
+                  : out.shape(),
+              bfloat16,
+              nullptr,
+              {});
+          if (!try_eval_matmul_vulkan({x_mat, rhs_bf16}, out_work, s)) {
+            throw std::runtime_error(
+                "[QuantizedMatmul::eval_gpu] Failed to dispatch BF16 prefill matmul.");
+          }
+          finalize_bf16_output(out_work);
+          trace_qmm(
+              "dequant_bf16_prefill",
+              (vector_lhs || flatten_lhs_batches) ? "reshaped_output=1"
+                                                  : "reshaped_output=0");
+          return;
+        }
+
         array out_work(
             (vector_lhs || flatten_lhs_batches)
                 ? Shape{static_cast<int>(rows), out.shape(-1)}
@@ -1762,7 +1890,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           const bool use_tiled_prefill = rows > 1 && !decode_lhs &&
               group_size_ >= 32 && (group_size_ % 32) == 0 &&
               fused_affine_bf16_tiled_prefill_enabled();
-          const bool use_large_n_tile = use_tiled_prefill && cols >= 65536;
+          const bool use_large_n_tile = use_tiled_prefill && cols >= 1024;
           const auto shader_id = use_decode_matvec
               ? vulkan::StaticShaderId::fused_affine_matvec8_bf16_bf16
               : use_large_n_tile
@@ -1801,33 +1929,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           vulkan::end_command_recording(s.index);
         }
 
-        if (vector_lhs || flatten_lhs_batches) {
-          array::Flags flags = out.flags();
-          flags.contiguous = true;
-          flags.row_contiguous = true;
-          if (vector_lhs) {
-            flags.col_contiguous = true;
-          } else {
-            auto max_dim =
-                std::max_element(out.shape().begin(), out.shape().end());
-            flags.col_contiguous = out.size() <= 1 || out.size() == *max_dim;
-          }
-          out.copy_shared_buffer(
-              out_work,
-              make_contiguous_strides(out.shape()),
-              flags,
-              out.size());
-          if (!detail::in_tracing() && !detail::retain_graph()) {
-            out.detach();
-          }
-          out.set_status(array::Status::evaluated);
-          trace_qmm("fused_bf16", "reshaped_output=1");
-          return;
-        }
-
-        out.copy_shared_buffer(out_work);
-        out.set_status(array::Status::evaluated);
-        trace_qmm("fused_bf16", "reshaped_output=0");
+        finalize_bf16_output(out_work);
+        trace_qmm(
+            "fused_bf16",
+            (vector_lhs || flatten_lhs_batches) ? "reshaped_output=1"
+                                                : "reshaped_output=0");
         return;
       }
     }

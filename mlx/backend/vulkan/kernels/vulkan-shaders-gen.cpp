@@ -2205,6 +2205,10 @@ void process_shaders() {
       {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
 
   string_to_spv("affine_dequantize_f32", "affine_dequantize.comp", {});
+  string_to_spv(
+      "affine_dequantize_bf16",
+      "affine_dequantize.comp",
+      {{"OUTPUT_BF16", "1"}});
   string_to_spv("affine_quantize_f32", "affine_quantize.comp", {});
   string_to_spv("dequant_nvfp4_f32", "dequant_nvfp4.comp", {});
   string_to_spv("quantize_nvfp4_f32", "quantize_nvfp4.comp", {});

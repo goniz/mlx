@@ -9,7 +9,7 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W {
-    uint8_t data_w[];
+    uint data_w[];
 };
 layout(binding = 1) readonly buffer SCALES {
     uint16_t data_scales[];
@@ -105,14 +105,28 @@ void main() {
                 ? bf16_to_fp32(uint(data_x[src_row * p.x_row_stride + src_k]))
                 : 0.0f;
         }
-        for (uint i = linear; i < BN * BK; i += thread_count) {
-            const uint c = i / BK;
-            const uint kk = i - c * BK;
+        for (uint i = linear; i < BN * (BK / 4u); i += thread_count) {
+            const uint c = i / (BK / 4u);
+            const uint packed_k = i - c * (BK / 4u);
             const uint src_col = gl_WorkGroupID.x * BN + c;
-            const uint src_k = kb + kk;
-            ws[c][kk] = (src_col < p.cols && src_k < p.K)
-                ? tile_scales[c] * float(data_w[src_col * p.packed_row_bytes + src_k]) + tile_biases[c]
-                : 0.0f;
+            const uint src_k = kb + packed_k * 4u;
+            const uint kk = packed_k * 4u;
+            if (src_col < p.cols && src_k + 3u < p.K) {
+                const uint packed = data_w[
+                    src_col * (p.packed_row_bytes / 4u) + src_k / 4u];
+                const vec4 values = vec4(unpack8(packed));
+                const float scale = tile_scales[c];
+                const float bias = tile_biases[c];
+                ws[c][kk + 0u] = fma(scale, values.x, bias);
+                ws[c][kk + 1u] = fma(scale, values.y, bias);
+                ws[c][kk + 2u] = fma(scale, values.z, bias);
+                ws[c][kk + 3u] = fma(scale, values.w, bias);
+            } else {
+                ws[c][kk + 0u] = 0.0f;
+                ws[c][kk + 1u] = 0.0f;
+                ws[c][kk + 2u] = 0.0f;
+                ws[c][kk + 3u] = 0.0f;
+            }
         }
         barrier();
 

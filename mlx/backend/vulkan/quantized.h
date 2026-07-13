@@ -24,6 +24,15 @@ bool affine_dequantize_to_float32(
     int group_size,
     int bits);
 
+bool affine_dequantize_to_bfloat16(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    Stream s,
+    int group_size,
+    int bits);
+
 bool nvfp4_dequantize_to_float32(
     const array& w,
     const array& scales,

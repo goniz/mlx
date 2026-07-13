@@ -1,7 +1,10 @@
 #version 450
 
+#extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "types.glsl"
 
 layout(push_constant) uniform parameter {
     uint ne;
@@ -12,9 +15,15 @@ layout(push_constant) uniform parameter {
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W { uint8_t data_w[]; };
+#ifdef OUTPUT_BF16
+layout(binding = 1) readonly buffer S { uint16_t data_s[]; };
+layout(binding = 2) readonly buffer B { uint16_t data_b[]; };
+layout(binding = 3) writeonly buffer D { uint16_t data_d[]; };
+#else
 layout(binding = 1) readonly buffer S { float data_s[]; };
 layout(binding = 2) readonly buffer B { float data_b[]; };
 layout(binding = 3) writeonly buffer D { float data_d[]; };
+#endif
 
 uint read_quant(const uint o) {
     if (p.bits == 2u) {
@@ -72,5 +81,11 @@ void main() {
     }
 
     const uint g = o / p.group_size;
-    data_d[o] = data_s[g] * float(read_quant(o)) + data_b[g];
+#ifdef OUTPUT_BF16
+    const float scale = bf16_to_fp32(uint(data_s[g]));
+    const float bias = bf16_to_fp32(uint(data_b[g]));
+    data_d[o] = uint16_t(fp32_to_bf16(fma(scale, float(read_quant(o)), bias)));
+#else
+    data_d[o] = fma(data_s[g], float(read_quant(o)), data_b[g]);
+#endif
 }

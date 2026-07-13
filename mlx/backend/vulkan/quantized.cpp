@@ -259,6 +259,22 @@ std::optional<vulkan::StaticShaderId> gather_affine_qmm_shader_id(
   }
 }
 
+std::optional<vulkan::StaticShaderId> gather_affine_qmm_rhs_shader_id(
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return vulkan::StaticShaderId::gather_affine_qmm_rhs_bf16_bf16;
+  }
+  switch (x_dtype) {
+    case float32:
+      return vulkan::StaticShaderId::gather_affine_qmm_rhs_f32_f32;
+    case float16:
+      return vulkan::StaticShaderId::gather_affine_qmm_rhs_f16_f32;
+    default:
+      return std::nullopt;
+  }
+}
+
 std::optional<vulkan::StaticShaderId> gather_affine_matvec8_shader_id(
     Dtype x_dtype,
     Dtype out_dtype) {
@@ -2478,11 +2494,19 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     throw std::runtime_error("[GatherQMM::eval_gpu] Invalid x batch count.");
   }
 
+  const auto expert_count = w.size() / (w.shape(-2) * w.shape(-1));
+  const bool use_sorted_rhs_qmm = rows == 1 && batches >= 16 && right_sorted_ &&
+      x_batch_count == batches && expert_count > 0 &&
+      batches / expert_count >= 4;
+  const auto sorted_rhs_shader = use_sorted_rhs_qmm
+      ? gather_affine_qmm_rhs_shader_id(x.dtype(), out.dtype())
+      : std::optional<vulkan::StaticShaderId>{};
+
   array out_work(out.shape(), native_bf16 ? bfloat16 : float32, nullptr, {});
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (out_work.size() != 0) {
     vulkan::GatherAffineMatmulPushConstants push_constants{};
-    push_constants.rows = rows;
+    push_constants.rows = sorted_rhs_shader.has_value() ? batches : rows;
     push_constants.cols = cols;
     push_constants.K = k;
     push_constants.packed_row_bytes =
@@ -2504,7 +2528,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     push_constants.group_size = static_cast<uint32_t>(group_size_);
     push_constants.num_groups = num_groups;
 
-    const std::array<uint32_t, 3> grid = matvec8_shader.has_value()
+    const std::array<uint32_t, 3> grid = sorted_rhs_shader.has_value()
+        ? std::array<uint32_t, 3>{(cols + 15u) / 16u,
+                                  (batches + 31u) / 32u, 1u}
+        : matvec8_shader.has_value()
         ? std::array<uint32_t, 3>{cols, rows, batches}
         : std::array<uint32_t, 3>{
               (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
@@ -2522,7 +2549,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         lhs_indices,
         rhs_indices,
         out_work,
-        *shader_id,
+        sorted_rhs_shader.value_or(*shader_id),
         command_buffer,
         s,
         push_constants,

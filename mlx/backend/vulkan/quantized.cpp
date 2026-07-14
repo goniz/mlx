@@ -2514,15 +2514,21 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       : std::optional<vulkan::StaticShaderId>{};
 
   const auto& context = vulkan::VulkanContext::get();
+  const auto device_limits = context.physical_device().getProperties().limits;
   const bool supports_64_lane_subgroups = context.subgroup_size() == 64u ||
       (context.subgroup_size_control_supported() &&
        context.subgroup_min_size() <= 64u &&
        context.subgroup_max_size() >= 64u);
+  const bool supports_expert_coop_workgroup =
+      device_limits.maxComputeWorkGroupInvocations >= 512u &&
+      device_limits.maxComputeWorkGroupSize[0] >= 512u &&
+      device_limits.maxComputeSharedMemorySize >= 27648u;
 #if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
   const bool use_expert_coop_qmm = use_sorted_rhs_qmm && native_bf16 &&
       bits_ == 8 && group_size_ == 64 && expert_count <= 256 &&
       (k % 16u) == 0u && context.coopmat_flash_attention_f32acc_supported() &&
-      supports_64_lane_subgroups && gather_affine_coop_prefill_enabled();
+      supports_64_lane_subgroups && supports_expert_coop_workgroup &&
+      gather_affine_coop_prefill_enabled();
 #else
   const bool use_expert_coop_qmm = false;
 #endif
@@ -2533,8 +2539,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     if (use_expert_coop_qmm) {
 #if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
       const uint32_t max_tiles =
-          (batches + 31u) / 32u + static_cast<uint32_t>(expert_count);
-      const uint32_t metadata_elements = 1u + 4u * max_tiles;
+          (batches + 63u) / 64u + static_cast<uint32_t>(expert_count);
+      const uint32_t metadata_elements = 1u + 3u * max_tiles + batches;
       array metadata(
           {static_cast<int>(metadata_elements)}, uint32, nullptr, {});
       metadata.set_data(allocator::malloc(metadata.nbytes()));
@@ -2571,7 +2577,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       push_constants.group_size = static_cast<uint32_t>(group_size_);
       push_constants.max_tiles = max_tiles;
 
-      const std::array<uint32_t, 3> grid = {(cols + 15u) / 16u, max_tiles, 1u};
+      const std::array<uint32_t, 3> grid = {(cols + 127u) / 128u, max_tiles, 1u};
       if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
         throw std::runtime_error(
             "[GatherQMM::eval_gpu] Cooperative gather dispatch grid exceeds Vulkan workgroup count limits.");

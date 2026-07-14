@@ -561,7 +561,9 @@ vulkan::StaticShaderId flash_attention_main_shader(
     const std::string value(env);
     if (value == "cm1") {
       if (kv_bf16) {
-        return vulkan::StaticShaderId::flash_attn_f32_f16_bf16;
+        return path == FlashAttentionTuningParams::Path::CoopMat1
+            ? vulkan::StaticShaderId::flash_attn_f32_f16_bf16_cm1
+            : vulkan::StaticShaderId::flash_attn_f32_f16_bf16;
       }
       return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
     }
@@ -573,7 +575,9 @@ vulkan::StaticShaderId flash_attention_main_shader(
     }
     if (value == "f16acc") {
       if (kv_bf16) {
-        return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_f16acc;
+        return path == FlashAttentionTuningParams::Path::CoopMat1
+            ? vulkan::StaticShaderId::flash_attn_f32_f16_bf16_f16acc_cm1
+            : vulkan::StaticShaderId::flash_attn_f32_f16_bf16_f16acc;
       }
       return path == FlashAttentionTuningParams::Path::CoopMat1
           ? vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc_cm1
@@ -581,7 +585,9 @@ vulkan::StaticShaderId flash_attention_main_shader(
     }
   }
   if (kv_bf16) {
-    return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_fp32;
+    return path == FlashAttentionTuningParams::Path::CoopMat1
+        ? vulkan::StaticShaderId::flash_attn_f32_f16_bf16_cm1
+        : vulkan::StaticShaderId::flash_attn_f32_f16_bf16_fp32;
   }
   if (path == FlashAttentionTuningParams::Path::CoopMat1) {
     return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
@@ -855,9 +861,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
   uint32_t workgroups_y = q_heads;
   const uint32_t qk_ratio = kv_heads == 0u ? 0u : q_heads / kv_heads;
 
-  auto tuning = use_native_bf16_kv
-      ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
-      : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
+  auto tuning = get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
 
   // Pack GQA heads into rows only for decode; doing this for short prefill
   // conflates sequence rows and corrupts small-prompt attention.
@@ -866,9 +870,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
     gqa_ratio = qk_ratio;
     n_rows = gqa_ratio;
     workgroups_y /= gqa_ratio;
-    tuning = use_native_bf16_kv
-        ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
-        : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
+    tuning = get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
   }
 
   const bool aligned = (kv_len % tuning.block_cols) == 0 &&

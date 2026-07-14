@@ -7,6 +7,7 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
 
 #include "types.glsl"
 
@@ -113,6 +114,7 @@ void main() {
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accum1 =
         coopmat<float, gl_ScopeSubgroup, 16, 16,
             gl_MatrixUseAccumulator>(0.0f);
+    bool requires_fp32_weight = false;
 
     for (uint kb = 0u; kb < p.K; kb += BK) {
         for (uint pair_idx = lane; pair_idx < BM * (BK / 2u);
@@ -143,10 +145,28 @@ void main() {
             float16_t w0 = float16_t(0.0f);
             float16_t w1 = float16_t(0.0f);
             if (src_col < p.cols && k0 < p.K) {
-                w0 = float16_t(dequant_w(expert, src_col, k0));
-            }
-            if (src_col < p.cols && k0 + 1u < p.K) {
-                w1 = float16_t(dequant_w(expert, src_col, k0 + 1u));
+                const uint group = k0 / p.group_size;
+                const uint row_base = expert * p.w_matrix_stride_bytes +
+                    src_col * p.packed_row_bytes;
+                const uint scale_base = expert * p.scale_matrix_stride +
+                    src_col * p.scale_row_stride;
+                const uint bias_base = expert * p.bias_matrix_stride +
+                    src_col * p.bias_row_stride;
+                const float scale = bf16_to_fp32(
+                    uint(data_scales[scale_base + group]));
+                const float bias = bf16_to_fp32(
+                    uint(data_biases[bias_base + group]));
+                if ((k0 & 63u) == 0u &&
+                    (abs(bias) > 65504.0f ||
+                     abs(scale * 255.0f + bias) > 65504.0f)) {
+                    requires_fp32_weight = true;
+                }
+                w0 = float16_t(
+                    scale * float(data_w[row_base + k0]) + bias);
+                if (k0 + 1u < p.K) {
+                    w1 = float16_t(
+                        scale * float(data_w[row_base + k0 + 1u]) + bias);
+                }
             }
             ws[col * SHMEM_STRIDE + pair] = f16vec2(w0, w1);
         }
@@ -173,6 +193,26 @@ void main() {
         accum0 = coopMatMulAdd(matrix_a0, matrix_b, accum0);
         accum1 = coopMatMulAdd(matrix_a1, matrix_b, accum1);
         barrier();
+    }
+
+    if (subgroupAny(requires_fp32_weight)) {
+        for (uint index = lane; index < BM * BN; index += 64u) {
+            const uint row = index / BN;
+            const uint col = index - row * BN;
+            const uint src_row = row_start + row;
+            const uint src_col = col_start + col;
+            if (row < valid_rows && src_col < p.cols) {
+                float acc = 0.0f;
+                for (uint k = 0u; k < p.K; ++k) {
+                    const float x = bf16_to_fp32(
+                        uint(data_x[src_row * p.x_row_stride + k]));
+                    acc = fma(x, dequant_w(expert, src_col, k), acc);
+                }
+                data_out[src_row * p.out_row_stride + src_col] =
+                    uint16_t(fp32_to_bf16(acc));
+            }
+        }
+        return;
     }
 
     coopMatStore(

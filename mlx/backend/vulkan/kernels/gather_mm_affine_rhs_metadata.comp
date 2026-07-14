@@ -1,11 +1,16 @@
 #version 450
 
+#extension GL_EXT_shader_16bit_storage : require
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer RHS_INDICES {
     uint data_rhs_indices[];
 };
-layout(binding = 1) writeonly buffer METADATA {
+layout(binding = 1) readonly buffer X {
+    uint16_t data_x[];
+};
+layout(binding = 2) buffer METADATA {
     uint data_metadata[];
 };
 
@@ -13,11 +18,15 @@ layout(push_constant) uniform parameter {
     uint rows;
     uint expert_count;
     uint max_tiles;
+    uint K;
+    uint x_row_stride;
+    uint scan_ranges;
 } p;
 
 const uint BM = 32u;
 
 shared uint expert_starts[257];
+shared uint requires_fp32;
 
 uint lower_bound_expert(const uint expert) {
     uint lo = 0u;
@@ -35,6 +44,37 @@ uint lower_bound_expert(const uint expert) {
 
 void main() {
     const uint lane = gl_LocalInvocationID.x;
+    if (p.scan_ranges != 0u) {
+        const uint tile = gl_WorkGroupID.x;
+        if (tile >= data_metadata[0]) {
+            return;
+        }
+        if (lane == 0u) {
+            requires_fp32 = 0u;
+        }
+        barrier();
+
+        const uint row_start = data_metadata[1u + p.max_tiles + tile];
+        const uint valid_rows =
+            data_metadata[1u + 2u * p.max_tiles + tile];
+        const uint tile_elements = valid_rows * p.K;
+        for (uint index = lane; index < tile_elements; index += 256u) {
+            const uint row = index / p.K;
+            const uint k = index - row * p.K;
+            const uint x_abs_bits = uint(data_x[
+                (row_start + row) * p.x_row_stride + k]) & 0x7fffu;
+            if (x_abs_bits >= 0x4780u && x_abs_bits < 0x7f80u) {
+                atomicOr(requires_fp32, 1u);
+                break;
+            }
+        }
+        barrier();
+        if (lane == 0u) {
+            data_metadata[1u + 3u * p.max_tiles + tile] = requires_fp32;
+        }
+        return;
+    }
+
     if (lane < p.expert_count) {
         expert_starts[lane] = lower_bound_expert(lane);
     }

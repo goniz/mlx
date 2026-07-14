@@ -607,7 +607,7 @@ const std::array<KernelSpec, 42> kKernelSpecs = {
         sizeof(GatherAffineMatmulPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
-        {0, 1},
+        {0, 1, 2},
         sizeof(GatherAffineTileMetadataPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
@@ -4187,8 +4187,9 @@ void dispatch_gather_affine_coop_matmul_op(
     const GatherAffineTileMetadataPushConstants& metadata_push_constants,
     const GatherAffineCoopMatmulPushConstants& matmul_push_constants,
     const std::array<uint32_t, 3>& grid) {
-  const std::array<BoundArray, 2> metadata_arrays = {{
+  const std::array<BoundArray, 3> metadata_arrays = {{
       {&rhs_indices, "RHS_INDICES"},
+      {&x, "X"},
       {&metadata, "METADATA"},
   }};
   dispatch_with_spec(
@@ -4205,6 +4206,30 @@ void dispatch_gather_affine_coop_matmul_op(
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(
+      cmd_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
+
+  auto range_push_constants = metadata_push_constants;
+  range_push_constants.scan_ranges = 1u;
+  dispatch_with_spec(
+      StaticShaderId::gather_affine_qmm_rhs_metadata,
+      KernelSpecId::GatherAffineTileMetadata,
+      metadata_arrays,
+      range_push_constants,
+      metadata_push_constants.rows,
+      cmd_buffer,
+      s,
+      std::array<uint32_t, 3>{metadata_push_constants.max_tiles, 1u, 1u});
+
   vkCmdPipelineBarrier(
       cmd_buffer,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

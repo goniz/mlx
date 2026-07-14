@@ -656,6 +656,9 @@ struct GatherAffineTileMetadataPushConstants {
   uint32_t rows;
   uint32_t expert_count;
   uint32_t max_tiles;
+  uint32_t K;
+  uint32_t x_row_stride;
+  uint32_t scan_ranges;
 };
 
 struct GatherAffineCoopMatmulPushConstants {

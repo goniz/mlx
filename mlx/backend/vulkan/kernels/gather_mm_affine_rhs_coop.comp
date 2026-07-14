@@ -81,6 +81,28 @@ void main() {
     const uint row_start = data_metadata[1u + p.max_tiles + tile];
     const uint col_start = gl_WorkGroupID.x * BN;
     const uint valid_rows = data_metadata[1u + 2u * p.max_tiles + tile];
+    const bool use_fp32_tile =
+        data_metadata[1u + 3u * p.max_tiles + tile] != 0u;
+
+    if (use_fp32_tile) {
+        for (uint index = lane; index < BM * BN; index += 64u) {
+            const uint row = index / BN;
+            const uint col = index - row * BN;
+            const uint src_row = row_start + row;
+            const uint src_col = col_start + col;
+            if (row < valid_rows && src_col < p.cols) {
+                float acc = 0.0f;
+                for (uint k = 0u; k < p.K; ++k) {
+                    const float x = bf16_to_fp32(
+                        uint(data_x[src_row * p.x_row_stride + k]));
+                    acc = fma(x, dequant_w(expert, src_col, k), acc);
+                }
+                data_out[src_row * p.out_row_stride + src_col] =
+                    uint16_t(fp32_to_bf16(acc));
+            }
+        }
+        return;
+    }
 
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matrix_a0;
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matrix_a1;

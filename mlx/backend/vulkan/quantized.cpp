@@ -2534,7 +2534,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 #if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
       const uint32_t max_tiles =
           (batches + 31u) / 32u + static_cast<uint32_t>(expert_count);
-      const uint32_t metadata_elements = 1u + 3u * max_tiles;
+      const uint32_t metadata_elements = 1u + 4u * max_tiles;
       array metadata(
           {static_cast<int>(metadata_elements)}, uint32, nullptr, {});
       metadata.set_data(allocator::malloc(metadata.nbytes()));
@@ -2544,6 +2544,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       metadata_push_constants.expert_count =
           static_cast<uint32_t>(expert_count);
       metadata_push_constants.max_tiles = max_tiles;
+      metadata_push_constants.K = k;
+      metadata_push_constants.x_row_stride =
+          static_cast<uint32_t>(x.strides(-2));
+      metadata_push_constants.scan_ranges = 0u;
 
       vulkan::GatherAffineCoopMatmulPushConstants push_constants{};
       push_constants.rows = batches;

@@ -2305,6 +2305,18 @@ void process_shaders() {
        {"TO_FLOAT_TYPE", "bf16_to_fp32"},
        {"SCALE_TO_FLOAT_TYPE(x)", "bf16_to_fp32(uint(x))"},
        {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
+  string_to_spv(
+      "gather_affine_qmm_rhs_metadata",
+      "gather_mm_affine_rhs_metadata.comp",
+      {});
+#if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
+  string_to_spv(
+      "gather_affine_qmm_rhs_bf16_bf16",
+      "gather_mm_affine_rhs_coop.comp",
+      {},
+      true,
+      true);
+#endif
 
   string_to_spv(
       "gather_affine_matvec8_f32_f32",

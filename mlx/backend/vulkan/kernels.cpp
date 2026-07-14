@@ -240,6 +240,12 @@ PipelineCreationOptions pipeline_creation_options(
     const std::vector<uint32_t>& specialization_constants) {
   PipelineCreationOptions options;
 
+  if (shader_name == "gather_affine_qmm_rhs_bf16_bf16_cm1") {
+    options.require_full_subgroups = true;
+    options.required_subgroup_size = 64;
+    return options;
+  }
+
   if ((shader_name == "soft_max_f32" || shader_name == "soft_max_f32_f16" ||
        shader_name == "soft_max_bf16") &&
       !specialization_constants.empty()) {
@@ -430,6 +436,8 @@ enum class KernelSpecId {
   Nvfp4Quant,
   FusedAffineMatmul,
   GatherAffineMatmul,
+  GatherAffineTileMetadata,
+  GatherAffineCoopMatmul,
   Nvfp4QMatmul,
   LayerNormAffine,
   RMSNormBack,
@@ -461,7 +469,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 40> kKernelSpecs = {
+const std::array<KernelSpec, 42> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -597,6 +605,14 @@ const std::array<KernelSpec, 40> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4, 5, 6},
         sizeof(GatherAffineMatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1},
+        sizeof(GatherAffineTileMetadataPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 5},
+        sizeof(GatherAffineCoopMatmulPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1, 2, 3, 4, 5},
@@ -4155,6 +4171,72 @@ void dispatch_gather_affine_matmul_op(
       s,
       grid,
       matmul_specialization_constants({}));
+}
+
+void dispatch_gather_affine_coop_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& x,
+    const array& rhs_indices,
+    array& metadata,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const GatherAffineTileMetadataPushConstants& metadata_push_constants,
+    const GatherAffineCoopMatmulPushConstants& matmul_push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 2> metadata_arrays = {{
+      {&rhs_indices, "RHS_INDICES"},
+      {&metadata, "METADATA"},
+  }};
+  dispatch_with_spec(
+      StaticShaderId::gather_affine_qmm_rhs_metadata,
+      KernelSpecId::GatherAffineTileMetadata,
+      metadata_arrays,
+      metadata_push_constants,
+      metadata_push_constants.rows,
+      cmd_buffer,
+      s,
+      std::array<uint32_t, 3>{1u, 1u, 1u});
+
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(
+      cmd_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
+
+  const std::array<BoundArray, 6> matmul_arrays = {{
+      {&w, "W"},
+      {&scales, "SCALES"},
+      {&biases, "BIASES"},
+      {&x, "X"},
+      {&metadata, "METADATA"},
+      {&out, "OUT"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GatherAffineCoopMatmul,
+      matmul_arrays,
+      matmul_push_constants,
+      checked_mul_u32(
+          matmul_push_constants.rows,
+          matmul_push_constants.cols,
+          "gather cooperative qmm elements"),
+      cmd_buffer,
+      s,
+      grid);
 }
 
 void dispatch_nvfp4_qmatmul_op(

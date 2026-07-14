@@ -340,6 +340,17 @@ bool gather_affine_matvec8_smallk_enabled() {
   return enabled;
 }
 
+bool gather_affine_coop_prefill_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_GATHER_QMM_COOP");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
 bool fused_affine_bf16_tiled_prefill_enabled() {
   static const bool enabled = []() {
     if (const char* env = std::getenv("MLX_VULKAN_AFFINE_BF16_TILED_PREFILL");
@@ -2502,59 +2513,139 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       ? gather_affine_qmm_rhs_shader_id(x.dtype(), out.dtype())
       : std::optional<vulkan::StaticShaderId>{};
 
+  const auto& context = vulkan::VulkanContext::get();
+  const bool supports_64_lane_subgroups = context.subgroup_size() == 64u ||
+      (context.subgroup_size_control_supported() &&
+       context.subgroup_min_size() <= 64u &&
+       context.subgroup_max_size() >= 64u);
+#if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
+  const bool use_expert_coop_qmm = use_sorted_rhs_qmm && native_bf16 &&
+      bits_ == 8 && group_size_ == 64 && expert_count <= 256 &&
+      (k % 16u) == 0u && context.coopmat_flash_attention_f32acc_supported() &&
+      supports_64_lane_subgroups && gather_affine_coop_prefill_enabled();
+#else
+  const bool use_expert_coop_qmm = false;
+#endif
+
   array out_work(out.shape(), native_bf16 ? bfloat16 : float32, nullptr, {});
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (out_work.size() != 0) {
-    vulkan::GatherAffineMatmulPushConstants push_constants{};
-    push_constants.rows = sorted_rhs_shader.has_value() ? batches : rows;
-    push_constants.cols = cols;
-    push_constants.K = k;
-    push_constants.packed_row_bytes =
-        static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
-    push_constants.x_batch_stride =
-        static_cast<uint32_t>(x.shape(-2) * x.shape(-1));
-    push_constants.x_row_stride = static_cast<uint32_t>(x.strides(-2));
-    push_constants.out_batch_stride = rows * cols;
-    push_constants.out_row_stride = static_cast<uint32_t>(out_work.strides(-2));
-    push_constants.scale_matrix_stride =
-        static_cast<uint32_t>(scales.strides(-3));
-    push_constants.scale_row_stride = static_cast<uint32_t>(scales.strides(-2));
-    push_constants.bias_matrix_stride =
-        static_cast<uint32_t>(biases->strides(-3));
-    push_constants.bias_row_stride = static_cast<uint32_t>(biases->strides(-2));
-    push_constants.w_matrix_stride_bytes =
-        static_cast<uint32_t>(w.strides(-3) * sizeof(uint32_t));
-    push_constants.bits = static_cast<uint32_t>(bits_);
-    push_constants.group_size = static_cast<uint32_t>(group_size_);
-    push_constants.num_groups = num_groups;
+    if (use_expert_coop_qmm) {
+#if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
+      const uint32_t max_tiles =
+          (batches + 31u) / 32u + static_cast<uint32_t>(expert_count);
+      const uint32_t metadata_elements = 1u + 3u * max_tiles;
+      array metadata(
+          {static_cast<int>(metadata_elements)}, uint32, nullptr, {});
+      metadata.set_data(allocator::malloc(metadata.nbytes()));
 
-    const std::array<uint32_t, 3> grid = sorted_rhs_shader.has_value()
-        ? std::array<uint32_t, 3>{(cols + 15u) / 16u,
-                                  (batches + 31u) / 32u, 1u}
-        : matvec8_shader.has_value()
-        ? std::array<uint32_t, 3>{cols, rows, batches}
-        : std::array<uint32_t, 3>{
-              (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
-    if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
-      throw std::runtime_error(
-          "[GatherQMM::eval_gpu] Gather dispatch grid exceeds Vulkan workgroup count limits.");
+      vulkan::GatherAffineTileMetadataPushConstants metadata_push_constants{};
+      metadata_push_constants.rows = batches;
+      metadata_push_constants.expert_count =
+          static_cast<uint32_t>(expert_count);
+      metadata_push_constants.max_tiles = max_tiles;
+
+      vulkan::GatherAffineCoopMatmulPushConstants push_constants{};
+      push_constants.rows = batches;
+      push_constants.cols = cols;
+      push_constants.K = k;
+      push_constants.packed_row_bytes =
+          static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
+      push_constants.x_row_stride = static_cast<uint32_t>(x.strides(-2));
+      push_constants.out_row_stride =
+          static_cast<uint32_t>(out_work.strides(-2));
+      push_constants.scale_matrix_stride =
+          static_cast<uint32_t>(scales.strides(-3));
+      push_constants.scale_row_stride =
+          static_cast<uint32_t>(scales.strides(-2));
+      push_constants.bias_matrix_stride =
+          static_cast<uint32_t>(biases->strides(-3));
+      push_constants.bias_row_stride =
+          static_cast<uint32_t>(biases->strides(-2));
+      push_constants.w_matrix_stride_bytes =
+          static_cast<uint32_t>(w.strides(-3) * sizeof(uint32_t));
+      push_constants.group_size = static_cast<uint32_t>(group_size_);
+      push_constants.max_tiles = max_tiles;
+
+      const std::array<uint32_t, 3> grid = {(cols + 15u) / 16u, max_tiles, 1u};
+      if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
+        throw std::runtime_error(
+            "[GatherQMM::eval_gpu] Cooperative gather dispatch grid exceeds Vulkan workgroup count limits.");
+      }
+
+      auto command_buffer = vulkan::begin_command_recording(s.index);
+      vulkan::dispatch_gather_affine_coop_matmul_op(
+          w,
+          scales,
+          *biases,
+          x,
+          rhs_indices,
+          metadata,
+          out_work,
+          vulkan::StaticShaderId::gather_affine_qmm_rhs_bf16_bf16_cm1,
+          command_buffer,
+          s,
+          metadata_push_constants,
+          push_constants,
+          grid);
+      vulkan::end_command_recording(s.index);
+#endif
+    } else {
+      vulkan::GatherAffineMatmulPushConstants push_constants{};
+      push_constants.rows = sorted_rhs_shader.has_value() ? batches : rows;
+      push_constants.cols = cols;
+      push_constants.K = k;
+      push_constants.packed_row_bytes =
+          static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
+      push_constants.x_batch_stride =
+          static_cast<uint32_t>(x.shape(-2) * x.shape(-1));
+      push_constants.x_row_stride = static_cast<uint32_t>(x.strides(-2));
+      push_constants.out_batch_stride = rows * cols;
+      push_constants.out_row_stride =
+          static_cast<uint32_t>(out_work.strides(-2));
+      push_constants.scale_matrix_stride =
+          static_cast<uint32_t>(scales.strides(-3));
+      push_constants.scale_row_stride =
+          static_cast<uint32_t>(scales.strides(-2));
+      push_constants.bias_matrix_stride =
+          static_cast<uint32_t>(biases->strides(-3));
+      push_constants.bias_row_stride =
+          static_cast<uint32_t>(biases->strides(-2));
+      push_constants.w_matrix_stride_bytes =
+          static_cast<uint32_t>(w.strides(-3) * sizeof(uint32_t));
+      push_constants.bits = static_cast<uint32_t>(bits_);
+      push_constants.group_size = static_cast<uint32_t>(group_size_);
+      push_constants.num_groups = num_groups;
+
+      const std::array<uint32_t, 3> grid = sorted_rhs_shader.has_value()
+          ? std::array<
+                uint32_t,
+                3>{(cols + 15u) / 16u, (batches + 31u) / 32u, 1u}
+          : matvec8_shader.has_value()
+          ? std::array<uint32_t, 3>{cols, rows, batches}
+          : std::array<uint32_t, 3>{
+                (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
+      if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
+        throw std::runtime_error(
+            "[GatherQMM::eval_gpu] Gather dispatch grid exceeds Vulkan workgroup count limits.");
+      }
+
+      auto command_buffer = vulkan::begin_command_recording(s.index);
+      vulkan::dispatch_gather_affine_matmul_op(
+          w,
+          scales,
+          *biases,
+          x,
+          lhs_indices,
+          rhs_indices,
+          out_work,
+          sorted_rhs_shader.value_or(*shader_id),
+          command_buffer,
+          s,
+          push_constants,
+          grid);
+      vulkan::end_command_recording(s.index);
     }
-
-    auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_gather_affine_matmul_op(
-        w,
-        scales,
-        *biases,
-        x,
-        lhs_indices,
-        rhs_indices,
-        out_work,
-        sorted_rhs_shader.value_or(*shader_id),
-        command_buffer,
-        s,
-        push_constants,
-        grid);
-    vulkan::end_command_recording(s.index);
   }
 
   if (out.dtype() == out_work.dtype()) {

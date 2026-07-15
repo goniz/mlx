@@ -186,7 +186,10 @@ bool barrier_between_deferred_ops() {
       return std::string(env) != "0";
     }
 
-    return true;
+    // Default off: inter-primitive RAW/WAW/WAR is handled in begin_primitive,
+    // and intra-primitive multi-segment dependencies are barrier'd when a
+    // subsequent recording segment starts inside the same primitive.
+    return false;
   }();
   return enabled;
 }
@@ -773,6 +776,9 @@ struct StreamData {
   uint32_t decode_hazard_submit_count{0};
   uint32_t decode_transfer_submit_count{0};
   DecodeResourceSummary last_decode_resource_summary;
+  uint32_t primitive_depth{0};
+  uint32_t segments_in_current_primitive{0};
+  bool has_untracked_segment_writes{false};
 };
 
 class VulkanDevice {
@@ -1263,6 +1269,7 @@ class VulkanDevice {
   static bool is_heavy_primitive_name(const std::string& primitive) {
     return primitive_name_contains(primitive, "Matmul") ||
         primitive_name_contains(primitive, "GatherMM") ||
+        primitive_name_contains(primitive, "GatherQMM") ||
         primitive_name_contains(primitive, "BlockMaskedMM") ||
         primitive_name_contains(primitive, "SegmentedMM") ||
         primitive_name_contains(primitive, "QuantizedMatmul") ||
@@ -1281,6 +1288,7 @@ class VulkanDevice {
     uint64_t weighted = input_bytes + output_bytes;
     if (primitive_name_contains(primitive, "Matmul") ||
         primitive_name_contains(primitive, "GatherMM") ||
+        primitive_name_contains(primitive, "GatherQMM") ||
         primitive_name_contains(primitive, "BlockMaskedMM") ||
         primitive_name_contains(primitive, "SegmentedMM") ||
         primitive_name_contains(primitive, "QuantizedMatmul")) {
@@ -1463,6 +1471,25 @@ class VulkanDevice {
     retire_submissions(stream, false);
     flush_host_readback_writes(inputs);
 
+    stream->primitive_depth += 1;
+    if (stream->primitive_depth == 1) {
+      stream->segments_in_current_primitive = 0;
+    }
+
+    if (stream->recording && stream->recording_resources &&
+        stream->has_untracked_segment_writes) {
+      // A prior deferred segment in this (or an outer) primitive wrote temps
+      // that are not yet in unsynced_*. Make them visible before more work.
+      trace_sync(
+          "barrier action=primitive-head reason=untracked-segment-writes");
+      insert_memory_barrier(
+          stream->recording_resources->compute_command_buffer);
+      record_decode_barrier(stream, "untracked-segment-writes");
+      stream->has_untracked_segment_writes = false;
+      stream->unsynced_reads.clear();
+      stream->unsynced_writes.clear();
+    }
+
     if (!deferred_submission_enabled()) {
       return;
     }
@@ -1515,26 +1542,39 @@ class VulkanDevice {
       const Stream& s,
       const std::vector<array>& inputs,
       const std::vector<array>& outputs) {
+    auto* stream = get_stream(s.index);
+    if (stream->primitive_depth == 0) {
+      // Some helpers historically call end without begin; ignore.
+      return;
+    }
+    const bool outermost = stream->primitive_depth == 1;
+    stream->primitive_depth -= 1;
+    if (outermost) {
+      stream->segments_in_current_primitive = 0;
+      stream->has_untracked_segment_writes = false;
+    }
+
     if (!deferred_submission_enabled()) {
       return;
     }
 
-    auto* stream = get_stream(s.index);
     if (!stream->recording) {
       return;
     }
 
-    update_deferred_work_estimate(stream, inputs, outputs);
-    update_decode_resource_summary(stream, inputs, outputs);
+    if (outermost) {
+      update_deferred_work_estimate(stream, inputs, outputs);
+      update_decode_resource_summary(stream, inputs, outputs);
 
-    auto reads = make_access_ranges(inputs);
-    auto writes = make_access_ranges(outputs);
-    auto donation_writes = make_potential_donation_writes(inputs, outputs);
-    writes.insert(writes.end(), donation_writes.begin(), donation_writes.end());
-    stream->unsynced_reads.insert(
-        stream->unsynced_reads.end(), reads.begin(), reads.end());
-    stream->unsynced_writes.insert(
-        stream->unsynced_writes.end(), writes.begin(), writes.end());
+      auto reads = make_access_ranges(inputs);
+      auto writes = make_access_ranges(outputs);
+      auto donation_writes = make_potential_donation_writes(inputs, outputs);
+      writes.insert(writes.end(), donation_writes.begin(), donation_writes.end());
+      stream->unsynced_reads.insert(
+          stream->unsynced_reads.end(), reads.begin(), reads.end());
+      stream->unsynced_writes.insert(
+          stream->unsynced_writes.end(), writes.begin(), writes.end());
+    }
   }
 
   VkCommandBuffer begin_recording(int stream_index) {
@@ -1603,6 +1643,10 @@ class VulkanDevice {
       stream->decode_hazard_submit_count = 0;
       stream->decode_transfer_submit_count = 0;
       stream->last_decode_resource_summary.reset();
+      // Keep primitive_depth across submit/re-record so nested tracking stays
+      // balanced; only clear segment bookkeeping for the new CB.
+      stream->segments_in_current_primitive = 0;
+      stream->has_untracked_segment_writes = false;
       if (trace_sync_enabled()) {
         std::ostringstream oss;
         oss << "begin_recording(stream=" << stream_index
@@ -1612,6 +1656,15 @@ class VulkanDevice {
             << " next_epoch=" << stream->next_epoch;
         trace_sync(oss.str());
       }
+    } else if (
+        !transfer && stream->recording_resources &&
+        stream->has_untracked_segment_writes) {
+      trace_sync(
+          "barrier action=recording-head reason=untracked-segment-writes");
+      insert_memory_barrier(
+          stream->recording_resources->compute_command_buffer);
+      record_decode_barrier(stream, "untracked-segment-writes");
+      stream->has_untracked_segment_writes = false;
     }
 
     return stream->recording_transfer
@@ -1675,6 +1728,10 @@ class VulkanDevice {
         stream->recorded_ops += 1;
       }
       stream->last_op_budget_free = false;
+      if (stream->primitive_depth > 0) {
+        stream->segments_in_current_primitive += 1;
+        stream->has_untracked_segment_writes = true;
+      }
       if (exceeds_decode_hard_limits(stream)) {
         std::string submit_reason;
         (void)should_submit_recording(stream, &submit_reason);
@@ -1714,6 +1771,10 @@ class VulkanDevice {
       stream->recorded_ops += 1;
     }
     stream->last_op_budget_free = false;
+    if (stream->primitive_depth > 0) {
+      stream->segments_in_current_primitive += 1;
+      stream->has_untracked_segment_writes = true;
+    }
     std::string submit_reason;
     if (should_submit_recording(stream, &submit_reason)) {
       stream->force_immediate_submit_ = false;
@@ -1948,9 +2009,6 @@ class VulkanDevice {
       const std::vector<array>& inputs,
       const std::vector<array>& outputs) {
     stream->last_decode_resource_summary.reset();
-    if (!decode_batch_enabled()) {
-      return;
-    }
 
     for (const auto& in : inputs) {
       stream->last_decode_resource_summary.record(
@@ -2025,12 +2083,13 @@ class VulkanDevice {
   }
 
   static void insert_memory_barrier(vk::CommandBuffer command_buffer) {
+    // Prefer a RAW-oriented dependency. The previous full read|write mask on
+    // both sides forced a heavier global sync than decode typically needs.
     vk::MemoryBarrier barrier;
-    barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead |
-        vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead |
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
         vk::AccessFlagBits::eTransferWrite;
     barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead |
-        vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead |
+        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eShaderWrite |
         vk::AccessFlagBits::eTransferWrite;
 
     command_buffer.pipelineBarrier(

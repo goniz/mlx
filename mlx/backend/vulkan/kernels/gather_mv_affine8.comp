@@ -3,6 +3,8 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 #ifdef FLOAT16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -26,10 +28,13 @@
 #define SCALE_TO_FLOAT_TYPE(x) float(x)
 #endif
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// Wave64-sized workgroup: one subgroup covers the full reduce on AMD.
+#define BLOCK_SIZE 64
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W {
-    uint8_t data_w[];
+    uint data_w[];
 };
 layout(binding = 1) readonly buffer SCALES {
     S_TYPE data_scales[];
@@ -69,7 +74,7 @@ layout(push_constant) uniform parameter {
     uint num_groups;
 } p;
 
-shared float partial[256];
+shared float partial[BLOCK_SIZE];
 
 void main() {
     const uint col = gl_WorkGroupID.x;
@@ -83,29 +88,73 @@ void main() {
 
     const uint lhs_batch = data_lhs_indices[batch];
     const uint rhs_batch = data_rhs_indices[batch];
-    const uint w_row_base = rhs_batch * p.w_matrix_stride_bytes + col * p.packed_row_bytes;
-    const uint scale_row_base = rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
-    const uint bias_row_base = rhs_batch * p.bias_matrix_stride + col * p.bias_row_stride;
+    const uint w_row_words =
+        (rhs_batch * p.w_matrix_stride_bytes + col * p.packed_row_bytes) >> 2;
+    const uint scale_row_base =
+        rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
+    const uint bias_row_base =
+        rhs_batch * p.bias_matrix_stride + col * p.bias_row_stride;
     const uint x_row_base = lhs_batch * p.x_batch_stride + row * p.x_row_stride;
 
     float acc = 0.0f;
-    for (uint k = tid; k < p.K; k += gl_WorkGroupSize.x) {
-        const uint group = k / p.group_size;
-        const float w = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base + group]) *
-            float(data_w[w_row_base + k]) + SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base + group]);
-        acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k]), w, acc);
+    if ((p.K & 3u) == 0u && (p.group_size & 3u) == 0u) {
+        const uint packs = p.K >> 2;
+        for (uint pidx = tid; pidx < packs; pidx += BLOCK_SIZE) {
+            const uint k = pidx << 2;
+            const uint group = k / p.group_size;
+            const float s =
+                SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base + group]);
+            const float b =
+                SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base + group]);
+            const uint packed = data_w[w_row_words + pidx];
+            acc = fma(
+                TO_FLOAT_TYPE(data_x[x_row_base + k]),
+                float(packed & 0xffu) * s + b,
+                acc);
+            acc = fma(
+                TO_FLOAT_TYPE(data_x[x_row_base + k + 1u]),
+                float((packed >> 8) & 0xffu) * s + b,
+                acc);
+            acc = fma(
+                TO_FLOAT_TYPE(data_x[x_row_base + k + 2u]),
+                float((packed >> 16) & 0xffu) * s + b,
+                acc);
+            acc = fma(
+                TO_FLOAT_TYPE(data_x[x_row_base + k + 3u]),
+                float((packed >> 24) & 0xffu) * s + b,
+                acc);
+        }
+    } else {
+        for (uint k = tid; k < p.K; k += BLOCK_SIZE) {
+            const uint group = k / p.group_size;
+            const uint word = data_w[w_row_words + (k >> 2)];
+            const uint q = (word >> ((k & 3u) * 8u)) & 0xffu;
+            const float w = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base + group]) *
+                    float(q) +
+                SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base + group]);
+            acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k]), w, acc);
+        }
+    }
+
+    if (gl_SubgroupSize == BLOCK_SIZE && gl_NumSubgroups == 1u) {
+        acc = subgroupAdd(acc);
+        if (tid == 0u) {
+            data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
+                D_TYPE(FROM_FLOAT_TYPE(acc));
+        }
+        return;
     }
 
     partial[tid] = acc;
     barrier();
-    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
+    for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             partial[tid] += partial[tid + stride];
         }
         barrier();
     }
-
     if (tid == 0u) {
-        data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] = D_TYPE(FROM_FLOAT_TYPE(partial[0]));
+        data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
+            D_TYPE(FROM_FLOAT_TYPE(partial[0]));
     }
 }

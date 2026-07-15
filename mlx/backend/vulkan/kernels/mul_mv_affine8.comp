@@ -28,7 +28,9 @@
 #define FROM_FLOAT_TYPE(x) (x)
 #endif
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W {
     uint data_w[];
@@ -60,7 +62,9 @@ layout(push_constant) uniform parameter {
     uint num_groups;
 } p;
 
-shared float partial[8];
+// Size to the workgroup so gl_SubgroupID is always in-range for any legal
+// subgroup size (NumSubgroups <= BLOCK_SIZE).
+shared float partial[BLOCK_SIZE];
 
 void main() {
     const uint col = gl_WorkGroupID.x;
@@ -79,7 +83,7 @@ void main() {
     float acc = 0.0f;
     if ((p.K & 3u) == 0u && (p.group_size & 3u) == 0u) {
         const uint packs = p.K >> 2;
-        for (uint pidx = tid; pidx < packs; pidx += gl_WorkGroupSize.x) {
+        for (uint pidx = tid; pidx < packs; pidx += BLOCK_SIZE) {
             const uint k = pidx << 2;
             const uint group = k / p.group_size;
             const float s = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base + group]);
@@ -91,7 +95,7 @@ void main() {
             acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k + 3u]), float((packed >> 24) & 0xffu) * s + b, acc);
         }
     } else {
-        for (uint k = tid; k < p.K; k += gl_WorkGroupSize.x) {
+        for (uint k = tid; k < p.K; k += BLOCK_SIZE) {
             const uint group = k / p.group_size;
             const uint word = data_w[w_row_words + (k >> 2)];
             const uint q = (word >> ((k & 3u) * 8u)) & 0xffu;
@@ -99,6 +103,14 @@ void main() {
                 float(q) + SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base + group]);
             acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k]), w, acc);
         }
+    }
+
+    if (gl_SubgroupSize == BLOCK_SIZE && gl_NumSubgroups == 1u) {
+        acc = subgroupAdd(acc);
+        if (tid == 0u) {
+            data_out[row * p.out_row_stride + col] = D_TYPE(FROM_FLOAT_TYPE(acc));
+        }
+        return;
     }
 
     acc = subgroupAdd(acc);

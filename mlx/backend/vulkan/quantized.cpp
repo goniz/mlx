@@ -1929,12 +1929,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
               if (bits_ == 4) {
                 shader_id =
                     vulkan::StaticShaderId::fused_affine_matvec4_bf16_bf16;
+                grid = {(cols + 7u) / 8u, rows, 1u};
               } else {
                 shader_id =
                     vulkan::StaticShaderId::fused_affine_matvec8_bf16_bf16;
+                grid = {cols, rows, 1u};
               }
-              // Both affine4/affine8 decode matvecs process NUM_COLS=8.
-              grid = {(cols + 7u) / 8u, rows, 1u};
             } else if (bits_ == 4) {
               shader_id = use_large_n_tile
                   ? vulkan::StaticShaderId::
@@ -2060,13 +2060,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.group_size = static_cast<uint32_t>(group_size_);
           push_constants.num_groups = num_groups;
 
-          // fused_affine_matvec8 uses NUM_COLS=8; generic matvec is 1-col/WG.
           const std::array<uint32_t, 3> grid = prefill_like_rows
               ? std::array<
                     uint32_t,
                     3>{(cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
-              : bits_ == 8
-              ? std::array<uint32_t, 3>{(cols + 7u) / 8u, rows, 1u}
               : std::array<uint32_t, 3>{cols, rows, 1u};
 
           auto command_buffer = vulkan::begin_command_recording(s.index);

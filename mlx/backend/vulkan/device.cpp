@@ -2441,6 +2441,19 @@ class VulkanDevice {
           details.str() + ").");
     };
 
+    // Flush shader/transfer writes before the CB ends. Intra-CB hazard
+    // tracking may leave the final producer without a trailing barrier when
+    // barrier_between_deferred_ops is off; without this, a later same-stream
+    // submission has no memory dependency on those writes.
+    if (!submit_to_transfer_queue &&
+        (!stream->unsynced_writes.empty() ||
+         stream->has_untracked_segment_writes)) {
+      trace_sync("barrier action=submit-tail reason=pending-writes");
+      insert_memory_barrier(command_buffer);
+      record_decode_barrier(stream, "submit-tail");
+      stream->has_untracked_segment_writes = false;
+    }
+
     VkResult result;
     try {
       command_buffer.end();
@@ -2483,6 +2496,9 @@ class VulkanDevice {
       }
 
       std::lock_guard<std::mutex> affinity_lock(buffer->queue_affinity_mutex);
+      // Cross-queue transfers still need an explicit timeline wait. Same-queue
+      // producers are covered by the submit-tail barrier above plus queue
+      // submission order for the common deferred decode path.
       if (!buffer->last_semaphore || buffer->last_timeline_value == 0 ||
           buffer->queue_affinity == VulkanBuffer::QueueAffinity::None ||
           buffer->queue_affinity == queue_affinity) {

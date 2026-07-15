@@ -6,15 +6,15 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_vote : require
 
 #include "types.glsl"
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W {
-    uint8_t data_w[];
+    uint data_w[];
 };
 layout(binding = 1) readonly buffer SCALES {
     uint16_t data_scales[];
@@ -23,7 +23,7 @@ layout(binding = 2) readonly buffer BIASES {
     uint16_t data_biases[];
 };
 layout(binding = 3) readonly buffer X {
-    uint16_t data_x[];
+    uint data_x[];
 };
 layout(binding = 4) readonly buffer METADATA {
     uint data_metadata[];
@@ -48,26 +48,50 @@ layout(push_constant) uniform parameter {
     uint max_tiles;
 } p;
 
-const uint BM = 32u;
-const uint BN = 16u;
+const uint BM = 64u;
+const uint BN = 128u;
 const uint BK = 16u;
 const uint SHMEM_STRIDE = BK / 2u + 4u;
 
 shared f16vec2 xs[BM * SHMEM_STRIDE];
 shared f16vec2 ws[BN * SHMEM_STRIDE];
-shared float output_stage[BM * BN];
+shared float16_t output_stage[BM * BN];
+shared uint x_scale_exponents[BM];
+shared float x_scale_factors[BM];
+shared uint w_scale_exponents[BN];
+shared float w_scales[BN];
+shared float w_biases[BN];
 
-float dequant_w(const uint expert, const uint col, const uint k) {
-    const uint group = k / p.group_size;
-    const uint row_base = expert * p.w_matrix_stride_bytes +
-        col * p.packed_row_bytes;
-    const uint scale_base = expert * p.scale_matrix_stride +
-        col * p.scale_row_stride;
-    const uint bias_base = expert * p.bias_matrix_stride +
-        col * p.bias_row_stride;
-    return bf16_to_fp32(uint(data_scales[scale_base + group])) *
-        float(data_w[row_base + k]) +
-        bf16_to_fp32(uint(data_biases[bias_base + group]));
+float scale_down(const float value, const uint exponent) {
+    return value * uintBitsToFloat((127u - exponent) << 23u);
+}
+
+float scale_up(const float value, const uint exponent) {
+    return value * uintBitsToFloat((127u + exponent) << 23u);
+}
+
+uint fp32_biased_exponent(const float value) {
+    const uint exponent = (floatBitsToUint(abs(value)) >> 23u) & 0xffu;
+    return exponent < 255u ? exponent : 0u;
+}
+
+uint fp16_range_scale_exponent(const uint exponent) {
+    // Biased exponent 142 reaches 65536, above the fp16 maximum of 65504.
+    return exponent >= 142u ? exponent - 141u : 0u;
+}
+
+uint ceil_log2(const uint value) {
+    return value <= 1u ? 0u : uint(findMSB(value - 1u)) + 1u;
+}
+
+uint dot_accumulator_scale_exponent(
+    const uint x_exponent,
+    const uint w_exponent,
+    const uint terms) {
+    // Values with biased exponent e are below 2^(e - 126). Account for the
+    // full dot length so the fp16 accumulator remains strictly below 2^16.
+    const uint exponent_sum = x_exponent + w_exponent + ceil_log2(terms);
+    return exponent_sum > 268u ? exponent_sum - 268u : 0u;
 }
 
 void main() {
@@ -78,47 +102,104 @@ void main() {
     }
 
     const uint lane = gl_LocalInvocationID.x;
+    const uint subgroup = lane / 64u;
+    const uint subgroup_row = (subgroup / 4u) * 32u;
+    const uint subgroup_col = (subgroup & 3u) * 32u;
     const uint expert = data_metadata[1u + tile];
     const uint row_start = data_metadata[1u + p.max_tiles + tile];
     const uint col_start = gl_WorkGroupID.x * BN;
     const uint valid_rows = data_metadata[1u + 2u * p.max_tiles + tile];
-    const bool use_fp32_tile =
-        data_metadata[1u + 3u * p.max_tiles + tile] != 0u;
 
-    if (use_fp32_tile) {
-        for (uint index = lane; index < BM * BN; index += 64u) {
-            const uint row = index / BN;
-            const uint col = index - row * BN;
-            const uint src_row = row_start + row;
-            const uint src_col = col_start + col;
-            if (row < valid_rows && src_col < p.cols) {
-                float acc = 0.0f;
-                for (uint k = 0u; k < p.K; ++k) {
-                    const float x = bf16_to_fp32(
-                        uint(data_x[src_row * p.x_row_stride + k]));
-                    acc = fma(x, dequant_w(expert, src_col, k), acc);
-                }
-                data_out[src_row * p.out_row_stride + src_col] =
-                    uint16_t(fp32_to_bf16(acc));
+    uint weight_exponent = 0u;
+    if (lane < BN) {
+        const uint src_col = col_start + lane;
+        if (src_col < p.cols) {
+            const uint scale_base = expert * p.scale_matrix_stride +
+                src_col * p.scale_row_stride;
+            const uint bias_base = expert * p.bias_matrix_stride +
+                src_col * p.bias_row_stride;
+            const uint num_groups =
+                (p.K + p.group_size - 1u) / p.group_size;
+            for (uint group = 0u; group < num_groups; ++group) {
+                const float scale = bf16_to_fp32(
+                    uint(data_scales[scale_base + group]));
+                const float bias = bf16_to_fp32(
+                    uint(data_biases[bias_base + group]));
+                weight_exponent = max(
+                    weight_exponent,
+                    fp32_biased_exponent(bias));
+                weight_exponent = max(
+                    weight_exponent,
+                    fp32_biased_exponent(fma(scale, 255.0f, bias)));
             }
+            const uint scale_exponent =
+                fp16_range_scale_exponent(weight_exponent);
+            w_scales[lane] = scale_down(
+                bf16_to_fp32(uint(data_scales[scale_base])), scale_exponent);
+            w_biases[lane] = scale_down(
+                bf16_to_fp32(uint(data_biases[bias_base])), scale_exponent);
+        } else {
+            w_scales[lane] = 0.0f;
+            w_biases[lane] = 0.0f;
         }
-        return;
+        w_scale_exponents[lane] = weight_exponent;
     }
+    const uint subgroup_w_exponent = subgroupMax(weight_exponent);
+    if (subgroup < 2u && subgroupElect()) {
+        x_scale_exponents[subgroup] = subgroup_w_exponent;
+    }
+    barrier();
+
+    const uint max_w_exponent =
+        max(x_scale_exponents[0], x_scale_exponents[1]);
+    if (lane < BM) {
+        const uint x_exponent = lane < valid_rows
+            ? data_metadata[1u + 3u * p.max_tiles + row_start + lane]
+            : 0u;
+        const uint max_w_scale_exponent =
+            fp16_range_scale_exponent(max_w_exponent);
+        const uint dot_scale_exponent = dot_accumulator_scale_exponent(
+            x_exponent, max_w_exponent, p.K);
+        const uint required_x_scale_exponent =
+            dot_scale_exponent > max_w_scale_exponent
+            ? dot_scale_exponent - max_w_scale_exponent
+            : 0u;
+        const uint scale_exponent = max(
+            fp16_range_scale_exponent(x_exponent),
+            required_x_scale_exponent);
+        x_scale_exponents[lane] = scale_exponent;
+        x_scale_factors[lane] =
+            uintBitsToFloat((127u - scale_exponent) << 23u);
+    }
+    if (lane < BN) {
+        w_scale_exponents[lane] =
+            fp16_range_scale_exponent(w_scale_exponents[lane]);
+    }
+    barrier();
 
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matrix_a0;
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matrix_a1;
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matrix_b;
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accum0 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16,
-            gl_MatrixUseAccumulator>(0.0f);
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accum1 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16,
-            gl_MatrixUseAccumulator>(0.0f);
-    bool requires_fp32_weight = false;
-
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matrix_b0;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matrix_b1;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+        gl_MatrixUseAccumulator> accum00 =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator>(float16_t(0.0f));
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+        gl_MatrixUseAccumulator> accum10 =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator>(float16_t(0.0f));
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+        gl_MatrixUseAccumulator> accum01 =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator>(float16_t(0.0f));
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+        gl_MatrixUseAccumulator> accum11 =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator>(float16_t(0.0f));
     for (uint kb = 0u; kb < p.K; kb += BK) {
         for (uint pair_idx = lane; pair_idx < BM * (BK / 2u);
-             pair_idx += 64u) {
+             pair_idx += 512u) {
             const uint row = pair_idx / (BK / 2u);
             const uint pair = pair_idx - row * (BK / 2u);
             const uint k0 = kb + pair * 2u;
@@ -126,115 +207,126 @@ void main() {
             float16_t x0 = float16_t(0.0f);
             float16_t x1 = float16_t(0.0f);
             if (row < valid_rows && k0 < p.K) {
-                x0 = float16_t(bf16_to_fp32(
-                    uint(data_x[src_row * p.x_row_stride + k0])));
-            }
-            if (row < valid_rows && k0 + 1u < p.K) {
-                x1 = float16_t(bf16_to_fp32(
-                    uint(data_x[src_row * p.x_row_stride + k0 + 1u])));
+                const uint packed_x = data_x[
+                    (src_row * p.x_row_stride + k0) / 2u];
+                const vec2 values = vec2(
+                    bf16_to_fp32(packed_x & 0xffffu),
+                    bf16_to_fp32(packed_x >> 16u)) * x_scale_factors[row];
+                x0 = float16_t(values.x);
+                x1 = float16_t(values.y);
             }
             xs[row * SHMEM_STRIDE + pair] = f16vec2(x0, x1);
         }
 
-        for (uint pair_idx = lane; pair_idx < BN * (BK / 2u);
-             pair_idx += 64u) {
-            const uint col = pair_idx / (BK / 2u);
-            const uint pair = pair_idx - col * (BK / 2u);
+        for (uint weight_idx = lane; weight_idx < BN * 4u;
+             weight_idx += 512u) {
+            const uint col = weight_idx / 4u;
+            const uint quad = weight_idx & 3u;
             const uint src_col = col_start + col;
-            const uint k0 = kb + pair * 2u;
-            float16_t w0 = float16_t(0.0f);
-            float16_t w1 = float16_t(0.0f);
-            if (src_col < p.cols && k0 < p.K) {
-                const uint group = k0 / p.group_size;
+            const uint k0 = kb + quad * 4u;
+            f16vec2 w01 = f16vec2(0.0f);
+            f16vec2 w23 = f16vec2(0.0f);
+            if (src_col < p.cols) {
                 const uint row_base = expert * p.w_matrix_stride_bytes +
                     src_col * p.packed_row_bytes;
-                const uint scale_base = expert * p.scale_matrix_stride +
-                    src_col * p.scale_row_stride;
-                const uint bias_base = expert * p.bias_matrix_stride +
-                    src_col * p.bias_row_stride;
-                const float scale = bf16_to_fp32(
-                    uint(data_scales[scale_base + group]));
-                const float bias = bf16_to_fp32(
-                    uint(data_biases[bias_base + group]));
-                if ((k0 & 63u) == 0u &&
-                    (abs(bias) > 65504.0f ||
-                     abs(scale * 255.0f + bias) > 65504.0f)) {
-                    requires_fp32_weight = true;
-                }
-                w0 = float16_t(
-                    scale * float(data_w[row_base + k0]) + bias);
-                if (k0 + 1u < p.K) {
-                    w1 = float16_t(
-                        scale * float(data_w[row_base + k0 + 1u]) + bias);
-                }
+                const uint packed_w = data_w[(row_base + k0) / 4u];
+                const float scale = w_scales[col];
+                const float bias = w_biases[col];
+                const vec4 values = fma(
+                    vec4(scale), vec4(unpack8(packed_w)), vec4(bias));
+                w01 = f16vec2(values.xy);
+                w23 = f16vec2(values.zw);
             }
-            ws[col * SHMEM_STRIDE + pair] = f16vec2(w0, w1);
+            ws[col * SHMEM_STRIDE + quad * 2u] = w01;
+            ws[col * SHMEM_STRIDE + quad * 2u + 1u] = w23;
         }
         barrier();
 
         coopMatLoad(
             matrix_a0,
             xs,
-            0u,
+            subgroup_row * SHMEM_STRIDE,
             SHMEM_STRIDE,
             gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(
             matrix_a1,
             xs,
-            16u * SHMEM_STRIDE,
+            (subgroup_row + 16u) * SHMEM_STRIDE,
             SHMEM_STRIDE,
             gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(
-            matrix_b,
+            matrix_b0,
             ws,
-            0u,
+            subgroup_col * SHMEM_STRIDE,
             SHMEM_STRIDE,
             gl_CooperativeMatrixLayoutColumnMajor);
-        accum0 = coopMatMulAdd(matrix_a0, matrix_b, accum0);
-        accum1 = coopMatMulAdd(matrix_a1, matrix_b, accum1);
+        coopMatLoad(
+            matrix_b1,
+            ws,
+            (subgroup_col + 16u) * SHMEM_STRIDE,
+            SHMEM_STRIDE,
+            gl_CooperativeMatrixLayoutColumnMajor);
+        accum00 = coopMatMulAdd(matrix_a0, matrix_b0, accum00);
+        accum01 = coopMatMulAdd(matrix_a0, matrix_b1, accum01);
+        accum10 = coopMatMulAdd(matrix_a1, matrix_b0, accum10);
+        accum11 = coopMatMulAdd(matrix_a1, matrix_b1, accum11);
+
+        const uint next_kb = kb + BK;
+        if (lane < BN && next_kb < p.K &&
+            (next_kb % p.group_size) == 0u) {
+            const uint src_col = col_start + lane;
+            if (src_col < p.cols) {
+                const uint group = next_kb / p.group_size;
+                const uint scale_base = expert * p.scale_matrix_stride +
+                    src_col * p.scale_row_stride;
+                const uint bias_base = expert * p.bias_matrix_stride +
+                    src_col * p.bias_row_stride;
+                w_scales[lane] = scale_down(
+                    bf16_to_fp32(uint(data_scales[scale_base + group])),
+                    w_scale_exponents[lane]);
+                w_biases[lane] = scale_down(
+                    bf16_to_fp32(uint(data_biases[bias_base + group])),
+                    w_scale_exponents[lane]);
+            }
+        }
         barrier();
     }
 
-    if (subgroupAny(requires_fp32_weight)) {
-        for (uint index = lane; index < BM * BN; index += 64u) {
-            const uint row = index / BN;
-            const uint col = index - row * BN;
-            const uint src_row = row_start + row;
-            const uint src_col = col_start + col;
-            if (row < valid_rows && src_col < p.cols) {
-                float acc = 0.0f;
-                for (uint k = 0u; k < p.K; ++k) {
-                    const float x = bf16_to_fp32(
-                        uint(data_x[src_row * p.x_row_stride + k]));
-                    acc = fma(x, dequant_w(expert, src_col, k), acc);
-                }
-                data_out[src_row * p.out_row_stride + src_col] =
-                    uint16_t(fp32_to_bf16(acc));
-            }
-        }
-        return;
-    }
-
     coopMatStore(
-        accum0,
+        accum00,
         output_stage,
-        0u,
+        subgroup_row * BN + subgroup_col,
         BN,
         gl_CooperativeMatrixLayoutRowMajor);
     coopMatStore(
-        accum1,
+        accum01,
         output_stage,
-        16u * BN,
+        subgroup_row * BN + subgroup_col + 16u,
+        BN,
+        gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(
+        accum10,
+        output_stage,
+        (subgroup_row + 16u) * BN + subgroup_col,
+        BN,
+        gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(
+        accum11,
+        output_stage,
+        (subgroup_row + 16u) * BN + subgroup_col + 16u,
         BN,
         gl_CooperativeMatrixLayoutRowMajor);
     barrier();
 
-    for (uint index = lane; index < BM * BN; index += 64u) {
+    for (uint index = lane; index < BM * BN; index += 512u) {
         const uint row = index / BN;
         const uint col = index - row * BN;
         if (row < valid_rows && col_start + col < p.cols) {
+            float value = scale_up(
+                float(output_stage[index]), x_scale_exponents[row]);
+            value = scale_up(value, w_scale_exponents[col]);
             data_out[(row_start + row) * p.out_row_stride + col_start + col] =
-                uint16_t(fp32_to_bf16(output_stage[index]));
+                uint16_t(fp32_to_bf16(value));
         }
     }
 }

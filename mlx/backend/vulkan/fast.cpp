@@ -561,7 +561,9 @@ vulkan::StaticShaderId flash_attention_main_shader(
     const std::string value(env);
     if (value == "cm1") {
       if (kv_bf16) {
-        return vulkan::StaticShaderId::flash_attn_f32_f16_bf16;
+        return path == FlashAttentionTuningParams::Path::CoopMat1
+            ? vulkan::StaticShaderId::flash_attn_f32_f16_bf16_cm1
+            : vulkan::StaticShaderId::flash_attn_f32_f16_bf16;
       }
       return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
     }
@@ -573,7 +575,9 @@ vulkan::StaticShaderId flash_attention_main_shader(
     }
     if (value == "f16acc") {
       if (kv_bf16) {
-        return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_f16acc;
+        return path == FlashAttentionTuningParams::Path::CoopMat1
+            ? vulkan::StaticShaderId::flash_attn_f32_f16_bf16_f16acc_cm1
+            : vulkan::StaticShaderId::flash_attn_f32_f16_bf16_f16acc;
       }
       return path == FlashAttentionTuningParams::Path::CoopMat1
           ? vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc_cm1
@@ -581,7 +585,9 @@ vulkan::StaticShaderId flash_attention_main_shader(
     }
   }
   if (kv_bf16) {
-    return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_fp32;
+    return path == FlashAttentionTuningParams::Path::CoopMat1
+        ? vulkan::StaticShaderId::flash_attn_f32_f16_bf16_cm1
+        : vulkan::StaticShaderId::flash_attn_f32_f16_bf16_fp32;
   }
   if (path == FlashAttentionTuningParams::Path::CoopMat1) {
     return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
@@ -654,7 +660,8 @@ bool flash_attention_coopmat_shmem_supported(
     const FlashAttentionTuningParams& params,
     uint32_t hsk,
     uint32_t hsv,
-    bool f32acc) {
+    bool f32acc,
+    bool bf16_range_safe = false) {
   const uint32_t block_rows = params.block_rows;
   const uint32_t block_cols = params.block_cols;
   const uint32_t mat_block_rows = 16u;
@@ -681,7 +688,8 @@ bool flash_attention_coopmat_shmem_supported(
                                   : (block_cols * vsh_stride)) *
       f16vec4_size;
   const uint32_t osh_stride = params.row_split * mat_block_rows / 4u;
-  const uint32_t pvsh = mat_block_cols * osh_stride * f16vec4_size;
+  const uint32_t pvsh = mat_block_cols * osh_stride *
+      (bf16_range_safe ? 4u * sizeof(float) : f16vec4_size);
   const uint32_t slope = block_rows * acc_type_size;
   return tmpsh + qf + psh + sfsh + ksh + pvsh + slope <=
       max_compute_shared_memory_size();
@@ -847,6 +855,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
     bool do_causal,
     uint32_t mask_heads,
     bool use_native_bf16_kv,
+    bool use_bool_mask,
     uint32_t q_stride,
     uint32_t k_stride,
     uint32_t v_stride) {
@@ -855,9 +864,24 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
   uint32_t workgroups_y = q_heads;
   const uint32_t qk_ratio = kv_heads == 0u ? 0u : q_heads / kv_heads;
 
-  auto tuning = use_native_bf16_kv
-      ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
-      : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
+  auto get_tuning = [&](uint32_t rows) {
+    if (use_native_bf16_kv && use_bool_mask) {
+      return get_flash_attention_tuning_params_scalar(
+          hsk, hsv, rows, kv_len);
+    }
+    auto candidate =
+        get_flash_attention_tuning_params(hsk, hsv, rows, kv_len);
+    if (use_native_bf16_kv &&
+        (candidate.path != FlashAttentionTuningParams::Path::CoopMat1 ||
+         candidate.subgroup_size != 64u ||
+         !flash_attention_coopmat_shmem_supported(
+             candidate, hsk, hsv, true, true))) {
+      return get_flash_attention_tuning_params_scalar(
+          hsk, hsv, rows, kv_len);
+    }
+    return candidate;
+  };
+  auto tuning = get_tuning(n_rows);
 
   // Pack GQA heads into rows only for decode; doing this for short prefill
   // conflates sequence rows and corrupts small-prompt attention.
@@ -866,9 +890,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
     gqa_ratio = qk_ratio;
     n_rows = gqa_ratio;
     workgroups_y /= gqa_ratio;
-    tuning = use_native_bf16_kv
-        ? get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, kv_len)
-        : get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
+    tuning = get_tuning(n_rows);
   }
 
   const bool aligned = (kv_len % tuning.block_cols) == 0 &&
@@ -983,6 +1005,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       has_mask ? checked_u32_size((*mask).shape(1), "flash_attn mask_heads")
                : 1u,
       use_native_bf16_kv,
+      use_bool_mask,
       q_stride,
       k_stride,
       v_stride);

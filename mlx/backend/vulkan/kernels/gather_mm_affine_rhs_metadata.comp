@@ -1,6 +1,8 @@
 #version 450
 
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -8,7 +10,7 @@ layout(binding = 0) readonly buffer RHS_INDICES {
     uint data_rhs_indices[];
 };
 layout(binding = 1) readonly buffer X {
-    uint16_t data_x[];
+    uint data_x[];
 };
 layout(binding = 2) buffer METADATA {
     uint data_metadata[];
@@ -23,10 +25,9 @@ layout(push_constant) uniform parameter {
     uint scan_ranges;
 } p;
 
-const uint BM = 32u;
+const uint BM = 64u;
 
 shared uint expert_starts[257];
-shared uint requires_fp32;
 
 uint lower_bound_expert(const uint expert) {
     uint lo = 0u;
@@ -49,30 +50,39 @@ void main() {
         if (tile >= data_metadata[0]) {
             return;
         }
-        if (lane == 0u) {
-            requires_fp32 = 0u;
-        }
-        barrier();
 
         const uint row_start = data_metadata[1u + p.max_tiles + tile];
         const uint valid_rows =
             data_metadata[1u + 2u * p.max_tiles + tile];
-        const uint tile_elements = valid_rows * p.K;
-        for (uint index = lane; index < tile_elements; index += 256u) {
-            const uint row = index / p.K;
-            const uint k = index - row * p.K;
-            const uint x_abs_bits = uint(data_x[
-                (row_start + row) * p.x_row_stride + k]) & 0x7fffu;
-            if (x_abs_bits >= 0x4780u && x_abs_bits < 0x7f80u) {
-                atomicOr(requires_fp32, 1u);
-                break;
+        const uint row_pairs = p.K / 2u;
+        // Assign one subgroup per row to preserve coalesced packed loads while
+        // reducing each row's maximum exponent without global atomics.
+        for (uint row = gl_SubgroupID; row < valid_rows;
+             row += gl_NumSubgroups) {
+            uint max_exponent = 0u;
+            for (uint pair = gl_SubgroupInvocationID; pair < row_pairs;
+                 pair += gl_SubgroupSize) {
+                const uint packed = data_x[
+                    ((row_start + row) * p.x_row_stride + pair * 2u) / 2u];
+                const uint exponent0 = ((packed & 0x7fffu) >> 7u) & 0xffu;
+                const uint exponent1 =
+                    (((packed >> 16u) & 0x7fffu) >> 7u) & 0xffu;
+                const uint exponent = max(exponent0, exponent1);
+                if (exponent < 255u) {
+                    max_exponent = max(max_exponent, exponent);
+                }
+            }
+            max_exponent = subgroupMax(max_exponent);
+            if (subgroupElect()) {
+                data_metadata[1u + 3u * p.max_tiles + row_start + row] =
+                    max_exponent;
             }
         }
-        barrier();
-        if (lane == 0u) {
-            data_metadata[1u + 3u * p.max_tiles + tile] = requires_fp32;
-        }
         return;
+    }
+
+    for (uint row = lane; row < p.rows; row += 256u) {
+        data_metadata[1u + 3u * p.max_tiles + row] = 0u;
     }
 
     if (lane < p.expert_count) {

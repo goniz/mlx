@@ -76,7 +76,8 @@ uint fp32_biased_exponent(const float value) {
 }
 
 uint fp16_range_scale_exponent(const uint exponent) {
-    return exponent >= 143u ? exponent - 142u : 0u;
+    // Biased exponent 142 reaches 65536, above the fp16 maximum of 65504.
+    return exponent >= 142u ? exponent - 141u : 0u;
 }
 
 uint ceil_log2(const uint value) {

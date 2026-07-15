@@ -1926,7 +1926,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
               ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
               : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16;
           const std::array<uint32_t, 3> grid = use_decode_matvec
-              ? std::array<uint32_t, 3>{cols, rows, 1u}
+              ? std::array<uint32_t, 3>{(cols + 7u) / 8u, rows, 1u}
               : shader_id ==
                       vulkan::StaticShaderId::
                           fused_affine_qmm_bf16_bf16_tiled_n32
@@ -2043,6 +2043,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
               ? std::array<
                     uint32_t,
                     3>{(cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
+              : bits_ == 8
+              ? std::array<uint32_t, 3>{(cols + 7u) / 8u, rows, 1u}
               : std::array<uint32_t, 3>{cols, rows, 1u};
 
           auto command_buffer = vulkan::begin_command_recording(s.index);
@@ -2632,7 +2634,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
                 uint32_t,
                 3>{(cols + 15u) / 16u, (batches + 31u) / 32u, 1u}
           : matvec8_shader.has_value()
-          ? std::array<uint32_t, 3>{cols, rows, batches}
+          ? std::array<uint32_t, 3>{(cols + 7u) / 8u, rows, batches}
           : std::array<uint32_t, 3>{
                 (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
       if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {

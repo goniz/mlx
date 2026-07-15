@@ -1,8 +1,11 @@
 #version 450
 
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 #ifdef FLOAT16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -26,7 +29,12 @@
 #define SCALE_TO_FLOAT_TYPE(x) float(x)
 #endif
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// Process 8 output columns per workgroup so each activation load is reused,
+// matching Metal gather_qmv / llama.cpp mul_mat_vec_id NUM_COLS style.
+#define NUM_COLS 8
+#define BLOCK_SIZE 64
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W {
     uint8_t data_w[];
@@ -69,43 +77,128 @@ layout(push_constant) uniform parameter {
     uint num_groups;
 } p;
 
-shared float partial[256];
+shared float partial[NUM_COLS][BLOCK_SIZE];
 
 void main() {
-    const uint col = gl_WorkGroupID.x;
+    const uint col0 = gl_WorkGroupID.x * NUM_COLS;
     const uint row = gl_WorkGroupID.y;
     const uint batch = gl_WorkGroupID.z;
     const uint tid = gl_LocalInvocationID.x;
 
-    if (row >= p.rows || col >= p.cols) {
+    if (row >= p.rows || col0 >= p.cols) {
         return;
     }
 
+    const uint num_cols = min(NUM_COLS, p.cols - col0);
     const uint lhs_batch = data_lhs_indices[batch];
     const uint rhs_batch = data_rhs_indices[batch];
-    const uint w_row_base = rhs_batch * p.w_matrix_stride_bytes + col * p.packed_row_bytes;
-    const uint scale_row_base = rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
-    const uint bias_row_base = rhs_batch * p.bias_matrix_stride + col * p.bias_row_stride;
     const uint x_row_base = lhs_batch * p.x_batch_stride + row * p.x_row_stride;
 
-    float acc = 0.0f;
-    for (uint k = tid; k < p.K; k += gl_WorkGroupSize.x) {
-        const uint group = k / p.group_size;
-        const float w = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base + group]) *
-            float(data_w[w_row_base + k]) + SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base + group]);
-        acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k]), w, acc);
+    uint w_row_base[NUM_COLS];
+    uint scale_row_base[NUM_COLS];
+    uint bias_row_base[NUM_COLS];
+    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+        if (c < num_cols) {
+            const uint col = col0 + c;
+            w_row_base[c] = rhs_batch * p.w_matrix_stride_bytes + col * p.packed_row_bytes;
+            scale_row_base[c] = rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
+            bias_row_base[c] = rhs_batch * p.bias_matrix_stride + col * p.bias_row_stride;
+        }
     }
 
-    partial[tid] = acc;
+    float acc[NUM_COLS];
+    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+        acc[c] = 0.0f;
+    }
+
+    // Prefer vec4 strides when K is divisible by 4 (Qwen MoE K=512/2048).
+    if ((p.K & 3u) == 0u) {
+        for (uint k0 = 0u; k0 < p.K; k0 += BLOCK_SIZE * 4u) {
+            const uint k = k0 + tid * 4u;
+            if (k < p.K) {
+                const float x0 = TO_FLOAT_TYPE(data_x[x_row_base + k]);
+                const float x1 = TO_FLOAT_TYPE(data_x[x_row_base + k + 1u]);
+                const float x2 = TO_FLOAT_TYPE(data_x[x_row_base + k + 2u]);
+                const float x3 = TO_FLOAT_TYPE(data_x[x_row_base + k + 3u]);
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    if (c < num_cols) {
+                        const uint group0 = k / p.group_size;
+                        const uint group1 = (k + 1u) / p.group_size;
+                        const uint group2 = (k + 2u) / p.group_size;
+                        const uint group3 = (k + 3u) / p.group_size;
+                        const float w0 = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group0]) *
+                                float(data_w[w_row_base[c] + k]) +
+                            SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group0]);
+                        const float w1 = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group1]) *
+                                float(data_w[w_row_base[c] + k + 1u]) +
+                            SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group1]);
+                        const float w2 = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group2]) *
+                                float(data_w[w_row_base[c] + k + 2u]) +
+                            SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group2]);
+                        const float w3 = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group3]) *
+                                float(data_w[w_row_base[c] + k + 3u]) +
+                            SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group3]);
+                        acc[c] = fma(x0, w0, acc[c]);
+                        acc[c] = fma(x1, w1, acc[c]);
+                        acc[c] = fma(x2, w2, acc[c]);
+                        acc[c] = fma(x3, w3, acc[c]);
+                    }
+                }
+            }
+        }
+    } else {
+        for (uint k0 = 0u; k0 < p.K; k0 += BLOCK_SIZE) {
+            const uint k = k0 + tid;
+            if (k < p.K) {
+                const float xval = TO_FLOAT_TYPE(data_x[x_row_base + k]);
+                const uint group = k / p.group_size;
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    if (c < num_cols) {
+                        const float w = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group]) *
+                                float(data_w[w_row_base[c] + k]) +
+                            SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group]);
+                        acc[c] = fma(xval, w, acc[c]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fast path when the workgroup is a single subgroup (typical AMD wave64).
+    if (gl_SubgroupSize == BLOCK_SIZE && gl_NumSubgroups == 1u) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            acc[c] = subgroupAdd(acc[c]);
+        }
+        if (tid == 0u) {
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                if (c < num_cols) {
+                    data_out[batch * p.out_batch_stride + row * p.out_row_stride + col0 + c] =
+                        D_TYPE(FROM_FLOAT_TYPE(acc[c]));
+                }
+            }
+        }
+        return;
+    }
+
+    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+        partial[c][tid] = acc[c];
+    }
     barrier();
-    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
+    for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
-            partial[tid] += partial[tid + stride];
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                partial[c][tid] += partial[c][tid + stride];
+            }
         }
         barrier();
     }
 
     if (tid == 0u) {
-        data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] = D_TYPE(FROM_FLOAT_TYPE(partial[0]));
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            if (c < num_cols) {
+                data_out[batch * p.out_batch_stride + row * p.out_row_stride + col0 + c] =
+                    D_TYPE(FROM_FLOAT_TYPE(partial[c][0]));
+            }
+        }
     }
 }

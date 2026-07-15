@@ -660,7 +660,8 @@ bool flash_attention_coopmat_shmem_supported(
     const FlashAttentionTuningParams& params,
     uint32_t hsk,
     uint32_t hsv,
-    bool f32acc) {
+    bool f32acc,
+    bool bf16_range_safe = false) {
   const uint32_t block_rows = params.block_rows;
   const uint32_t block_cols = params.block_cols;
   const uint32_t mat_block_rows = 16u;
@@ -687,7 +688,8 @@ bool flash_attention_coopmat_shmem_supported(
                                   : (block_cols * vsh_stride)) *
       f16vec4_size;
   const uint32_t osh_stride = params.row_split * mat_block_rows / 4u;
-  const uint32_t pvsh = mat_block_cols * osh_stride * f16vec4_size;
+  const uint32_t pvsh = mat_block_cols * osh_stride *
+      (bf16_range_safe ? 4u * sizeof(float) : f16vec4_size);
   const uint32_t slope = block_rows * acc_type_size;
   return tmpsh + qf + psh + sfsh + ksh + pvsh + slope <=
       max_compute_shared_memory_size();
@@ -863,9 +865,21 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
   const uint32_t qk_ratio = kv_heads == 0u ? 0u : q_heads / kv_heads;
 
   auto get_tuning = [&](uint32_t rows) {
-    return use_native_bf16_kv
-        ? get_flash_attention_tuning_params_scalar(hsk, hsv, rows, kv_len)
-        : get_flash_attention_tuning_params(hsk, hsv, rows, kv_len);
+    if (use_native_bf16_kv && use_bool_mask) {
+      return get_flash_attention_tuning_params_scalar(
+          hsk, hsv, rows, kv_len);
+    }
+    auto candidate =
+        get_flash_attention_tuning_params(hsk, hsv, rows, kv_len);
+    if (use_native_bf16_kv &&
+        (candidate.path != FlashAttentionTuningParams::Path::CoopMat1 ||
+         candidate.subgroup_size != 64u ||
+         !flash_attention_coopmat_shmem_supported(
+             candidate, hsk, hsv, true, true))) {
+      return get_flash_attention_tuning_params_scalar(
+          hsk, hsv, rows, kv_len);
+    }
+    return candidate;
   };
   auto tuning = get_tuning(n_rows);
 

@@ -32,18 +32,52 @@ layout (binding = 1) readonly buffer KV4 {u16vec4 data_kv4[];};
 layout (binding = 2) readonly buffer V {uint16_t data_v[];};
 layout (binding = 2) readonly buffer VV4 {u16vec4 data_vv4[];};
 
-f16vec4 load_kv4(const u16vec4 value) {
-    return f16vec4(
-        float16_t(bf16_to_fp32(uint(value.x))),
-        float16_t(bf16_to_fp32(uint(value.y))),
-        float16_t(bf16_to_fp32(uint(value.z))),
-        float16_t(bf16_to_fp32(uint(value.w))));
+uint bf16_scale_exponent(const u16vec4 value) {
+    const u16vec4 exponents = (value >> u16vec4(7u)) & u16vec4(0xffu);
+    const uint exponent = max(
+        max(uint(exponents.x), uint(exponents.y)),
+        max(uint(exponents.z), uint(exponents.w)));
+    return exponent >= 143u && exponent < 255u ? exponent - 142u : 0u;
 }
+
+float bf16_scale_down(const uint exponent) {
+    return uintBitsToFloat((127u - exponent) << 23u);
+}
+
+float bf16_scale_up(const uint exponent) {
+    return uintBitsToFloat((127u + exponent) << 23u);
+}
+
+f16vec4 load_kv4(const u16vec4 value, const uint exponent) {
+    if (exponent == 0u) {
+        return f16vec4(
+            float16_t(bf16_to_fp32(uint(value.x))),
+            float16_t(bf16_to_fp32(uint(value.y))),
+            float16_t(bf16_to_fp32(uint(value.z))),
+            float16_t(bf16_to_fp32(uint(value.w))));
+    }
+    const float scale = bf16_scale_down(exponent);
+    return f16vec4(
+        float16_t(bf16_to_fp32(uint(value.x)) * scale),
+        float16_t(bf16_to_fp32(uint(value.y)) * scale),
+        float16_t(bf16_to_fp32(uint(value.z)) * scale),
+        float16_t(bf16_to_fp32(uint(value.w)) * scale));
+}
+
+#define OUTPUT_ACC_TYPE float
+#define OUTPUT_ACC_TYPEV4 vec4
+#define KQ_ACC_TYPE float
+#define KQ_ACC_TYPEV4 vec4
 #else
 layout (binding = 1) readonly buffer K {float16_t data_k[];};
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
 layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
+
+#define OUTPUT_ACC_TYPE float16_t
+#define OUTPUT_ACC_TYPEV4 f16vec4
+#define KQ_ACC_TYPE ACC_TYPE
+#define KQ_ACC_TYPEV4 ACC_TYPEV4
 #endif
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
@@ -57,7 +91,7 @@ shared f16vec4 Psh[Bc * psh_stride];
 
 // Avoid padding for hsk==256 to make it fit in 48KB shmem.
 const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
-shared ACC_TYPEV4 sfsh[Bc * sfshstride];
+shared KQ_ACC_TYPEV4 sfsh[Bc * sfshstride];
 
 const uint32_t D_pad = HSK_pad > HSV_pad ? HSK_pad : HSV_pad;
 const uint32_t kvsh_stride = (SHMEM_STAGING != 0 ? D_pad : MatBr) / 4 + 2; // in units of f16vec4
@@ -66,7 +100,7 @@ const uint vsh_stride = v_cols;
 shared f16vec4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
 
 const uint32_t osh_stride = row_split * MatBr / 4;
-shared f16vec4 pvsh[MatBc * osh_stride];
+shared OUTPUT_ACC_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
@@ -108,10 +142,10 @@ void main() {
     }
     barrier();
 
-    f16vec4 Of[rows_per_thread][d_per_thread];
+    OUTPUT_ACC_TYPEV4 Of[rows_per_thread][d_per_thread];
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
         [[unroll]] for (uint32_t d = 0; d < d_per_thread; ++d) {
-            Of[r][d] = f16vec4(0.0);
+            Of[r][d] = OUTPUT_ACC_TYPEV4(0.0);
         }
     }
 
@@ -244,6 +278,7 @@ void main() {
             }
         }
 
+#if !defined(DATA_A_BF16)
         if (SHMEM_STAGING != 0) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSK_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSK_pad / 4);
@@ -257,11 +292,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
-#if defined(DATA_A_BF16)
-                        K_Tf = load_kv4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
-#else
                         K_Tf = f16vec4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
-#endif
 #endif
                     }
 
@@ -270,20 +301,45 @@ void main() {
             }
             barrier();
         }
+#endif
 
         // K * Q^T -> S^T: Bc x HSK_pad * HSK_pad x Br -> Bc x Br
         // Bc split across workgroup (four subgroups), loop over HSK in chunks of 16: 16 x 16 * 16 x 16 -> 16 x 16
         // This is written transposed in order to allow for N being 8 if implementations need it
-        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+        coopmat<KQ_ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr,
+            gl_MatrixUseAccumulator> SfMat =
+            coopmat<KQ_ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr,
+                gl_MatrixUseAccumulator>(0);
         coopmat<float16_t, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
         coopmat<float16_t, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
 
         [[unroll]] for (uint32_t d = 0; d < HSK_pad / 16; ++d) {
+            uint k_scale_exponent = 0u;
             // If SHMEM_STAGING is set, a Bc * HSK_pad size tile of K is loaded to shmem
             // If not, f16 K is loaded directly from global memory if aligned, otherwise
             // staged through a Bc * MatBr size staging buffer.
             // If K is not type f16, then it is always staged for dequantization.
-            if (SHMEM_STAGING == 0) {
+            if (SHMEM_STAGING == 0
+#if defined(DATA_A_BF16)
+                || true
+#endif
+            ) {
+#if defined(DATA_A_BF16)
+            barrier();
+            const uint32_t col_vec = tid % (MatBr / 4);
+            const uint32_t row = tid / (MatBr / 4);
+            u16vec4 raw_k = u16vec4(0u);
+            if ((!KV_bounds_check || j * Bc + row < KV) &&
+                (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
+                raw_k = data_kv4[
+                    k_offset / 4 + (j * Bc + row) * k_stride / 4 +
+                    d * 16 / 4 + col_vec];
+            }
+            k_scale_exponent = subgroupMax(bf16_scale_exponent(raw_k));
+            kvsh[row * kvsh_stride + col_vec] =
+                load_kv4(raw_k, k_scale_exponent);
+            barrier();
+#else
 #if BLOCK_SIZE == 1 && !defined(DATA_A_BF16)
             if (KV_bounds_check || d * 16 + 16 > HSK) {
 #endif
@@ -300,11 +356,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
-#if defined(DATA_A_BF16)
-                        K_Tf = load_kv4(data_kv4[k_offset / 4 + (j * Bc + row) * k_stride / 4 + d * 16 / 4 + col_vec]);
-#else
                         K_Tf = f16vec4(data_kv4[k_offset / 4 + (j * Bc + row) * k_stride / 4 + d * 16 / 4 + col_vec]);
-#endif
 #endif
                     }
 
@@ -314,6 +366,7 @@ void main() {
             barrier();
 #if BLOCK_SIZE == 1 && !defined(DATA_A_BF16)
             }
+#endif
 #endif
 
 #if BLOCK_SIZE == 1 && !defined(DATA_A_BF16)
@@ -336,7 +389,20 @@ void main() {
 
             coopMatLoad(QMat, Qf, d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
 
+#if defined(DATA_A_BF16)
+            if (k_scale_exponent == 0u) {
+                SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+            } else {
+                coopmat<KQ_ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr,
+                    gl_MatrixUseAccumulator> SfChunk =
+                    coopmat<KQ_ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr,
+                        gl_MatrixUseAccumulator>(0);
+                SfChunk = coopMatMulAdd(KMat, QMat, SfChunk);
+                SfMat += SfChunk * bf16_scale_up(k_scale_exponent);
+            }
+#else
             SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+#endif
         }
 
         uint coord = gl_SubgroupID * MatBc * sfshstride;
@@ -348,7 +414,8 @@ void main() {
                 uint32_t c = (idx + tid) / (Br / 4);
                 uint32_t r = (idx + tid) % (Br / 4);
                 if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
-                    sfsh[c * sfshstride + r] = ACC_TYPEV4(p.logit_softcap * tanh(sfsh[c * sfshstride + r]));
+                    sfsh[c * sfshstride + r] = KQ_ACC_TYPEV4(
+                        p.logit_softcap * tanh(sfsh[c * sfshstride + r]));
                 }
             }
             barrier();
@@ -361,8 +428,13 @@ void main() {
                 if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
                     if (!KV_bounds_check || j * Bc + c < KV) {
                         // Mask nem1 bounds check is handled when loading masks
-                        ACC_TYPEV4 masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
-                        ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
+                        KQ_ACC_TYPEV4 masks =
+                            KQ_ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
+                        KQ_ACC_TYPEV4 slopes = KQ_ACC_TYPEV4(
+                            slope[r * 4],
+                            slope[r * 4 + 1],
+                            slope[r * 4 + 2],
+                            slope[r * 4 + 3]);
                         sfsh[c * sfshstride + r] += slopes * masks;
                     }
                 }
@@ -375,7 +447,7 @@ void main() {
                 if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
                     const uint32_t global_col = j * Bc + c;
                     const uint32_t row0 = i * Br + r * 4;
-                    ACC_TYPEV4 causal = sfsh[c * sfshstride + r];
+                    KQ_ACC_TYPEV4 causal = sfsh[c * sfshstride + r];
                     if (int(global_col) > n_past + int(row0)) {
                         causal[0] = ACC_TYPE(NEG_FLT_MAX_OVER_2);
                     }
@@ -423,7 +495,7 @@ void main() {
         [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
             const uint d_local = d0 / threads_per_rowgroup;
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Of[r][d_local] = float16_t(eMf[r]) * Of[r][d_local];
+                Of[r][d_local] = OUTPUT_ACC_TYPE(eMf[r]) * Of[r][d_local];
             }
         }
 
@@ -446,6 +518,7 @@ void main() {
             }
         }
 
+#if !defined(DATA_A_BF16)
         if (SHMEM_STAGING != 0) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV_pad / 4);
@@ -459,11 +532,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE);
                         V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
-#if defined(DATA_A_BF16)
-                        V_Tf = load_kv4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
-#else
                         V_Tf = f16vec4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
-#endif
 #endif
                     }
 
@@ -471,6 +540,7 @@ void main() {
                 }
             }
         }
+#endif
         barrier();
 
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
@@ -478,8 +548,12 @@ void main() {
         // Each subgroup handles HSV/4 columns
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
+            uint v_scale_exponent = 0u;
 
-            coopmat<float16_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat = coopmat<float16_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+            coopmat<OUTPUT_ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr,
+                gl_MatrixUseAccumulator> PVMat =
+                coopmat<OUTPUT_ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr,
+                    gl_MatrixUseAccumulator>(0);
 
             // Preload V tiles for [Bc, 16 * num subgroups]
             const uint v_rows = Bc;
@@ -490,7 +564,44 @@ void main() {
             // If not, f16 V is loaded directly from global memory if aligned, otherwise
             // staged through a Bc * MatBr size staging buffer.
             // If V is not type f16, then it is always staged for dequantization.
-            if (SHMEM_STAGING == 0) {
+            if (SHMEM_STAGING == 0
+#if defined(DATA_A_BF16)
+                || true
+#endif
+            ) {
+#if defined(DATA_A_BF16)
+            uint local_v_exponent = 0u;
+            const uint values_per_subgroup = Bc * (MatBc / 4);
+            const uint values_per_thread = 4u;
+            u16vec4 raw_v[4];
+            [[unroll]] for (uint i = 0u; i < values_per_thread; ++i) {
+                const uint idx = i * gl_SubgroupSize +
+                    gl_SubgroupInvocationID;
+                const uint row = idx / (MatBc / 4);
+                const uint col_in_tile = idx % (MatBc / 4);
+                const uint col = gl_SubgroupID * (MatBc / 4) + col_in_tile;
+                const uint v_row = j * Bc + row;
+                const uint v_col =
+                    hsv_tile * MatBc * row_split + col * 4;
+                raw_v[i] = u16vec4(0u);
+                if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
+                    raw_v[i] = data_vv4[
+                        (v_offset + v_row * v_stride + v_col) / 4];
+                }
+                local_v_exponent = max(
+                    local_v_exponent, bf16_scale_exponent(raw_v[i]));
+            }
+            v_scale_exponent = subgroupMax(local_v_exponent);
+            [[unroll]] for (uint i = 0u; i < values_per_thread; ++i) {
+                const uint idx = i * gl_SubgroupSize +
+                    gl_SubgroupInvocationID;
+                const uint row = idx / (MatBc / 4);
+                const uint col_in_tile = idx % (MatBc / 4);
+                const uint col = gl_SubgroupID * (MatBc / 4) + col_in_tile;
+                kvsh[row * vsh_stride + col] =
+                    load_kv4(raw_v[i], v_scale_exponent);
+            }
+#else
 #if BLOCK_SIZE == 1 && !defined(DATA_A_BF16)
             // For f16, only preload if not aligned
             if (KV_bounds_check) {
@@ -511,12 +622,7 @@ void main() {
 #if BLOCK_SIZE > 1
                     kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
-#if defined(DATA_A_BF16)
-                    kvsh[row * vsh_stride + col] = load_kv4(
-                        data_vv4[(v_offset + v_row * v_stride + v_col) / 4]);
-#else
                     kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
-#endif
 #endif
                 } else {
                     kvsh[row * vsh_stride + col] = f16vec4(0.0f);
@@ -525,6 +631,7 @@ void main() {
 
 #if BLOCK_SIZE == 1 && !defined(DATA_A_BF16)
             }
+#endif
 #endif
             }
             barrier();
@@ -535,7 +642,11 @@ void main() {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
 
-                    if (SHMEM_STAGING == 0) {
+                    if (SHMEM_STAGING == 0
+#if defined(DATA_A_BF16)
+                        || true
+#endif
+                    ) {
 #if BLOCK_SIZE == 1 && !defined(DATA_A_BF16)
                     if (!KV_bounds_check) {
                         // F16 values can be loaded directly from global memory
@@ -578,7 +689,12 @@ void main() {
 
                     if (hsv_col >= hsv_base && hsv_col < hsv_base + hsv_per_tile && hsv_col < HSV) {
                         const uint local_hsv = (hsv_col - hsv_base) / 4;
-                        Of[r][d_local] += pvsh[row * osh_stride + local_hsv];
+                        Of[r][d_local] +=
+                            pvsh[row * osh_stride + local_hsv]
+#if defined(DATA_A_BF16)
+                            * bf16_scale_up(v_scale_exponent)
+#endif
+                            ;
                     }
                 }
             }
@@ -654,7 +770,7 @@ void main() {
 
                 [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
                     const uint d_local = d0 / threads_per_rowgroup;
-                    Of[r][d_local] *= float16_t(ms);
+                    Of[r][d_local] *= OUTPUT_ACC_TYPE(ms);
                 }
             } else {
                 vs = exp(sink - Mf[r]);
@@ -672,8 +788,8 @@ void main() {
     [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
         const uint d_local = d0 / threads_per_rowgroup;
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            Of[r][d_local] *= float16_t(Lfrcp[r]);
-#if defined(FLOAT_TYPE_MAX)
+            Of[r][d_local] *= OUTPUT_ACC_TYPE(Lfrcp[r]);
+#if defined(FLOAT_TYPE_MAX) && !defined(DATA_A_BF16)
             Of[r][d_local] = clamp(Of[r][d_local], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
 #endif
         }

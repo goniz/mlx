@@ -6,6 +6,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_basic : require
 
 #include "types.glsl"
@@ -69,9 +70,27 @@ float scale_up(const float value, const uint exponent) {
     return value * uintBitsToFloat((127u + exponent) << 23u);
 }
 
-uint fp16_range_scale_exponent(const float value) {
+uint fp32_biased_exponent(const float value) {
     const uint exponent = (floatBitsToUint(abs(value)) >> 23u) & 0xffu;
-    return exponent >= 143u && exponent < 255u ? exponent - 142u : 0u;
+    return exponent < 255u ? exponent : 0u;
+}
+
+uint fp16_range_scale_exponent(const uint exponent) {
+    return exponent >= 143u ? exponent - 142u : 0u;
+}
+
+uint ceil_log2(const uint value) {
+    return value <= 1u ? 0u : uint(findMSB(value - 1u)) + 1u;
+}
+
+uint dot_accumulator_scale_exponent(
+    const uint x_exponent,
+    const uint w_exponent,
+    const uint terms) {
+    // Values with biased exponent e are below 2^(e - 126). Account for the
+    // full dot length so the fp16 accumulator remains strictly below 2^16.
+    const uint exponent_sum = x_exponent + w_exponent + ceil_log2(terms);
+    return exponent_sum > 268u ? exponent_sum - 268u : 0u;
 }
 
 void main() {
@@ -90,17 +109,9 @@ void main() {
     const uint col_start = gl_WorkGroupID.x * BN;
     const uint valid_rows = data_metadata[1u + 2u * p.max_tiles + tile];
 
-    if (lane < BM) {
-        const uint exponent = lane < valid_rows
-            ? data_metadata[1u + 3u * p.max_tiles + row_start + lane]
-            : 0u;
-        x_scale_exponents[lane] = exponent;
-        x_scale_factors[lane] =
-            uintBitsToFloat((127u - exponent) << 23u);
-    }
+    uint weight_exponent = 0u;
     if (lane < BN) {
         const uint src_col = col_start + lane;
-        uint scale_exponent = 0u;
         if (src_col < p.cols) {
             const uint scale_base = expert * p.scale_matrix_stride +
                 src_col * p.scale_row_stride;
@@ -113,13 +124,15 @@ void main() {
                     uint(data_scales[scale_base + group]));
                 const float bias = bf16_to_fp32(
                     uint(data_biases[bias_base + group]));
-                scale_exponent = max(
-                    scale_exponent,
-                    fp16_range_scale_exponent(bias));
-                scale_exponent = max(
-                    scale_exponent,
-                    fp16_range_scale_exponent(fma(scale, 255.0f, bias)));
+                weight_exponent = max(
+                    weight_exponent,
+                    fp32_biased_exponent(bias));
+                weight_exponent = max(
+                    weight_exponent,
+                    fp32_biased_exponent(fma(scale, 255.0f, bias)));
             }
+            const uint scale_exponent =
+                fp16_range_scale_exponent(weight_exponent);
             w_scales[lane] = scale_down(
                 bf16_to_fp32(uint(data_scales[scale_base])), scale_exponent);
             w_biases[lane] = scale_down(
@@ -128,7 +141,38 @@ void main() {
             w_scales[lane] = 0.0f;
             w_biases[lane] = 0.0f;
         }
-        w_scale_exponents[lane] = scale_exponent;
+        w_scale_exponents[lane] = weight_exponent;
+    }
+    const uint subgroup_w_exponent = subgroupMax(weight_exponent);
+    if (subgroup < 2u && subgroupElect()) {
+        x_scale_exponents[subgroup] = subgroup_w_exponent;
+    }
+    barrier();
+
+    const uint max_w_exponent =
+        max(x_scale_exponents[0], x_scale_exponents[1]);
+    if (lane < BM) {
+        const uint x_exponent = lane < valid_rows
+            ? data_metadata[1u + 3u * p.max_tiles + row_start + lane]
+            : 0u;
+        const uint max_w_scale_exponent =
+            fp16_range_scale_exponent(max_w_exponent);
+        const uint dot_scale_exponent = dot_accumulator_scale_exponent(
+            x_exponent, max_w_exponent, p.K);
+        const uint required_x_scale_exponent =
+            dot_scale_exponent > max_w_scale_exponent
+            ? dot_scale_exponent - max_w_scale_exponent
+            : 0u;
+        const uint scale_exponent = max(
+            fp16_range_scale_exponent(x_exponent),
+            required_x_scale_exponent);
+        x_scale_exponents[lane] = scale_exponent;
+        x_scale_factors[lane] =
+            uintBitsToFloat((127u - scale_exponent) << 23u);
+    }
+    if (lane < BN) {
+        w_scale_exponents[lane] =
+            fp16_range_scale_exponent(w_scale_exponents[lane]);
     }
     barrier();
 

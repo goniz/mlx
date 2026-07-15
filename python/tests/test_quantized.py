@@ -1157,6 +1157,31 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertEqual(y_q.shape, y_hat.shape)
                 self.assertLess((y_q - y_hat).abs().max(), 1e-1)
 
+    def test_gather_qmm_sorted_bf16_accumulator_range(self):
+        batches, experts, n, k = 64, 1, 128, 64
+        x = mx.full((batches, 1, k), 128, dtype=mx.bfloat16)
+        w_q = mx.zeros((experts, n, k // 4), dtype=mx.uint32)
+        scales = mx.zeros((experts, n, k // 64), dtype=mx.bfloat16)
+        biases = mx.full(
+            (experts, n, k // 64), 128, dtype=mx.bfloat16
+        )
+        rhs_indices = mx.zeros((batches,), dtype=mx.uint32)
+
+        y = mx.gather_qmm(
+            x,
+            w_q,
+            scales,
+            biases,
+            rhs_indices=rhs_indices,
+            transpose=True,
+            group_size=64,
+            bits=8,
+            sorted_indices=True,
+        )
+        expected = mx.full(y.shape, k * 128 * 128, dtype=mx.bfloat16)
+        self.assertTrue(mx.all(mx.isfinite(y)))
+        self.assertEqualArray(y, expected)
+
     def test_gather_qmm_sorted(self):
         def quantize(w, transpose=True, group_size=None, mode="affine"):
             if mode == "affine":

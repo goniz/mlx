@@ -1,6 +1,8 @@
 #version 450
 
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -53,21 +55,27 @@ void main() {
         const uint valid_rows =
             data_metadata[1u + 2u * p.max_tiles + tile];
         const uint row_pairs = p.K / 2u;
-        const uint tile_pairs = valid_rows * row_pairs;
-        for (uint index = lane; index < tile_pairs; index += 256u) {
-            const uint row = index / row_pairs;
-            const uint pair = index - row * row_pairs;
-            const uint packed = data_x[
-                ((row_start + row) * p.x_row_stride + pair * 2u) / 2u];
-            const uint exponent0 = ((packed & 0x7fffu) >> 7u) & 0xffu;
-            const uint exponent1 =
-                (((packed >> 16u) & 0x7fffu) >> 7u) & 0xffu;
-            const uint exponent = max(exponent0, exponent1);
-            if (exponent >= 143u && exponent < 255u) {
-                atomicMax(
-                    data_metadata[
-                        1u + 3u * p.max_tiles + row_start + row],
-                    exponent - 142u);
+        // Assign one subgroup per row to preserve coalesced packed loads while
+        // reducing each row's maximum exponent without global atomics.
+        for (uint row = gl_SubgroupID; row < valid_rows;
+             row += gl_NumSubgroups) {
+            uint max_exponent = 0u;
+            for (uint pair = gl_SubgroupInvocationID; pair < row_pairs;
+                 pair += gl_SubgroupSize) {
+                const uint packed = data_x[
+                    ((row_start + row) * p.x_row_stride + pair * 2u) / 2u];
+                const uint exponent0 = ((packed & 0x7fffu) >> 7u) & 0xffu;
+                const uint exponent1 =
+                    (((packed >> 16u) & 0x7fffu) >> 7u) & 0xffu;
+                const uint exponent = max(exponent0, exponent1);
+                if (exponent < 255u) {
+                    max_exponent = max(max_exponent, exponent);
+                }
+            }
+            max_exponent = subgroupMax(max_exponent);
+            if (subgroupElect()) {
+                data_metadata[1u + 3u * p.max_tiles + row_start + row] =
+                    max_exponent;
             }
         }
         return;

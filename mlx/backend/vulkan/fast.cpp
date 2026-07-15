@@ -853,6 +853,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
     bool do_causal,
     uint32_t mask_heads,
     bool use_native_bf16_kv,
+    bool use_bool_mask,
     uint32_t q_stride,
     uint32_t k_stride,
     uint32_t v_stride) {
@@ -861,7 +862,12 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
   uint32_t workgroups_y = q_heads;
   const uint32_t qk_ratio = kv_heads == 0u ? 0u : q_heads / kv_heads;
 
-  auto tuning = get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
+  auto get_tuning = [&](uint32_t rows) {
+    return use_native_bf16_kv && use_bool_mask
+        ? get_flash_attention_tuning_params_scalar(hsk, hsv, rows, kv_len)
+        : get_flash_attention_tuning_params(hsk, hsv, rows, kv_len);
+  };
+  auto tuning = get_tuning(n_rows);
 
   // Pack GQA heads into rows only for decode; doing this for short prefill
   // conflates sequence rows and corrupts small-prompt attention.
@@ -870,7 +876,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
     gqa_ratio = qk_ratio;
     n_rows = gqa_ratio;
     workgroups_y /= gqa_ratio;
-    tuning = get_flash_attention_tuning_params(hsk, hsv, n_rows, kv_len);
+    tuning = get_tuning(n_rows);
   }
 
   const bool aligned = (kv_len % tuning.block_cols) == 0 &&
@@ -985,6 +991,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       has_mask ? checked_u32_size((*mask).shape(1), "flash_attn mask_heads")
                : 1u,
       use_native_bf16_kv,
+      use_bool_mask,
       q_stride,
       k_stride,
       v_stride);

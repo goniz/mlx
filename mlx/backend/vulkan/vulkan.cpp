@@ -502,6 +502,7 @@ void VulkanContext::init() {
   bool pipeline_robustness_supported = false;
   bool cooperative_matrix_supported = false;
   bool coopmat_flash_attention_f32acc_supported = false;
+  bool coopmat_f16acc_supported = false;
   bool coopmat2_conv2d_supported = false;
   bool integer_dot_product_supported = false;
   uint32_t vendor_id = 0;
@@ -898,7 +899,14 @@ void VulkanContext::init() {
                   prop.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
                   prop.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
                 coopmat_flash_attention_f32acc_supported = true;
-                break;
+              }
+              if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16 &&
+                  prop.scope == VK_SCOPE_SUBGROUP_KHR &&
+                  prop.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                  prop.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                  prop.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                  prop.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR) {
+                coopmat_f16acc_supported = true;
               }
             }
           }
@@ -1071,6 +1079,8 @@ void VulkanContext::init() {
     this->coopmat_flash_attention_f32acc_supported_ =
         coopmat_flash_attention_f32acc_supported &&
         subgroup_require_full_support;
+    this->coopmat_f16acc_supported_ =
+        coopmat_f16acc_supported && subgroup_require_full_support;
     this->coopmat2_conv2d_supported_ = coopmat2_conv2d_supported;
     this->integer_dot_product_supported_ = integer_dot_product_supported;
     // Only enable push descriptor support if both extension is present AND
@@ -1147,6 +1157,7 @@ void VulkanContext::cleanup() {
   pipeline_robustness_supported_ = false;
   cooperative_matrix_supported_ = false;
   coopmat_flash_attention_f32acc_supported_ = false;
+  coopmat_f16acc_supported_ = false;
   coopmat2_conv2d_supported_ = false;
   integer_dot_product_supported_ = false;
   vendor_id_ = 0;

@@ -863,7 +863,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
   const uint32_t qk_ratio = kv_heads == 0u ? 0u : q_heads / kv_heads;
 
   auto get_tuning = [&](uint32_t rows) {
-    return use_native_bf16_kv && use_bool_mask
+    return use_native_bf16_kv
         ? get_flash_attention_tuning_params_scalar(hsk, hsv, rows, kv_len)
         : get_flash_attention_tuning_params(hsk, hsv, rows, kv_len);
   };

@@ -2526,7 +2526,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 #if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
   const bool use_expert_coop_qmm = use_sorted_rhs_qmm && native_bf16 &&
       bits_ == 8 && group_size_ == 64 && expert_count <= 256 &&
-      (k % 16u) == 0u && context.coopmat_flash_attention_f32acc_supported() &&
+      (k % 16u) == 0u && context.coopmat_f16acc_supported() &&
       supports_64_lane_subgroups && supports_expert_coop_workgroup &&
       gather_affine_coop_prefill_enabled();
 #else

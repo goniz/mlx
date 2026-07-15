@@ -2271,6 +2271,23 @@ void process_shaders() {
        {"SCALE_TO_FLOAT_TYPE(x)", "bf16_to_fp32(uint(x))"},
        {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
   string_to_spv(
+      "fused_affine_matvec4_bf16_bf16",
+      "mul_mv_affine4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"S_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"SCALE_TO_FLOAT_TYPE(x)", "bf16_to_fp32(uint(x))"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
+  string_to_spv(
+      "fused_affine_qmm_bf16_bf16_tiled4",
+      "mul_mm_affine_bf16_tiled4.comp",
+      {});
+  string_to_spv(
+      "fused_affine_qmm_bf16_bf16_tiled4_n32",
+      "mul_mm_affine_bf16_tiled4.comp",
+      {{"MLX_BN", "32"}, {"MLX_TN", "4"}});
+  string_to_spv(
       "fused_affine_matvec_f32_f32",
       "mul_mv_affine.comp",
       {{"B_TYPE", "float"}});

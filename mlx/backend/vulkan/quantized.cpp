@@ -2632,7 +2632,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
                 uint32_t,
                 3>{(cols + 15u) / 16u, (batches + 31u) / 32u, 1u}
           : matvec8_shader.has_value()
-          ? std::array<uint32_t, 3>{(cols + 7u) / 8u, rows, batches}
+          ? std::array<uint32_t, 3>{cols, rows, batches}
           : std::array<uint32_t, 3>{
                 (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
       if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {

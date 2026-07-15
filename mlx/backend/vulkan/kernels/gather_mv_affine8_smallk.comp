@@ -1,6 +1,5 @@
 #version 450
 
-#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
@@ -29,12 +28,7 @@
 #define SCALE_TO_FLOAT_TYPE(x) float(x)
 #endif
 
-// Metal gather_qmv / llama.cpp mul_mat_vec_id style: reuse activations across
-// several output columns. On AMD wave64 a single subgroup covers BLOCK_SIZE.
-#define NUM_COLS 8
-#define BLOCK_SIZE 64
-
-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W {
     uint data_w[];
@@ -77,125 +71,79 @@ layout(push_constant) uniform parameter {
     uint num_groups;
 } p;
 
-shared float partial[NUM_COLS][BLOCK_SIZE];
+shared float partial[8];
 
 void main() {
-    const uint col0 = gl_WorkGroupID.x * NUM_COLS;
+    const uint col = gl_WorkGroupID.x;
     const uint row = gl_WorkGroupID.y;
     const uint batch = gl_WorkGroupID.z;
     const uint tid = gl_LocalInvocationID.x;
 
-    if (row >= p.rows || col0 >= p.cols) {
+    if (row >= p.rows || col >= p.cols) {
         return;
     }
 
-    const uint num_cols = min(NUM_COLS, p.cols - col0);
     const uint lhs_batch = data_lhs_indices[batch];
     const uint rhs_batch = data_rhs_indices[batch];
+    const uint w_row_words =
+        (rhs_batch * p.w_matrix_stride_bytes + col * p.packed_row_bytes) >> 2;
+    const uint scale_row_base =
+        rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
+    const uint bias_row_base =
+        rhs_batch * p.bias_matrix_stride + col * p.bias_row_stride;
     const uint x_row_base = lhs_batch * p.x_batch_stride + row * p.x_row_stride;
 
-    uint w_row_words[NUM_COLS];
-    uint scale_row_base[NUM_COLS];
-    uint bias_row_base[NUM_COLS];
-    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-        if (c < num_cols) {
-            const uint col = col0 + c;
-            w_row_words[c] =
-                (rhs_batch * p.w_matrix_stride_bytes + col * p.packed_row_bytes) >> 2;
-            scale_row_base[c] =
-                rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
-            bias_row_base[c] =
-                rhs_batch * p.bias_matrix_stride + col * p.bias_row_stride;
-        }
-    }
-
-    float acc[NUM_COLS];
-    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-        acc[c] = 0.0f;
-    }
-
-    // 8-bit affine weights are packed 4-per-uint32. Walk K in uint packs so
-    // each thread issues wide loads; activations are reused across NUM_COLS.
+    float acc = 0.0f;
     if ((p.K & 3u) == 0u && (p.group_size & 3u) == 0u) {
         const uint packs = p.K >> 2;
-        for (uint pidx = tid; pidx < packs; pidx += BLOCK_SIZE) {
+        for (uint pidx = tid; pidx < packs; pidx += gl_WorkGroupSize.x) {
             const uint k = pidx << 2;
             const uint group = k / p.group_size;
-            const float x0 = TO_FLOAT_TYPE(data_x[x_row_base + k]);
-            const float x1 = TO_FLOAT_TYPE(data_x[x_row_base + k + 1u]);
-            const float x2 = TO_FLOAT_TYPE(data_x[x_row_base + k + 2u]);
-            const float x3 = TO_FLOAT_TYPE(data_x[x_row_base + k + 3u]);
-
-            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-                if (c < num_cols) {
-                    const float s =
-                        SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group]);
-                    const float b =
-                        SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group]);
-                    const uint packed = data_w[w_row_words[c] + pidx];
-                    acc[c] = fma(x0, float(packed & 0xffu) * s + b, acc[c]);
-                    acc[c] = fma(
-                        x1, float((packed >> 8) & 0xffu) * s + b, acc[c]);
-                    acc[c] = fma(
-                        x2, float((packed >> 16) & 0xffu) * s + b, acc[c]);
-                    acc[c] = fma(
-                        x3, float((packed >> 24) & 0xffu) * s + b, acc[c]);
-                }
-            }
+            const float s =
+                SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base + group]);
+            const float b =
+                SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base + group]);
+            const uint packed = data_w[w_row_words + pidx];
+            acc = fma(
+                TO_FLOAT_TYPE(data_x[x_row_base + k]),
+                float(packed & 0xffu) * s + b,
+                acc);
+            acc = fma(
+                TO_FLOAT_TYPE(data_x[x_row_base + k + 1u]),
+                float((packed >> 8) & 0xffu) * s + b,
+                acc);
+            acc = fma(
+                TO_FLOAT_TYPE(data_x[x_row_base + k + 2u]),
+                float((packed >> 16) & 0xffu) * s + b,
+                acc);
+            acc = fma(
+                TO_FLOAT_TYPE(data_x[x_row_base + k + 3u]),
+                float((packed >> 24) & 0xffu) * s + b,
+                acc);
         }
     } else {
-        for (uint k = tid; k < p.K; k += BLOCK_SIZE) {
+        for (uint k = tid; k < p.K; k += gl_WorkGroupSize.x) {
             const uint group = k / p.group_size;
-            const float xval = TO_FLOAT_TYPE(data_x[x_row_base + k]);
-            const uint byte_off = k;
-            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-                if (c < num_cols) {
-                    const uint word = data_w[w_row_words[c] + (byte_off >> 2)];
-                    const uint q = (word >> ((byte_off & 3u) * 8u)) & 0xffu;
-                    const float w = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group]) *
-                            float(q) +
-                        SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group]);
-                    acc[c] = fma(xval, w, acc[c]);
-                }
-            }
+            const uint word = data_w[w_row_words + (k >> 2)];
+            const uint q = (word >> ((k & 3u) * 8u)) & 0xffu;
+            const float w = SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base + group]) *
+                    float(q) +
+                SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base + group]);
+            acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k]), w, acc);
         }
     }
 
-    // Fast path: one subgroup covers the whole workgroup (AMD wave64).
-    if (gl_SubgroupSize == BLOCK_SIZE && gl_NumSubgroups == 1u) {
-        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-            acc[c] = subgroupAdd(acc[c]);
-        }
-        if (tid == 0u) {
-            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-                if (c < num_cols) {
-                    data_out[batch * p.out_batch_stride + row * p.out_row_stride + col0 + c] =
-                        D_TYPE(FROM_FLOAT_TYPE(acc[c]));
-                }
-            }
-        }
-        return;
-    }
-
-    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-        partial[c][tid] = acc[c];
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) {
+        partial[gl_SubgroupID] = acc;
     }
     barrier();
-    for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-                partial[c][tid] += partial[c][tid + stride];
-            }
-        }
-        barrier();
-    }
-
     if (tid == 0u) {
-        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
-            if (c < num_cols) {
-                data_out[batch * p.out_batch_stride + row * p.out_row_stride + col0 + c] =
-                    D_TYPE(FROM_FLOAT_TYPE(partial[c][0]));
-            }
+        float total = 0.0f;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+            total += partial[i];
         }
+        data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
+            D_TYPE(FROM_FLOAT_TYPE(total));
     }
 }

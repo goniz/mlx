@@ -633,6 +633,17 @@ struct FusedAffineMatmulPushConstants {
   uint32_t num_groups;
 };
 
+struct AffineBf16ExponentsPushConstants {
+  uint32_t rows;
+  uint32_t cols;
+  uint32_t K;
+  uint32_t x_row_stride;
+  uint32_t scale_row_stride;
+  uint32_t bias_row_stride;
+  uint32_t num_groups;
+  uint32_t mode;
+};
+
 struct GatherAffineMatmulPushConstants {
   uint32_t rows;
   uint32_t cols;
@@ -1153,6 +1164,19 @@ void dispatch_fused_affine_matmul_op(
     const array& scales,
     const array& biases,
     const array& b,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const FusedAffineMatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
+
+void dispatch_fused_affine_coop4_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& x,
+    array& exponents,
     array& out,
     StaticShaderId shader_id,
     vk::CommandBuffer cmd_buffer,

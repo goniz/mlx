@@ -25,7 +25,12 @@ layout(binding = 2) readonly buffer BIASES {
 layout(binding = 3) readonly buffer X {
     uint data_x[];
 };
-layout(binding = 4) writeonly buffer OUT {
+layout(binding = 4) readonly buffer EXPONENTS {
+    // [0, rows) activation row exponents; [rows, rows+cols) weight column
+    // exponents. Precomputed once per QMM (see affine_bf16_exponents.comp).
+    uint data_exponents[];
+};
+layout(binding = 5) writeonly buffer OUT {
     uint16_t data_out[];
 };
 
@@ -101,43 +106,17 @@ void main() {
     const uint valid_rows = min(BM, p.rows - row_start);
     const uint packed_row_words = p.packed_row_bytes >> 2;
 
-    // Per-row BF16 exponents for activations in this tile.
-    const uint row_pairs = p.K >> 1;
-    for (uint row = gl_SubgroupID; row < valid_rows; row += gl_NumSubgroups) {
-        uint max_exponent = 0u;
-        for (uint pair = gl_SubgroupInvocationID; pair < row_pairs;
-             pair += gl_SubgroupSize) {
-            const uint packed =
-                data_x[((row_start + row) * p.x_row_stride + pair * 2u) >> 1];
-            const uint exponent0 = ((packed & 0x7fffu) >> 7u) & 0xffu;
-            const uint exponent1 = (((packed >> 16u) & 0x7fffu) >> 7u) & 0xffu;
-            const uint exponent = max(exponent0, exponent1);
-            if (exponent < 255u) {
-                max_exponent = max(max_exponent, exponent);
-            }
-        }
-        max_exponent = subgroupMax(max_exponent);
-        if (subgroupElect()) {
-            x_scale_exponents[row] = max_exponent;
-        }
+    // Load precomputed activation / weight exponents for this tile.
+    if (lane < valid_rows) {
+        x_scale_exponents[lane] = data_exponents[row_start + lane];
     }
-
     uint weight_exponent = 0u;
     if (lane < BN) {
         const uint src_col = col_start + lane;
         if (src_col < p.cols) {
+            weight_exponent = data_exponents[p.rows + src_col];
             const uint scale_base = src_col * p.scale_row_stride;
             const uint bias_base = src_col * p.bias_row_stride;
-            for (uint group = 0u; group < p.num_groups; ++group) {
-                const float scale =
-                    bf16_to_fp32(uint(data_scales[scale_base + group]));
-                const float bias =
-                    bf16_to_fp32(uint(data_biases[bias_base + group]));
-                weight_exponent = max(weight_exponent, fp32_biased_exponent(bias));
-                weight_exponent = max(
-                    weight_exponent,
-                    fp32_biased_exponent(fma(scale, 15.0f, bias)));
-            }
             const uint scale_exponent =
                 fp16_range_scale_exponent(weight_exponent);
             w_scales[lane] = scale_down(

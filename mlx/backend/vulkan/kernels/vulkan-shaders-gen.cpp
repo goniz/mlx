@@ -2349,6 +2349,10 @@ void process_shaders() {
       true,
       true);
   string_to_spv(
+      "affine_bf16_exponents",
+      "affine_bf16_exponents.comp",
+      {});
+  string_to_spv(
       "fused_affine_qmm_bf16_bf16_coop4",
       "mul_mm_affine_bf16_coop4.comp",
       {},

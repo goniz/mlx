@@ -1,0 +1,106 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+#include "types.glsl"
+
+// Prefetch BF16 activation-row / weight-column exponents for dense coop4 QMM.
+// Mode 0: one workgroup per activation row -> exponents[row]
+// Mode 1: one workgroup per weight column -> exponents[rows + col]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X {
+    uint data_x[];
+};
+layout(binding = 1) readonly buffer SCALES {
+    uint16_t data_scales[];
+};
+layout(binding = 2) readonly buffer BIASES {
+    uint16_t data_biases[];
+};
+layout(binding = 3) writeonly buffer EXPONENTS {
+    uint data_exponents[];
+};
+
+layout(push_constant) uniform parameter {
+    uint rows;
+    uint cols;
+    uint K;
+    uint x_row_stride;
+    uint scale_row_stride;
+    uint bias_row_stride;
+    uint num_groups;
+    uint mode;
+} p;
+
+shared uint subgroup_max_exponents[8];
+
+uint fp32_biased_exponent(const float value) {
+    const uint exponent = (floatBitsToUint(abs(value)) >> 23u) & 0xffu;
+    return exponent < 255u ? exponent : 0u;
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint idx = gl_WorkGroupID.x;
+
+    if (p.mode == 0u) {
+        if (idx >= p.rows) {
+            return;
+        }
+        const uint row_pairs = p.K >> 1;
+        uint max_exponent = 0u;
+        for (uint pair = lane; pair < row_pairs; pair += 256u) {
+            const uint packed =
+                data_x[(idx * p.x_row_stride + pair * 2u) >> 1];
+            const uint exponent0 = ((packed & 0x7fffu) >> 7u) & 0xffu;
+            const uint exponent1 = (((packed >> 16u) & 0x7fffu) >> 7u) & 0xffu;
+            const uint exponent = max(exponent0, exponent1);
+            if (exponent < 255u) {
+                max_exponent = max(max_exponent, exponent);
+            }
+        }
+        max_exponent = subgroupMax(max_exponent);
+        if (subgroupElect()) {
+            subgroup_max_exponents[gl_SubgroupID] = max_exponent;
+        }
+        barrier();
+        if (lane == 0u) {
+            uint reduced = 0u;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+                reduced = max(reduced, subgroup_max_exponents[i]);
+            }
+            data_exponents[idx] = reduced;
+        }
+        return;
+    }
+
+    if (idx >= p.cols) {
+        return;
+    }
+    uint weight_exponent = 0u;
+    const uint scale_base = idx * p.scale_row_stride;
+    const uint bias_base = idx * p.bias_row_stride;
+    for (uint group = lane; group < p.num_groups; group += 256u) {
+        const float scale = bf16_to_fp32(uint(data_scales[scale_base + group]));
+        const float bias = bf16_to_fp32(uint(data_biases[bias_base + group]));
+        weight_exponent = max(weight_exponent, fp32_biased_exponent(bias));
+        weight_exponent =
+            max(weight_exponent, fp32_biased_exponent(fma(scale, 15.0f, bias)));
+    }
+    weight_exponent = subgroupMax(weight_exponent);
+    if (subgroupElect()) {
+        subgroup_max_exponents[gl_SubgroupID] = weight_exponent;
+    }
+    barrier();
+    if (lane == 0u) {
+        uint reduced = 0u;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+            reduced = max(reduced, subgroup_max_exponents[i]);
+        }
+        data_exponents[p.rows + idx] = reduced;
+    }
+}

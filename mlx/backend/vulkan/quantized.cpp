@@ -1912,12 +1912,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                   "[QuantizedMatmul::eval_gpu] Cooperative affine-4 dispatch grid exceeds Vulkan limits.");
             }
 
+            array exponents(
+                {static_cast<int>(rows + cols)}, uint32, nullptr, {});
+            exponents.set_data(allocator::malloc(exponents.nbytes()));
+
             auto command_buffer = vulkan::begin_command_recording(s.index);
-            vulkan::dispatch_fused_affine_matmul_op(
+            vulkan::dispatch_fused_affine_coop4_matmul_op(
                 w,
                 scales_bf16,
                 biases_bf16,
                 x_mat,
+                exponents,
                 out_work,
                 vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_coop4_cm1,
                 command_buffer,
@@ -1925,6 +1930,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                 push_constants,
                 grid);
             vulkan::end_command_recording(s.index);
+            vulkan::retain_array_for_stream(s, exponents);
           }
           finalize_bf16_output(out_work);
           trace_qmm(

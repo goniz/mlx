@@ -1,0 +1,194 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifdef FLOAT16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#include "types.glsl"
+
+#if !defined(TO_FLOAT_TYPE)
+#define TO_FLOAT_TYPE float
+#endif
+#if !defined(S_TYPE)
+#define S_TYPE float
+#endif
+#if !defined(D_TYPE)
+#define D_TYPE float
+#endif
+#if !defined(SCALE_TO_FLOAT_TYPE)
+#define SCALE_TO_FLOAT_TYPE(x) float(x)
+#endif
+#if !defined(FROM_FLOAT_TYPE)
+#define FROM_FLOAT_TYPE(x) (x)
+#endif
+
+// Reuse activations across output columns (llama.cpp mul_mat_vec style).
+// Wave64 workgroup: one subgroup covers the reduce on AMD.
+#define NUM_COLS 8
+#define BLOCK_SIZE 64
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W {
+    uint data_w[];
+};
+layout(binding = 1) readonly buffer SCALES {
+    S_TYPE data_scales[];
+};
+layout(binding = 2) readonly buffer BIASES {
+    S_TYPE data_biases[];
+};
+layout(binding = 3) readonly buffer X {
+    B_TYPE data_x[];
+};
+layout(binding = 4) writeonly buffer OUT {
+    D_TYPE data_out[];
+};
+
+layout(push_constant) uniform parameter {
+    uint rows;
+    uint cols;
+    uint K;
+    uint packed_row_bytes;
+    uint x_row_stride;
+    uint out_row_stride;
+    uint scale_row_stride;
+    uint bias_row_stride;
+    uint bits;
+    uint group_size;
+    uint num_groups;
+} p;
+
+shared float partial[NUM_COLS][BLOCK_SIZE];
+
+void main() {
+    const uint col0 = gl_WorkGroupID.x * NUM_COLS;
+    const uint row = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.rows || col0 >= p.cols) {
+        return;
+    }
+
+    const uint num_cols = min(NUM_COLS, p.cols - col0);
+    const uint x_row_base = row * p.x_row_stride;
+
+    uint w_row_words[NUM_COLS];
+    uint scale_row_base[NUM_COLS];
+    uint bias_row_base[NUM_COLS];
+    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+        if (c < num_cols) {
+            const uint col = col0 + c;
+            w_row_words[c] = (col * p.packed_row_bytes) >> 2;
+            scale_row_base[c] = col * p.scale_row_stride;
+            bias_row_base[c] = col * p.bias_row_stride;
+        }
+    }
+
+    float acc[NUM_COLS];
+    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+        acc[c] = 0.0f;
+    }
+
+    // 4-bit affine weights pack 8 nibbles per uint32 (low nibble first).
+    if ((p.K & 7u) == 0u && (p.group_size & 7u) == 0u) {
+        const uint packs = p.K >> 3;
+        for (uint pidx = tid; pidx < packs; pidx += BLOCK_SIZE) {
+            const uint k = pidx << 3;
+            const uint group = k / p.group_size;
+            const float x0 = TO_FLOAT_TYPE(data_x[x_row_base + k]);
+            const float x1 = TO_FLOAT_TYPE(data_x[x_row_base + k + 1u]);
+            const float x2 = TO_FLOAT_TYPE(data_x[x_row_base + k + 2u]);
+            const float x3 = TO_FLOAT_TYPE(data_x[x_row_base + k + 3u]);
+            const float x4 = TO_FLOAT_TYPE(data_x[x_row_base + k + 4u]);
+            const float x5 = TO_FLOAT_TYPE(data_x[x_row_base + k + 5u]);
+            const float x6 = TO_FLOAT_TYPE(data_x[x_row_base + k + 6u]);
+            const float x7 = TO_FLOAT_TYPE(data_x[x_row_base + k + 7u]);
+
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                if (c < num_cols) {
+                    const float s =
+                        SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group]);
+                    const float b =
+                        SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group]);
+                    const uint packed = data_w[w_row_words[c] + pidx];
+                    acc[c] = fma(x0, float(packed & 0xFu) * s + b, acc[c]);
+                    acc[c] = fma(
+                        x1, float((packed >> 4) & 0xFu) * s + b, acc[c]);
+                    acc[c] = fma(
+                        x2, float((packed >> 8) & 0xFu) * s + b, acc[c]);
+                    acc[c] = fma(
+                        x3, float((packed >> 12) & 0xFu) * s + b, acc[c]);
+                    acc[c] = fma(
+                        x4, float((packed >> 16) & 0xFu) * s + b, acc[c]);
+                    acc[c] = fma(
+                        x5, float((packed >> 20) & 0xFu) * s + b, acc[c]);
+                    acc[c] = fma(
+                        x6, float((packed >> 24) & 0xFu) * s + b, acc[c]);
+                    acc[c] = fma(
+                        x7, float((packed >> 28) & 0xFu) * s + b, acc[c]);
+                }
+            }
+        }
+    } else {
+        for (uint k = tid; k < p.K; k += BLOCK_SIZE) {
+            const uint group = k / p.group_size;
+            const float xval = TO_FLOAT_TYPE(data_x[x_row_base + k]);
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                if (c < num_cols) {
+                    const uint word = data_w[w_row_words[c] + (k >> 3)];
+                    const uint q = (word >> ((k & 7u) * 4u)) & 0xFu;
+                    const float w =
+                        SCALE_TO_FLOAT_TYPE(data_scales[scale_row_base[c] + group]) *
+                            float(q) +
+                        SCALE_TO_FLOAT_TYPE(data_biases[bias_row_base[c] + group]);
+                    acc[c] = fma(xval, w, acc[c]);
+                }
+            }
+        }
+    }
+
+    if (gl_SubgroupSize == BLOCK_SIZE && gl_NumSubgroups == 1u) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            acc[c] = subgroupAdd(acc[c]);
+        }
+        if (tid == 0u) {
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                if (c < num_cols) {
+                    data_out[row * p.out_row_stride + col0 + c] =
+                        D_TYPE(FROM_FLOAT_TYPE(acc[c]));
+                }
+            }
+        }
+        return;
+    }
+
+    [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+        partial[c][tid] = acc[c];
+    }
+    barrier();
+    for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                partial[c][tid] += partial[c][tid + stride];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            if (c < num_cols) {
+                data_out[row * p.out_row_stride + col0 + c] =
+                    D_TYPE(FROM_FLOAT_TYPE(partial[c][0]));
+            }
+        }
+    }
+}

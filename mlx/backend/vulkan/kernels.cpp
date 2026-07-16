@@ -20,16 +20,20 @@ namespace mlx::core::vulkan {
 
 constexpr uint32_t kMaxMulMatVecCols = 8;
 
-uint32_t matvec_rows_per_workgroup() {
-  static const uint32_t value = []() {
-    if (const char* env = std::getenv("MLX_VULKAN_MATVEC_ROWS_PER_WG");
-        env != nullptr) {
-      return std::clamp<uint32_t>(
-          static_cast<uint32_t>(std::strtoul(env, nullptr, 10)), 1u, 8u);
-    }
-    return 1u;
-  }();
-  return value;
+uint32_t matvec_rows_per_workgroup(uint32_t nrows) {
+  if (const char* env = std::getenv("MLX_VULKAN_MATVEC_ROWS_PER_WG");
+      env != nullptr) {
+    return std::clamp<uint32_t>(
+        static_cast<uint32_t>(std::strtoul(env, nullptr, 10)), 1u, 8u);
+  }
+  // On RDNA, NUM_ROWS=2 reuses the activation vector across two output rows and
+  // lifts large GDN-style matvecs (N>=8K) from ~140GB/s toward ~180GB/s. Smaller
+  // N regresses, so keep the historical default of 1 elsewhere.
+  if (VulkanContext::get().architecture() == GpuArchitecture::AmdRdna &&
+      nrows >= 8192u) {
+    return 2u;
+  }
+  return 1u;
 }
 
 uint32_t max_compute_work_group_invocations() {
@@ -240,7 +244,10 @@ PipelineCreationOptions pipeline_creation_options(
     const std::vector<uint32_t>& specialization_constants) {
   PipelineCreationOptions options;
 
-  if (shader_name == "gather_affine_qmm_rhs_bf16_bf16_cm1") {
+  if (shader_name == "gather_affine_qmm_rhs_bf16_bf16_cm1" ||
+      shader_name == "fused_affine_qmm_bf16_bf16_coop4_cm1" ||
+      shader_name == "fused_affine_qmm_bf16_bf16_coop4" ||
+      shader_name == "affine_bf16_exponents") {
     options.require_full_subgroups = true;
     options.required_subgroup_size = 64;
     return options;
@@ -435,6 +442,8 @@ enum class KernelSpecId {
   Nvfp4Dequant,
   Nvfp4Quant,
   FusedAffineMatmul,
+  FusedAffineCoop4Matmul,
+  AffineBf16Exponents,
   GatherAffineMatmul,
   GatherAffineTileMetadata,
   GatherAffineCoopMatmul,
@@ -469,7 +478,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 42> kKernelSpecs = {
+const std::array<KernelSpec, 44> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -601,6 +610,14 @@ const std::array<KernelSpec, 42> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4},
         sizeof(FusedAffineMatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 5},
+        sizeof(FusedAffineMatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(AffineBf16ExponentsPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1, 2, 3, 4, 5, 6},
@@ -3508,7 +3525,7 @@ void dispatch_mul_mat_vec_op(
   }};
 
   constexpr uint32_t kMaxWorkgroupsX = 65535u;
-  const uint32_t rows_per_workgroup = matvec_rows_per_workgroup();
+  const uint32_t rows_per_workgroup = matvec_rows_per_workgroup(nrows);
   const uint32_t row_groups =
       (nrows + rows_per_workgroup - 1u) / rows_per_workgroup;
   const uint32_t groups_z =
@@ -4133,6 +4150,118 @@ void dispatch_fused_affine_matmul_op(
       s,
       grid,
       matmul_specialization_constants({}));
+}
+
+void dispatch_fused_affine_coop4_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& x,
+    array& exponents,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const FusedAffineMatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  if (w.ndim() != 2 || scales.ndim() != 2 || biases.ndim() != 2 ||
+      x.ndim() != 2 || out.ndim() != 2 || exponents.ndim() != 1) {
+    throw std::runtime_error(
+        "[vulkan::kernels] fused_affine_coop4 dispatch requires 2D tensors and 1D exponents.");
+  }
+
+  const uint32_t rows = push_constants.rows;
+  const uint32_t cols = push_constants.cols;
+  if (checked_u32(exponents.shape(0), "fused_affine_coop4 exponents") !=
+      rows + cols) {
+    throw std::runtime_error(
+        "[vulkan::kernels] fused_affine_coop4 exponents length must be rows+cols.");
+  }
+
+  AffineBf16ExponentsPushConstants exp_pc{};
+  exp_pc.rows = rows;
+  exp_pc.cols = cols;
+  exp_pc.K = push_constants.K;
+  exp_pc.x_row_stride = push_constants.x_row_stride;
+  exp_pc.scale_row_stride = push_constants.scale_row_stride;
+  exp_pc.bias_row_stride = push_constants.bias_row_stride;
+  exp_pc.num_groups = push_constants.num_groups;
+
+  const std::array<BoundArray, 4> exp_arrays = {{
+      {&x, "X"},
+      {&scales, "SCALES"},
+      {&biases, "BIASES"},
+      {&exponents, "EXPONENTS"},
+  }};
+
+  exp_pc.mode = 0u;
+  dispatch_with_spec(
+      StaticShaderId::affine_bf16_exponents,
+      KernelSpecId::AffineBf16Exponents,
+      exp_arrays,
+      exp_pc,
+      rows,
+      cmd_buffer,
+      s,
+      std::array<uint32_t, 3>{rows, 1u, 1u});
+
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(
+      cmd_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
+
+  exp_pc.mode = 1u;
+  dispatch_with_spec(
+      StaticShaderId::affine_bf16_exponents,
+      KernelSpecId::AffineBf16Exponents,
+      exp_arrays,
+      exp_pc,
+      cols,
+      cmd_buffer,
+      s,
+      std::array<uint32_t, 3>{cols, 1u, 1u});
+
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(
+      cmd_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
+
+  const std::array<BoundArray, 6> matmul_arrays = {{
+      {&w, "W"},
+      {&scales, "SCALES"},
+      {&biases, "BIASES"},
+      {&x, "X"},
+      {&exponents, "EXPONENTS"},
+      {&out, "OUT"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::FusedAffineCoop4Matmul,
+      matmul_arrays,
+      push_constants,
+      checked_mul_u32(rows, cols, "fused_affine_coop4 output elements"),
+      cmd_buffer,
+      s,
+      grid);
 }
 
 void dispatch_gather_affine_matmul_op(

@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -49,6 +50,8 @@ struct MulMmTransposeCacheEntry {
   int64_t source_offset{0};
   Dtype source_dtype;
   array transposed;
+  // Optional F16 copy of transposed for BF16→F16 coopmat1 promote.
+  std::optional<array> f16_promoted;
 };
 
 std::mutex& mul_mm_transpose_cache_mutex() {
@@ -343,10 +346,69 @@ constexpr std::array<uint32_t, 11> kSafeMatmulSpec =
 constexpr std::array<uint32_t, 11> kLane64MatmulSpec =
     {64, 32, 32, 16, 32, 32, 2, 2, 2, 1, 64};
 
+// Cooperative-matrix warptiles (TM/TN/TK must match 16x16x16 subgroup mats).
+// On Strix Halo / RDNA3.5 the llama.cpp "large" 128x128/256-thread tile is
+// ~10x slower than this medium tile for dense F16 GEMMs; keep one known-good
+// wave64 tile across families.
+constexpr std::array<uint32_t, 11> kSafeCoopmatMatmulSpec =
+    {64, 32, 32, 16, 32, 32, 2, 16, 16, 16, 32};
+constexpr std::array<uint32_t, 11> kLane64CoopmatMatmulSpec =
+    {128, 64, 64, 16, 64, 32, 2, 16, 16, 16, 64};
+
 bool supports_64_lane_matmul(const vulkan::VulkanContext& ctx) {
   return ctx.subgroup_size() >= 64u ||
       (ctx.subgroup_size_control_supported() &&
        ctx.subgroup_min_size() <= 64u && ctx.subgroup_max_size() >= 64u);
+}
+
+bool matmul_coopmat_env_enabled() {
+  if (const char* env = std::getenv("MLX_VULKAN_MATMUL_COOPMAT");
+      env != nullptr && env[0] != '\0') {
+    return !(env[0] == '0' && env[1] == '\0');
+  }
+  return true;
+}
+
+bool prefer_matmul_coopmat1(
+    Dtype dtype,
+    uint32_t m,
+    uint32_t n,
+    uint32_t k) {
+  const auto& ctx = vulkan::VulkanContext::get();
+  if (!matmul_coopmat_env_enabled() || !ctx.cooperative_matrix_supported()) {
+    return false;
+  }
+  // mul_mm.comp cm1 paths require a real 16x16x16 f16 A/B coopmat mode.
+  // Extension presence alone is not enough: without it we would still replace
+  // scalar TM/TN/TK with 16 and break the scalar fallback candidates.
+  if (!ctx.coopmat_f16acc_supported() &&
+      !ctx.coopmat_flash_attention_f32acc_supported()) {
+    return false;
+  }
+  // Native BF16 coopmat shaders are incorrect on current AMD drivers (cosine
+  // ~0.72). Use F16 coopmat instead (with BF16→F16 promote when needed).
+  if (dtype != float16 || !ctx.shader_float16_supported()) {
+    return false;
+  }
+  // Coopmat pays off on medium/large GEMMs; tiny shapes stay on scalar.
+  return m >= 64u && n >= 64u && k >= 64u;
+}
+
+bool prefer_bf16_to_f16_coopmat_promote(uint32_t m, uint32_t n, uint32_t k) {
+  const auto& ctx = vulkan::VulkanContext::get();
+  if (!ctx.shader_bfloat16_supported()) {
+    return false;
+  }
+  return prefer_matmul_coopmat1(float16, m, n, k);
+}
+
+std::array<uint32_t, 11> coopmat_matmul_spec_for(
+    MatmulFamily /*family*/,
+    const vulkan::VulkanContext& ctx) {
+  if (supports_64_lane_matmul(ctx)) {
+    return kLane64CoopmatMatmulSpec;
+  }
+  return kSafeCoopmatMatmulSpec;
 }
 
 std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(
@@ -389,37 +451,97 @@ std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(
 std::vector<vulkan::StaticShaderId> mul_mm_direct_shader_candidates(
     Dtype input_dtype,
     Dtype output_dtype,
-    bool prefer_fp32_accum) {
+    bool prefer_fp32_accum,
+    bool aligned,
+    bool prefer_coopmat1) {
+  const auto& ctx = vulkan::VulkanContext::get();
+  const bool use_f16acc_cm1 =
+      prefer_coopmat1 && ctx.coopmat_f16acc_supported() && !prefer_fp32_accum;
+
+  auto append_unique = [](std::vector<vulkan::StaticShaderId>& out,
+                          vulkan::StaticShaderId id) {
+    for (auto existing : out) {
+      if (existing == id) {
+        return;
+      }
+    }
+    out.push_back(id);
+  };
+
+  auto with_coopmat_and_scalar =
+      [&](vulkan::StaticShaderId scalar,
+          vulkan::StaticShaderId scalar_f16acc,
+          vulkan::StaticShaderId aligned_scalar,
+          vulkan::StaticShaderId aligned_scalar_f16acc,
+          vulkan::StaticShaderId cm1,
+          vulkan::StaticShaderId cm1_f16acc,
+          vulkan::StaticShaderId aligned_cm1,
+          vulkan::StaticShaderId aligned_cm1_f16acc) {
+        std::vector<vulkan::StaticShaderId> out;
+        if (prefer_coopmat1) {
+          // Prefer fp32-accum coopmat for BF16 (matches device BF16 coopmat
+          // props). Prefer f16acc coopmat when requested and supported.
+          if (aligned) {
+            if (use_f16acc_cm1) {
+              append_unique(out, aligned_cm1_f16acc);
+            }
+            append_unique(out, aligned_cm1);
+          }
+          if (use_f16acc_cm1) {
+            append_unique(out, cm1_f16acc);
+          }
+          append_unique(out, cm1);
+        }
+
+        if (prefer_fp32_accum) {
+          if (aligned) {
+            append_unique(out, aligned_scalar);
+            append_unique(out, aligned_scalar_f16acc);
+          }
+          append_unique(out, scalar);
+          append_unique(out, scalar_f16acc);
+        } else {
+          if (aligned) {
+            append_unique(out, aligned_scalar_f16acc);
+            append_unique(out, aligned_scalar);
+          }
+          append_unique(out, scalar_f16acc);
+          append_unique(out, scalar);
+        }
+        return out;
+      };
+
   switch (input_dtype) {
     case float16:
       switch (output_dtype) {
         case float16:
-          return prefer_fp32_accum
-              ? std::vector<vulkan::StaticShaderId>{
-                    vulkan::StaticShaderId::matmul_direct_f16,
-                    vulkan::StaticShaderId::matmul_direct_f16_f16acc,
-                }
-              : std::vector<vulkan::StaticShaderId>{
-                    vulkan::StaticShaderId::matmul_direct_f16_f16acc,
-                    vulkan::StaticShaderId::matmul_direct_f16,
-                };
+          return with_coopmat_and_scalar(
+              vulkan::StaticShaderId::matmul_direct_f16,
+              vulkan::StaticShaderId::matmul_direct_f16_f16acc,
+              vulkan::StaticShaderId::matmul_direct_f16_aligned,
+              vulkan::StaticShaderId::matmul_direct_f16_aligned_f16acc,
+              vulkan::StaticShaderId::matmul_direct_f16_cm1,
+              vulkan::StaticShaderId::matmul_direct_f16_f16acc_cm1,
+              vulkan::StaticShaderId::matmul_direct_f16_aligned_cm1,
+              vulkan::StaticShaderId::matmul_direct_f16_aligned_f16acc_cm1);
         case bfloat16:
-          return prefer_fp32_accum
-              ? std::vector<vulkan::StaticShaderId>{
-                    vulkan::StaticShaderId::matmul_direct_f16_bf16,
-                    vulkan::StaticShaderId::matmul_direct_f16_bf16_f16acc,
-                }
-              : std::vector<vulkan::StaticShaderId>{
-                    vulkan::StaticShaderId::matmul_direct_f16_bf16_f16acc,
-                    vulkan::StaticShaderId::matmul_direct_f16_bf16,
-                };
+          return with_coopmat_and_scalar(
+              vulkan::StaticShaderId::matmul_direct_f16_bf16,
+              vulkan::StaticShaderId::matmul_direct_f16_bf16_f16acc,
+              vulkan::StaticShaderId::matmul_direct_f16_bf16_aligned,
+              vulkan::StaticShaderId::matmul_direct_f16_bf16_aligned_f16acc,
+              vulkan::StaticShaderId::matmul_direct_f16_bf16_cm1,
+              vulkan::StaticShaderId::matmul_direct_f16_bf16_f16acc_cm1,
+              vulkan::StaticShaderId::matmul_direct_f16_bf16_aligned_cm1,
+              vulkan::StaticShaderId::
+                  matmul_direct_f16_bf16_aligned_f16acc_cm1);
         case float32:
           return mul_mm_shader_candidates(input_dtype, prefer_fp32_accum);
         default:
           return {};
       }
     case bfloat16:
-      if (!vulkan::VulkanContext::get().shader_bfloat16_supported()) {
+      if (!ctx.shader_bfloat16_supported()) {
         return {};
       }
       if (output_dtype != bfloat16) {
@@ -427,15 +549,15 @@ std::vector<vulkan::StaticShaderId> mul_mm_direct_shader_candidates(
             ? mul_mm_shader_candidates(input_dtype, prefer_fp32_accum)
             : std::vector<vulkan::StaticShaderId>{};
       }
-      return prefer_fp32_accum
-          ? std::vector<vulkan::StaticShaderId>{
-                vulkan::StaticShaderId::matmul_direct_bf16,
-                vulkan::StaticShaderId::matmul_direct_bf16_f16acc,
-            }
-          : std::vector<vulkan::StaticShaderId>{
-                vulkan::StaticShaderId::matmul_direct_bf16_f16acc,
-                vulkan::StaticShaderId::matmul_direct_bf16,
-            };
+      return with_coopmat_and_scalar(
+          vulkan::StaticShaderId::matmul_direct_bf16,
+          vulkan::StaticShaderId::matmul_direct_bf16_f16acc,
+          vulkan::StaticShaderId::matmul_direct_bf16_aligned,
+          vulkan::StaticShaderId::matmul_direct_bf16_aligned_f16acc,
+          vulkan::StaticShaderId::matmul_direct_bf16_cm1,
+          vulkan::StaticShaderId::matmul_direct_bf16_f16acc_cm1,
+          vulkan::StaticShaderId::matmul_direct_bf16_aligned_cm1,
+          vulkan::StaticShaderId::matmul_direct_bf16_aligned_f16acc_cm1);
     case float32:
       return output_dtype == float32
           ? mul_mm_shader_candidates(input_dtype, prefer_fp32_accum)
@@ -534,7 +656,10 @@ MatmulFamily classify_matmul_family(uint32_t m, uint32_t n, uint32_t k) {
 }
 
 bool matmul_inputs_aligned(uint32_t m, uint32_t n, uint32_t k) {
-  return (m % 4u) == 0 && (n % 8u) == 0 && (k % 8u) == 0;
+  // Aligned mul_mm load paths omit end_k checks and assume a full BK tile.
+  // F16/F32 shaders hardcode BK=32; BF16 uses BK=16. Require k%32 so aligned
+  // candidates never read past the logical K dimension (e.g. K=72).
+  return (m % 4u) == 0 && (n % 8u) == 0 && (k % 32u) == 0;
 }
 
 uint32_t round_up_div(uint32_t value, uint32_t divisor) {
@@ -612,7 +737,24 @@ select_matmul_dispatch_tuning(Dtype dtype, uint32_t m, uint32_t n, uint32_t k) {
     }
   }
 
-  if (ctx.architecture() == vulkan::GpuArchitecture::AmdRdna &&
+  if (prefer_matmul_coopmat1(dtype, m, n, k)) {
+    // Keep split-K off for coopmat1 direct shaders. Prefer f16acc when the
+    // device advertises 16x16x16 f16-accum coopmat support.
+    tuning.split_k_threshold = std::max(tuning.split_k_threshold, k + 1u);
+    tuning.prefer_fp32_accum = !ctx.coopmat_f16acc_supported();
+    const auto coop_spec = coopmat_matmul_spec_for(family, ctx);
+    tuning.specialization_constants.assign(coop_spec.begin(), coop_spec.end());
+    if (tuning.specialization_constants.size() > 10 &&
+        ctx.subgroup_size_control_supported()) {
+      uint32_t preferred = std::clamp(
+          supports_64_lane_matmul(ctx) ? 64u : profile.preferred_subgroup_size,
+          std::max(ctx.subgroup_min_size(), 1u),
+          std::max(ctx.subgroup_max_size(), 1u));
+      preferred = std::min(preferred, tuning.specialization_constants[0]);
+      tuning.specialization_constants[10] = preferred;
+    }
+  } else if (
+      ctx.architecture() == vulkan::GpuArchitecture::AmdRdna &&
       dtype == bfloat16) {
     tuning.prefer_fp32_accum = true;
   }
@@ -925,9 +1067,14 @@ void cache_mul_mm_transpose(const array& source, const array& transposed) {
 
   std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
   auto& cache = mul_mm_transpose_cache();
+  std::optional<array> keep_f16;
   for (auto it = cache.begin(); it != cache.end();) {
-    if (it->source.expired() ||
-        same_mul_mm_transpose_source(*it, source_data, source)) {
+    if (it->source.expired()) {
+      it = cache.erase(it);
+      continue;
+    }
+    if (same_mul_mm_transpose_source(*it, source_data, source)) {
+      keep_f16 = std::move(it->f16_promoted);
       it = cache.erase(it);
     } else {
       ++it;
@@ -941,10 +1088,107 @@ void cache_mul_mm_transpose(const array& source, const array& transposed) {
           source.strides(),
           source.offset(),
           source.dtype(),
-          transposed});
+          transposed,
+          std::move(keep_f16)});
   while (cache.size() > kMulMmTransposeCacheLimit) {
     cache.pop_front();
   }
+}
+
+std::optional<array> find_cached_mul_mm_f16_promote(const array& source) {
+  auto source_data = source.data_shared_ptr();
+  if (source_data == nullptr) {
+    return std::nullopt;
+  }
+
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  auto& cache = mul_mm_transpose_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (it->source.expired()) {
+      it = cache.erase(it);
+      continue;
+    }
+    if (same_mul_mm_transpose_source(*it, source_data, source) &&
+        it->f16_promoted.has_value()) {
+      auto cached = *it->f16_promoted;
+      auto entry = std::move(*it);
+      cache.erase(it);
+      cache.push_back(std::move(entry));
+      return cached;
+    }
+    ++it;
+  }
+  return std::nullopt;
+}
+
+void cache_mul_mm_f16_promote(
+    const array& source,
+    const array& b_t_bf16,
+    const array& f16_bt) {
+  if (!cacheable_mul_mm_transpose_source(source) || source.dtype() != bfloat16) {
+    return;
+  }
+  auto source_data = source.data_shared_ptr();
+  if (source_data == nullptr || b_t_bf16.data_shared_ptr() == nullptr ||
+      f16_bt.data_shared_ptr() == nullptr || f16_bt.dtype() != float16) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  auto& cache = mul_mm_transpose_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (it->source.expired()) {
+      it = cache.erase(it);
+      continue;
+    }
+    if (same_mul_mm_transpose_source(*it, source_data, source)) {
+      it->f16_promoted = f16_bt;
+      auto entry = std::move(*it);
+      cache.erase(it);
+      cache.push_back(std::move(entry));
+      return;
+    }
+    ++it;
+  }
+  cache.push_back(
+      MulMmTransposeCacheEntry{
+          source_data,
+          source_data.get(),
+          source.shape(),
+          source.strides(),
+          source.offset(),
+          source.dtype(),
+          b_t_bf16,
+          f16_bt});
+  while (cache.size() > kMulMmTransposeCacheLimit) {
+    cache.pop_front();
+  }
+}
+
+array cast_to_float16_contiguous(const array& arr, Stream s) {
+  array out(arr.shape(), float16, nullptr, {});
+  out.set_data(allocator::malloc(out.nbytes()));
+  copy_gpu(arr, out, CopyType::General, s);
+  return out;
+}
+
+// Cacheable BF16→F16 promote of a materialized B^T. Keyed by original B so the
+// F16 copy lives with the BF16 transpose cache entry (A stays per-call scratch).
+array materialize_mul_mm_f16_promoted_transpose(
+    const array& source_b,
+    const array& b_t_bf16,
+    Stream s) {
+  if (detail::in_tracing() || detail::retain_graph() ||
+      !cacheable_mul_mm_transpose_source(source_b) ||
+      source_b.dtype() != bfloat16) {
+    return cast_to_float16_contiguous(b_t_bf16, s);
+  }
+  if (auto cached = find_cached_mul_mm_f16_promote(source_b)) {
+    return *cached;
+  }
+  array f16_bt = cast_to_float16_contiguous(b_t_bf16, s);
+  cache_mul_mm_f16_promote(source_b, b_t_bf16, f16_bt);
+  return f16_bt;
 }
 
 array materialize_mul_mm_transpose(array b, Stream s, bool allow_cache = true) {
@@ -1224,15 +1468,23 @@ bool try_eval_mul_mm_vulkan(
   }
 
   bool b_uses_cast_scratch = false;
+  bool promote_bf16_to_f16_coopmat = false;
   if (a.dtype() == bfloat16 &&
       !vulkan::VulkanContext::get().shader_bfloat16_supported()) {
     a = cast_to_float16_scratch(a, s, kMulMmACastScratchLane);
     b = cast_to_float16_scratch(b, s, kMulMmBCastScratchLane);
     b_uses_cast_scratch = true;
+  } else if (
+      a.dtype() == bfloat16 && out.dtype() == bfloat16 &&
+      prefer_bf16_to_f16_coopmat_promote(
+          static_cast<uint32_t>(out.shape(-2)),
+          static_cast<uint32_t>(out.shape(-1)),
+          static_cast<uint32_t>(a.shape(-1)))) {
+    // Native BF16 coopmat is unreliable on current AMD drivers. Transpose the
+    // original BF16 weights (cacheable), then promote A/B^T to F16 and use
+    // matmul_direct_f16_bf16_*_cm1 (writes BF16 out directly).
+    promote_bf16_to_f16_coopmat = true;
   }
-
-  // Keep BF16 inputs in BF16 and dispatch matmul_bf16* directly.
-  // This matches ggml's BF16xBF16 path and avoids costly staging casts.
 
   if (!is_row_contiguous_zero_offset(a)) {
     if (!ensure_vulkan_buffer(a, s)) {
@@ -1256,6 +1508,15 @@ bool try_eval_mul_mm_vulkan(
   }
   if (!is_row_contiguous_zero_offset(b_t)) {
     return false;
+  }
+
+  if (promote_bf16_to_f16_coopmat) {
+    a = cast_to_float16_scratch(a, s, kMulMmACastScratchLane);
+    // B^T F16 promote is keyed by original BF16 B (same cache as transpose).
+    b_t = materialize_mul_mm_f16_promoted_transpose(b, b_t, s);
+    if (matmul_debug_enabled()) {
+      std::cerr << "[vulkan::mul_mm] promote bf16->f16 for coopmat1\n";
+    }
   }
 
   if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b_t, s)) {
@@ -1496,8 +1757,16 @@ bool try_eval_mul_mm_vulkan(
   const bool can_direct_write =
       split_k == 1u && is_row_contiguous_zero_offset(out);
   if (can_direct_write) {
+    const bool use_coopmat1 =
+        prefer_matmul_coopmat1(a.dtype(), m, n, k) &&
+        (out.dtype() == a.dtype() ||
+         (a.dtype() == float16 && out.dtype() == bfloat16));
     auto direct_candidates = mul_mm_direct_shader_candidates(
-        a.dtype(), out.dtype(), tuning.prefer_fp32_accum);
+        a.dtype(),
+        out.dtype(),
+        tuning.prefer_fp32_accum,
+        tuning.aligned,
+        use_coopmat1);
     array out_direct = out;
     out_direct.set_data(allocator::malloc(out_direct.nbytes()));
     if (ensure_vulkan_buffer(out_direct, s) &&

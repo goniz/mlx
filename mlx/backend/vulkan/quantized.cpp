@@ -373,6 +373,17 @@ bool dequantized_bf16_prefill_enabled() {
   return enabled;
 }
 
+bool fused_affine_coop4_prefill_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_AFFINE_COOP4_PREFILL");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
 bool is_row_contiguous_zero_offset(const array& arr) {
   if (arr.ndim() == 0) {
     return arr.offset() == 0;
@@ -1829,8 +1840,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return true;
   }();
 
+  const bool fused_bf16_bits = bits_ == 8 || bits_ == 4;
   if (mode_ == QuantizationMode::Affine && enable_fused_decode_qmm &&
-      transpose_ && bits_ == 8 && x_mat.dtype() == bfloat16 &&
+      transpose_ && fused_bf16_bits && x_mat.dtype() == bfloat16 &&
       out.dtype() == bfloat16 && inputs[2].dtype() == bfloat16 &&
       inputs[3].dtype() == bfloat16 && x_mat.ndim() == 2 && w.ndim() == 2) {
     array scales_bf16 = ensure_row_contiguous_zero_offset(inputs[2], s);
@@ -1848,8 +1860,88 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           static_cast<uint32_t>(w.shape(-1) * 32 / bits_) == k &&
           num_groups ==
               static_cast<uint32_t>((k + group_size_ - 1) / group_size_)) {
-        const bool use_dequantized_prefill = rows >= 256 && !decode_lhs &&
-            dequantized_bf16_prefill_enabled();
+        const bool use_large_prefill = rows >= 256 && !decode_lhs;
+#if defined(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        const auto& vk_ctx = vulkan::VulkanContext::get();
+        const auto device_limits =
+            vk_ctx.physical_device().getProperties().limits;
+        const bool supports_coop_wg =
+            device_limits.maxComputeWorkGroupInvocations >= 512u &&
+            device_limits.maxComputeWorkGroupSize[0] >= 512u &&
+            device_limits.maxComputeSharedMemorySize >= 27648u;
+        const bool supports_64_lane = vk_ctx.subgroup_size() == 64u ||
+            (vk_ctx.subgroup_size_control_supported() &&
+             vk_ctx.subgroup_min_size() <= 64u &&
+             vk_ctx.subgroup_max_size() >= 64u);
+        const bool use_coop4_prefill = use_large_prefill && bits_ == 4 &&
+            group_size_ == 64 && (k % 16u) == 0u && (k % 2u) == 0u &&
+            vk_ctx.coopmat_f16acc_supported() && supports_64_lane &&
+            supports_coop_wg && fused_affine_coop4_prefill_enabled();
+        if (use_coop4_prefill) {
+          array out_work(
+              (vector_lhs || flatten_lhs_batches)
+                  ? Shape{static_cast<int>(rows), out.shape(-1)}
+                  : out.shape(),
+              bfloat16,
+              nullptr,
+              {});
+          out_work.set_data(allocator::malloc(out_work.nbytes()));
+          if (out_work.size() != 0) {
+            vulkan::FusedAffineMatmulPushConstants push_constants{};
+            push_constants.rows = rows;
+            push_constants.cols = cols;
+            push_constants.K = k;
+            push_constants.packed_row_bytes =
+                static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
+            push_constants.x_row_stride =
+                static_cast<uint32_t>(x_mat.strides(-2));
+            push_constants.out_row_stride =
+                static_cast<uint32_t>(out_work.strides(-2));
+            push_constants.scale_row_stride =
+                static_cast<uint32_t>(scales_bf16.strides(-2));
+            push_constants.bias_row_stride =
+                static_cast<uint32_t>(biases_bf16.strides(-2));
+            push_constants.bits = static_cast<uint32_t>(bits_);
+            push_constants.group_size = static_cast<uint32_t>(group_size_);
+            push_constants.num_groups = num_groups;
+
+            const std::array<uint32_t, 3> grid = {
+                (cols + 127u) / 128u, (rows + 63u) / 64u, 1u};
+            if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
+              throw std::runtime_error(
+                  "[QuantizedMatmul::eval_gpu] Cooperative affine-4 dispatch grid exceeds Vulkan limits.");
+            }
+
+            array exponents(
+                {static_cast<int>(rows + cols)}, uint32, nullptr, {});
+            exponents.set_data(allocator::malloc(exponents.nbytes()));
+
+            auto command_buffer = vulkan::begin_command_recording(s.index);
+            vulkan::dispatch_fused_affine_coop4_matmul_op(
+                w,
+                scales_bf16,
+                biases_bf16,
+                x_mat,
+                exponents,
+                out_work,
+                vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_coop4_cm1,
+                command_buffer,
+                s,
+                push_constants,
+                grid);
+            vulkan::end_command_recording(s.index);
+            vulkan::retain_array_for_stream(s, exponents);
+          }
+          finalize_bf16_output(out_work);
+          trace_qmm(
+              "fused_coop4_prefill",
+              (vector_lhs || flatten_lhs_batches) ? "reshaped_output=1"
+                                                  : "reshaped_output=0");
+          return;
+        }
+#endif
+        const bool use_dequantized_prefill =
+            use_large_prefill && dequantized_bf16_prefill_enabled();
         if (use_dequantized_prefill) {
           array w_deq(
               expanded_quantized_shape(w, bits_), bfloat16, nullptr, {});
@@ -1886,82 +1978,102 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           return;
         }
 
-        array out_work(
-            (vector_lhs || flatten_lhs_batches)
-                ? Shape{static_cast<int>(rows), out.shape(-1)}
-                : out.shape(),
-            bfloat16,
-            nullptr,
-            {});
-        out_work.set_data(allocator::malloc(out_work.nbytes()));
-        if (out_work.size() != 0) {
-          vulkan::FusedAffineMatmulPushConstants push_constants{};
-          push_constants.rows = rows;
-          push_constants.cols = cols;
-          push_constants.K = k;
-          push_constants.packed_row_bytes =
-              static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
-          push_constants.x_row_stride =
-              static_cast<uint32_t>(x_mat.strides(-2));
-          push_constants.out_row_stride =
-              static_cast<uint32_t>(out_work.strides(-2));
-          push_constants.scale_row_stride =
-              static_cast<uint32_t>(scales_bf16.strides(-2));
-          push_constants.bias_row_stride =
-              static_cast<uint32_t>(biases_bf16.strides(-2));
-          push_constants.bits = static_cast<uint32_t>(bits_);
-          push_constants.group_size = static_cast<uint32_t>(group_size_);
-          push_constants.num_groups = num_groups;
+        const bool use_decode_matvec = rows == 1 || decode_lhs;
+        const bool use_tiled_prefill = rows > 1 && !decode_lhs &&
+            group_size_ >= 32 && (group_size_ % 32) == 0 &&
+            fused_affine_bf16_tiled_prefill_enabled();
+        // 4-bit has no scalar BF16 acc kernel; require tiled prefill.
+        if (bits_ == 4 && !use_decode_matvec && !use_tiled_prefill) {
+          // Fall through to the staged float32 fused path below.
+        } else {
+          array out_work(
+              (vector_lhs || flatten_lhs_batches)
+                  ? Shape{static_cast<int>(rows), out.shape(-1)}
+                  : out.shape(),
+              bfloat16,
+              nullptr,
+              {});
+          out_work.set_data(allocator::malloc(out_work.nbytes()));
+          if (out_work.size() != 0) {
+            vulkan::FusedAffineMatmulPushConstants push_constants{};
+            push_constants.rows = rows;
+            push_constants.cols = cols;
+            push_constants.K = k;
+            push_constants.packed_row_bytes =
+                static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
+            push_constants.x_row_stride =
+                static_cast<uint32_t>(x_mat.strides(-2));
+            push_constants.out_row_stride =
+                static_cast<uint32_t>(out_work.strides(-2));
+            push_constants.scale_row_stride =
+                static_cast<uint32_t>(scales_bf16.strides(-2));
+            push_constants.bias_row_stride =
+                static_cast<uint32_t>(biases_bf16.strides(-2));
+            push_constants.bits = static_cast<uint32_t>(bits_);
+            push_constants.group_size = static_cast<uint32_t>(group_size_);
+            push_constants.num_groups = num_groups;
 
-          const bool use_decode_matvec = rows == 1 || decode_lhs;
-          const bool use_tiled_prefill = rows > 1 && !decode_lhs &&
-              group_size_ >= 32 && (group_size_ % 32) == 0 &&
-              fused_affine_bf16_tiled_prefill_enabled();
-          const bool use_large_n_tile = use_tiled_prefill && cols >= 1024;
-          const auto shader_id = use_decode_matvec
-              ? vulkan::StaticShaderId::fused_affine_matvec8_bf16_bf16
-              : use_large_n_tile
-              ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled_n32
-              : use_tiled_prefill
-              ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
-              : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16;
-          const std::array<uint32_t, 3> grid = use_decode_matvec
-              ? std::array<uint32_t, 3>{cols, rows, 1u}
-              : shader_id ==
-                      vulkan::StaticShaderId::
-                          fused_affine_qmm_bf16_bf16_tiled_n32
-              ? std::array<
-                    uint32_t,
-                    3>{(cols + 31u) / 32u, (rows + 31u) / 32u, 1u}
-              : shader_id ==
-                      vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
-              ? std::array<
-                    uint32_t,
-                    3>{(cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
-              : std::array<uint32_t, 3>{
-                    (cols + 15u) / 16u, (rows + 15u) / 16u, 1u};
+            const bool use_large_n_tile = use_tiled_prefill && cols >= 1024;
+            vulkan::StaticShaderId shader_id;
+            std::array<uint32_t, 3> grid;
+            if (use_decode_matvec) {
+              if (bits_ == 4) {
+                shader_id =
+                    vulkan::StaticShaderId::fused_affine_matvec4_bf16_bf16;
+                grid = {(cols + 7u) / 8u, rows, 1u};
+              } else {
+                shader_id =
+                    vulkan::StaticShaderId::fused_affine_matvec8_bf16_bf16;
+                grid = {cols, rows, 1u};
+              }
+            } else if (bits_ == 4) {
+              shader_id = use_large_n_tile
+                  ? vulkan::StaticShaderId::
+                        fused_affine_qmm_bf16_bf16_tiled4_n32
+                  : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled4;
+              grid = use_large_n_tile
+                  ? std::array<uint32_t, 3>{
+                        (cols + 31u) / 32u, (rows + 31u) / 32u, 1u}
+                  : std::array<uint32_t, 3>{
+                        (cols + 15u) / 16u, (rows + 31u) / 32u, 1u};
+            } else {
+              shader_id = use_large_n_tile
+                  ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled_n32
+                  : use_tiled_prefill
+                  ? vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16_tiled
+                  : vulkan::StaticShaderId::fused_affine_qmm_bf16_bf16;
+              grid = use_large_n_tile
+                  ? std::array<uint32_t, 3>{
+                        (cols + 31u) / 32u, (rows + 31u) / 32u, 1u}
+                  : use_tiled_prefill
+                  ? std::array<uint32_t, 3>{
+                        (cols + 15u) / 16u, (rows + 31u) / 32u, 1u}
+                  : std::array<uint32_t, 3>{
+                        (cols + 15u) / 16u, (rows + 15u) / 16u, 1u};
+            }
 
-          auto command_buffer = vulkan::begin_command_recording(s.index);
-          vulkan::dispatch_fused_affine_matmul_op(
-              w,
-              scales_bf16,
-              biases_bf16,
-              x_mat,
-              out_work,
-              shader_id,
-              command_buffer,
-              s,
-              push_constants,
-              grid);
-          vulkan::end_command_recording(s.index);
+            auto command_buffer = vulkan::begin_command_recording(s.index);
+            vulkan::dispatch_fused_affine_matmul_op(
+                w,
+                scales_bf16,
+                biases_bf16,
+                x_mat,
+                out_work,
+                shader_id,
+                command_buffer,
+                s,
+                push_constants,
+                grid);
+            vulkan::end_command_recording(s.index);
+          }
+
+          finalize_bf16_output(out_work);
+          trace_qmm(
+              "fused_bf16",
+              (vector_lhs || flatten_lhs_batches) ? "reshaped_output=1"
+                                                  : "reshaped_output=0");
+          return;
         }
-
-        finalize_bf16_output(out_work);
-        trace_qmm(
-            "fused_bf16",
-            (vector_lhs || flatten_lhs_batches) ? "reshaped_output=1"
-                                                : "reshaped_output=0");
-        return;
       }
     }
   }

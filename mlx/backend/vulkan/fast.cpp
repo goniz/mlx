@@ -2691,7 +2691,10 @@ bool ScaledDotProductAttention::supports_bool_mask() {
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
-  return s.device == Device::cpu;
+  // Match Metal: differentiate through the composed fallback graph.
+  // The custom Vulkan SDPA VJP path currently SIGFPEs on AMD (Radeon 8060S)
+  // while evaluating dQ for float16 attention (see mlx-vulkan#66).
+  return true;
 }
 
 void ScaledDotProductAttention::eval_gpu(

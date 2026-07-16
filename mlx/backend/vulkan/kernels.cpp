@@ -245,7 +245,9 @@ PipelineCreationOptions pipeline_creation_options(
   PipelineCreationOptions options;
 
   if (shader_name == "gather_affine_qmm_rhs_bf16_bf16_cm1" ||
-      shader_name == "fused_affine_qmm_bf16_bf16_coop4_cm1") {
+      shader_name == "fused_affine_qmm_bf16_bf16_coop4_cm1" ||
+      shader_name == "fused_affine_qmm_bf16_bf16_coop4" ||
+      shader_name == "affine_bf16_exponents") {
     options.require_full_subgroups = true;
     options.required_subgroup_size = 64;
     return options;

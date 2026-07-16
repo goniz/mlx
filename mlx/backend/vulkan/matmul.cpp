@@ -375,6 +375,13 @@ bool prefer_matmul_coopmat1(
   if (!matmul_coopmat_env_enabled() || !ctx.cooperative_matrix_supported()) {
     return false;
   }
+  // mul_mm.comp cm1 paths require a real 16x16x16 f16 A/B coopmat mode.
+  // Extension presence alone is not enough: without it we would still replace
+  // scalar TM/TN/TK with 16 and break the scalar fallback candidates.
+  if (!ctx.coopmat_f16acc_supported() &&
+      !ctx.coopmat_flash_attention_f32acc_supported()) {
+    return false;
+  }
   // Native BF16 coopmat shaders are incorrect on current AMD drivers (cosine
   // ~0.72). Use F16 coopmat instead (with BF16→F16 promote when needed).
   if (dtype != float16 || !ctx.shader_float16_supported()) {
@@ -646,7 +653,10 @@ MatmulFamily classify_matmul_family(uint32_t m, uint32_t n, uint32_t k) {
 }
 
 bool matmul_inputs_aligned(uint32_t m, uint32_t n, uint32_t k) {
-  return (m % 4u) == 0 && (n % 8u) == 0 && (k % 8u) == 0;
+  // Aligned mul_mm load paths omit end_k checks and assume a full BK tile.
+  // F16/F32 shaders hardcode BK=32; BF16 uses BK=16. Require k%32 so aligned
+  // candidates never read past the logical K dimension (e.g. K=72).
+  return (m % 4u) == 0 && (n % 8u) == 0 && (k % 32u) == 0;
 }
 
 uint32_t round_up_div(uint32_t value, uint32_t divisor) {

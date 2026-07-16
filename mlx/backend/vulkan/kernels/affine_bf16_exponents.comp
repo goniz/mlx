@@ -36,7 +36,9 @@ layout(push_constant) uniform parameter {
     uint mode;
 } p;
 
-shared uint subgroup_max_exponents[8];
+// Workgroup is 256 threads. With a 16-lane default subgroup (and no required
+// size), gl_NumSubgroups can be 16 — size for that worst case.
+shared uint subgroup_max_exponents[16];
 
 uint fp32_biased_exponent(const float value) {
     const uint exponent = (floatBitsToUint(abs(value)) >> 23u) & 0xffu;

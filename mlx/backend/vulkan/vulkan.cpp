@@ -495,6 +495,7 @@ void VulkanContext::init() {
   bool shader_bfloat16_supported = false;
   bool shader_buffer_atomic_float32_supported = false;
   bool subgroup_size_control_supported = false;
+  bool subgroup_clustered_supported = false;
   bool subgroup_require_full_support = false;
   uint32_t subgroup_min_size = 0;
   uint32_t subgroup_max_size = 0;
@@ -756,6 +757,12 @@ void VulkanContext::init() {
     subgroup_size_control_props.pNext = &shader_integer_dot_product_props;
     physical_device.getProperties2(&props2);
     subgroup_size = subgroup_props.subgroupSize;
+    subgroup_clustered_supported =
+        static_cast<bool>(
+            subgroup_props.supportedStages & vk::ShaderStageFlagBits::eCompute) &&
+        static_cast<bool>(
+            subgroup_props.supportedOperations &
+            vk::SubgroupFeatureFlagBits::eClustered);
 
     // Build enabled features
     vk::PhysicalDeviceFeatures2 enabled_features;
@@ -1071,6 +1078,7 @@ void VulkanContext::init() {
     this->shader_bfloat16_supported_ = false;
     this->subgroup_size_control_supported_ = subgroup_size_control_supported;
     this->subgroup_require_full_support_ = subgroup_require_full_support;
+    this->subgroup_clustered_supported_ = subgroup_clustered_supported;
     this->subgroup_min_size_ = subgroup_min_size;
     this->subgroup_max_size_ = subgroup_max_size;
     this->subgroup_size_ = subgroup_size;
@@ -1151,6 +1159,7 @@ void VulkanContext::cleanup() {
   shader_bfloat16_supported_ = false;
   subgroup_size_control_supported_ = false;
   subgroup_require_full_support_ = false;
+  subgroup_clustered_supported_ = false;
   subgroup_min_size_ = 0;
   subgroup_max_size_ = 0;
   subgroup_size_ = 0;

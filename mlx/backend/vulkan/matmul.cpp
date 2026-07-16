@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -49,6 +50,8 @@ struct MulMmTransposeCacheEntry {
   int64_t source_offset{0};
   Dtype source_dtype;
   array transposed;
+  // Optional F16 copy of transposed for BF16→F16 coopmat1 promote.
+  std::optional<array> f16_promoted;
 };
 
 std::mutex& mul_mm_transpose_cache_mutex() {
@@ -1064,9 +1067,14 @@ void cache_mul_mm_transpose(const array& source, const array& transposed) {
 
   std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
   auto& cache = mul_mm_transpose_cache();
+  std::optional<array> keep_f16;
   for (auto it = cache.begin(); it != cache.end();) {
-    if (it->source.expired() ||
-        same_mul_mm_transpose_source(*it, source_data, source)) {
+    if (it->source.expired()) {
+      it = cache.erase(it);
+      continue;
+    }
+    if (same_mul_mm_transpose_source(*it, source_data, source)) {
+      keep_f16 = std::move(it->f16_promoted);
       it = cache.erase(it);
     } else {
       ++it;
@@ -1080,10 +1088,107 @@ void cache_mul_mm_transpose(const array& source, const array& transposed) {
           source.strides(),
           source.offset(),
           source.dtype(),
-          transposed});
+          transposed,
+          std::move(keep_f16)});
   while (cache.size() > kMulMmTransposeCacheLimit) {
     cache.pop_front();
   }
+}
+
+std::optional<array> find_cached_mul_mm_f16_promote(const array& source) {
+  auto source_data = source.data_shared_ptr();
+  if (source_data == nullptr) {
+    return std::nullopt;
+  }
+
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  auto& cache = mul_mm_transpose_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (it->source.expired()) {
+      it = cache.erase(it);
+      continue;
+    }
+    if (same_mul_mm_transpose_source(*it, source_data, source) &&
+        it->f16_promoted.has_value()) {
+      auto cached = *it->f16_promoted;
+      auto entry = std::move(*it);
+      cache.erase(it);
+      cache.push_back(std::move(entry));
+      return cached;
+    }
+    ++it;
+  }
+  return std::nullopt;
+}
+
+void cache_mul_mm_f16_promote(
+    const array& source,
+    const array& b_t_bf16,
+    const array& f16_bt) {
+  if (!cacheable_mul_mm_transpose_source(source) || source.dtype() != bfloat16) {
+    return;
+  }
+  auto source_data = source.data_shared_ptr();
+  if (source_data == nullptr || b_t_bf16.data_shared_ptr() == nullptr ||
+      f16_bt.data_shared_ptr() == nullptr || f16_bt.dtype() != float16) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mul_mm_transpose_cache_mutex());
+  auto& cache = mul_mm_transpose_cache();
+  for (auto it = cache.begin(); it != cache.end();) {
+    if (it->source.expired()) {
+      it = cache.erase(it);
+      continue;
+    }
+    if (same_mul_mm_transpose_source(*it, source_data, source)) {
+      it->f16_promoted = f16_bt;
+      auto entry = std::move(*it);
+      cache.erase(it);
+      cache.push_back(std::move(entry));
+      return;
+    }
+    ++it;
+  }
+  cache.push_back(
+      MulMmTransposeCacheEntry{
+          source_data,
+          source_data.get(),
+          source.shape(),
+          source.strides(),
+          source.offset(),
+          source.dtype(),
+          b_t_bf16,
+          f16_bt});
+  while (cache.size() > kMulMmTransposeCacheLimit) {
+    cache.pop_front();
+  }
+}
+
+array cast_to_float16_contiguous(const array& arr, Stream s) {
+  array out(arr.shape(), float16, nullptr, {});
+  out.set_data(allocator::malloc(out.nbytes()));
+  copy_gpu(arr, out, CopyType::General, s);
+  return out;
+}
+
+// Cacheable BF16→F16 promote of a materialized B^T. Keyed by original B so the
+// F16 copy lives with the BF16 transpose cache entry (A stays per-call scratch).
+array materialize_mul_mm_f16_promoted_transpose(
+    const array& source_b,
+    const array& b_t_bf16,
+    Stream s) {
+  if (detail::in_tracing() || detail::retain_graph() ||
+      !cacheable_mul_mm_transpose_source(source_b) ||
+      source_b.dtype() != bfloat16) {
+    return cast_to_float16_contiguous(b_t_bf16, s);
+  }
+  if (auto cached = find_cached_mul_mm_f16_promote(source_b)) {
+    return *cached;
+  }
+  array f16_bt = cast_to_float16_contiguous(b_t_bf16, s);
+  cache_mul_mm_f16_promote(source_b, b_t_bf16, f16_bt);
+  return f16_bt;
 }
 
 array materialize_mul_mm_transpose(array b, Stream s, bool allow_cache = true) {
@@ -1407,7 +1512,8 @@ bool try_eval_mul_mm_vulkan(
 
   if (promote_bf16_to_f16_coopmat) {
     a = cast_to_float16_scratch(a, s, kMulMmACastScratchLane);
-    b_t = cast_to_float16_scratch(b_t, s, kMulMmBCastScratchLane);
+    // B^T F16 promote is keyed by original BF16 B (same cache as transpose).
+    b_t = materialize_mul_mm_f16_promoted_transpose(b, b_t, s);
     if (matmul_debug_enabled()) {
       std::cerr << "[vulkan::mul_mm] promote bf16->f16 for coopmat1\n";
     }

@@ -92,6 +92,9 @@ class VulkanContext {
   bool subgroup_require_full_support() const {
     return subgroup_require_full_support_;
   }
+  bool subgroup_clustered_supported() const {
+    return subgroup_clustered_supported_;
+  }
   uint32_t subgroup_min_size() const {
     return subgroup_min_size_;
   }
@@ -181,6 +184,7 @@ class VulkanContext {
   mutable bool shader_bfloat16_supported_{false};
   bool subgroup_size_control_supported_{false};
   bool subgroup_require_full_support_{false};
+  bool subgroup_clustered_supported_{false};
   uint32_t subgroup_min_size_{0};
   uint32_t subgroup_max_size_{0};
   uint32_t subgroup_size_{0};

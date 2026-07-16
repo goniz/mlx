@@ -132,7 +132,9 @@ device_info(int device_index) {
         {"resource_limit", static_cast<size_t>(limits.maxMemoryAllocationCount)},
         {"subgroup_size", static_cast<size_t>(ctx.subgroup_size())},
         {"subgroup_min_size", static_cast<size_t>(ctx.subgroup_min_size())},
-        {"subgroup_max_size", static_cast<size_t>(ctx.subgroup_max_size())}};
+        {"subgroup_max_size", static_cast<size_t>(ctx.subgroup_max_size())},
+        {"subgroup_clustered",
+         static_cast<size_t>(ctx.subgroup_clustered_supported())}};
   };
 
   static auto device_info_ = init_device_info();

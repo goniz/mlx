@@ -1,0 +1,142 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// NVFP4 gather matvec for MoE decode: one workgroup per (batch, row, col),
+// threads split K and reduce with subgroup/shared memory.
+#define BLOCK_SIZE 64
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W {
+  uint data_w[];
+};
+layout(binding = 1) readonly buffer SCALES {
+  uint8_t data_scales[];
+};
+layout(binding = 2) readonly buffer X {
+  float data_x[];
+};
+layout(binding = 3) readonly buffer LHS_INDICES {
+  uint data_lhs_indices[];
+};
+layout(binding = 4) readonly buffer RHS_INDICES {
+  uint data_rhs_indices[];
+};
+layout(binding = 5) writeonly buffer OUT {
+  float data_out[];
+};
+
+layout(push_constant) uniform parameter {
+  uint rows;
+  uint cols;
+  uint K;
+  uint packed_row_words;
+  uint x_batch_stride;
+  uint x_row_stride;
+  uint out_batch_stride;
+  uint out_row_stride;
+  uint scale_matrix_stride;
+  uint scale_row_stride;
+  uint w_matrix_stride_words;
+  uint group_size;
+  uint num_groups;
+} p;
+
+shared float partial[BLOCK_SIZE];
+
+float fp8_e4m3_to_fp32(uint8_t x) {
+  uint v = (uint(x) & 127u) << 7;
+  float val = unpackHalf2x16(v).x * 256.0;
+  return (x & uint8_t(128u)) != 0u ? -val : val;
+}
+
+float nvfp4_lut(uint q) {
+  const float lut[16] = float[16](
+      +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0, -0.0, -0.5, -1.0, -1.5,
+      -2.0, -3.0, -4.0, -6.0);
+  return lut[q];
+}
+
+float decode_nibble(uint packed, uint lane, float scale) {
+  return nvfp4_lut((packed >> (lane * 4u)) & 0xFu) * scale;
+}
+
+void main() {
+  const uint col = gl_WorkGroupID.x;
+  const uint row = gl_WorkGroupID.y;
+  const uint batch = gl_WorkGroupID.z;
+  const uint tid = gl_LocalInvocationID.x;
+
+  if (row >= p.rows || col >= p.cols) {
+    return;
+  }
+
+  const uint lhs_batch = data_lhs_indices[batch];
+  const uint rhs_batch = data_rhs_indices[batch];
+  const uint w_row_base =
+      rhs_batch * p.w_matrix_stride_words + col * p.packed_row_words;
+  const uint scale_row_base =
+      rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
+  const uint x_row_base = lhs_batch * p.x_batch_stride + row * p.x_row_stride;
+
+  float acc = 0.0f;
+  // Fast path: 8 nibbles per uint32; group_size 16 so one scale covers a pack.
+  if ((p.K & 7u) == 0u && p.group_size == 16u) {
+    const uint packs = p.K >> 3u;
+    for (uint pidx = tid; pidx < packs; pidx += BLOCK_SIZE) {
+      const uint k = pidx << 3u;
+      const uint packed = data_w[w_row_base + pidx];
+      const float scale =
+          fp8_e4m3_to_fp32(data_scales[scale_row_base + (k >> 4u)]);
+      acc = fma(data_x[x_row_base + k], decode_nibble(packed, 0u, scale), acc);
+      acc = fma(
+          data_x[x_row_base + k + 1u], decode_nibble(packed, 1u, scale), acc);
+      acc = fma(
+          data_x[x_row_base + k + 2u], decode_nibble(packed, 2u, scale), acc);
+      acc = fma(
+          data_x[x_row_base + k + 3u], decode_nibble(packed, 3u, scale), acc);
+      acc = fma(
+          data_x[x_row_base + k + 4u], decode_nibble(packed, 4u, scale), acc);
+      acc = fma(
+          data_x[x_row_base + k + 5u], decode_nibble(packed, 5u, scale), acc);
+      acc = fma(
+          data_x[x_row_base + k + 6u], decode_nibble(packed, 6u, scale), acc);
+      acc = fma(
+          data_x[x_row_base + k + 7u], decode_nibble(packed, 7u, scale), acc);
+    }
+  } else {
+    for (uint k = tid; k < p.K; k += BLOCK_SIZE) {
+      const uint packed = data_w[w_row_base + (k >> 3u)];
+      const uint q = (packed >> ((k & 7u) * 4u)) & 0xFu;
+      const float scale =
+          fp8_e4m3_to_fp32(data_scales[scale_row_base + (k >> 4u)]);
+      acc = fma(data_x[x_row_base + k], nvfp4_lut(q) * scale, acc);
+    }
+  }
+
+  if (gl_SubgroupSize == BLOCK_SIZE && gl_NumSubgroups == 1u) {
+    acc = subgroupAdd(acc);
+    if (tid == 0u) {
+      data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
+          acc;
+    }
+    return;
+  }
+
+  partial[tid] = acc;
+  barrier();
+  for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) {
+      partial[tid] += partial[tid + stride];
+    }
+    barrier();
+  }
+  if (tid == 0u) {
+    data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
+        partial[0];
+  }
+}

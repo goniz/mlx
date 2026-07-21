@@ -2583,8 +2583,16 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         push_constants.group_size = static_cast<uint32_t>(group_size_);
         push_constants.num_groups = num_groups;
 
-        const std::array<uint32_t, 3> grid = {
-            (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
+        // Decode (rows<=8): one workgroup per output element with K-reduce.
+        // Prefill/larger rows: tiled gather_mm.
+        const bool use_matvec = rows <= 8;
+        const auto shader_id = use_matvec
+            ? vulkan::StaticShaderId::gather_mv_nvfp4_f32
+            : vulkan::StaticShaderId::gather_mm_nvfp4_f32;
+        const std::array<uint32_t, 3> grid = use_matvec
+            ? std::array<uint32_t, 3>{cols, rows, batches}
+            : std::array<uint32_t, 3>{
+                  (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
         if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
           throw std::runtime_error(
               "[GatherQMM::eval_gpu] NVFP4 gather dispatch grid exceeds Vulkan workgroup count limits.");
@@ -2598,7 +2606,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             lhs_indices,
             rhs_indices,
             out_work,
-            vulkan::StaticShaderId::gather_mm_nvfp4_f32,
+            shader_id,
             command_buffer,
             s,
             push_constants,

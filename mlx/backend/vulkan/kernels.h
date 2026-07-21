@@ -716,6 +716,18 @@ struct GatherNvfp4MatmulPushConstants {
   uint32_t num_groups;
 };
 
+struct Nvfp4DenseMatmulPushConstants {
+  uint32_t rows;
+  uint32_t cols;
+  uint32_t K;
+  uint32_t packed_row_words;
+  uint32_t x_row_stride;
+  uint32_t out_row_stride;
+  uint32_t scale_row_stride;
+  uint32_t group_size;
+  uint32_t num_groups;
+};
+
 struct LayerNormAffinePushConstants {
   uint32_t ne;
   uint32_t axis_size;
@@ -1253,6 +1265,17 @@ void dispatch_gather_nvfp4_matmul_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const GatherNvfp4MatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
+
+void dispatch_nvfp4_dense_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& x,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const Nvfp4DenseMatmulPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);
 
 // Get workgroup dimensions for element-wise operations.

@@ -195,6 +195,65 @@ bool fused_nvfp4_qqmm_enabled() {
   return enabled;
 }
 
+bool fused_nvfp4_dense_qmm_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_NVFP4_DENSE_QMM");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
+std::optional<vulkan::StaticShaderId> nvfp4_dense_matvec_shader_id(
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return vulkan::StaticShaderId::mul_mv_nvfp4_bf16_bf16;
+  }
+  if (x_dtype == float32 && out_dtype == float32) {
+    return vulkan::StaticShaderId::mul_mv_nvfp4_f32;
+  }
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> nvfp4_dense_matmul_shader_id(
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return vulkan::StaticShaderId::mul_mm_nvfp4_dense_bf16_bf16;
+  }
+  if (x_dtype == float32 && out_dtype == float32) {
+    return vulkan::StaticShaderId::mul_mm_nvfp4_dense_f32;
+  }
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> gather_nvfp4_matvec_shader_id(
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return vulkan::StaticShaderId::gather_mv_nvfp4_bf16_bf16;
+  }
+  if (x_dtype == float32 && out_dtype == float32) {
+    return vulkan::StaticShaderId::gather_mv_nvfp4_f32;
+  }
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> gather_nvfp4_matmul_shader_id(
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return vulkan::StaticShaderId::gather_mm_nvfp4_bf16_bf16;
+  }
+  if (x_dtype == float32 && out_dtype == float32) {
+    return vulkan::StaticShaderId::gather_mm_nvfp4_f32;
+  }
+  return std::nullopt;
+}
+
 std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
     Dtype x_dtype) {
   switch (x_dtype) {
@@ -2078,6 +2137,140 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
   }
 
+  // Fused weight-only NVFP4 QuantizedMatmul (dense Q/K/V/O + shared expert).
+  if (mode_ == QuantizationMode::Nvfp4 && fused_nvfp4_dense_qmm_enabled() &&
+      transpose_ && group_size_ == 16 && bits_ == 4 && x_mat.ndim() == 2 &&
+      w.ndim() == 2 && w.dtype() == uint32 && inputs[2].dtype() == uint8) {
+    array scales_nv = ensure_row_contiguous_zero_offset(inputs[2], s);
+    array x_work = ensure_row_contiguous_zero_offset(x_mat, s);
+    Dtype compute_dtype = float32;
+    if (x_work.dtype() == bfloat16 && out.dtype() == bfloat16) {
+      compute_dtype = bfloat16;
+    } else if (x_work.dtype() != float32) {
+      x_work = ensure_float32_row_contiguous(x_work, s);
+      compute_dtype = float32;
+    }
+    const Dtype out_compute_dtype =
+        (compute_dtype == bfloat16) ? bfloat16 : float32;
+    auto matvec_id =
+        nvfp4_dense_matvec_shader_id(compute_dtype, out_compute_dtype);
+    auto matmul_id =
+        nvfp4_dense_matmul_shader_id(compute_dtype, out_compute_dtype);
+    if (matvec_id.has_value() && matmul_id.has_value() &&
+        scales_nv.ndim() == 2 && is_row_contiguous_zero_offset(x_work) &&
+        is_row_contiguous_zero_offset(w) &&
+        is_row_contiguous_zero_offset(scales_nv)) {
+      const uint32_t rows = static_cast<uint32_t>(x_work.shape(-2));
+      const uint32_t cols = static_cast<uint32_t>(w.shape(-2));
+      const uint32_t k = static_cast<uint32_t>(x_work.shape(-1));
+      const uint32_t num_groups = static_cast<uint32_t>(scales_nv.shape(-1));
+      if (cols == static_cast<uint32_t>(out.shape(-1)) &&
+          static_cast<uint32_t>(w.shape(-1) * 8) == k &&
+          num_groups ==
+              static_cast<uint32_t>((k + group_size_ - 1) / group_size_)) {
+        array out_work(
+            (vector_lhs || flatten_lhs_batches)
+                ? Shape{static_cast<int>(rows), out.shape(-1)}
+                : out.shape(),
+            out_compute_dtype,
+            nullptr,
+            {});
+        out_work.set_data(allocator::malloc(out_work.nbytes()));
+        const bool use_matvec = rows <= 8 || decode_lhs || rows == 1;
+        if (out_work.size() != 0) {
+          vulkan::Nvfp4DenseMatmulPushConstants push_constants{};
+          push_constants.rows = rows;
+          push_constants.cols = cols;
+          push_constants.K = k;
+          push_constants.packed_row_words =
+              static_cast<uint32_t>(w.strides(-2));
+          push_constants.x_row_stride =
+              static_cast<uint32_t>(x_work.strides(-2));
+          push_constants.out_row_stride =
+              static_cast<uint32_t>(out_work.strides(-2));
+          push_constants.scale_row_stride =
+              static_cast<uint32_t>(scales_nv.strides(-2));
+          push_constants.group_size = static_cast<uint32_t>(group_size_);
+          push_constants.num_groups = num_groups;
+
+          const auto shader_id = use_matvec ? *matvec_id : *matmul_id;
+          const std::array<uint32_t, 3> grid = use_matvec
+              ? std::array<uint32_t, 3>{cols, rows, 1u}
+              : std::array<uint32_t, 3>{
+                    (cols + 15u) / 16u, (rows + 15u) / 16u, 1u};
+          if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
+            throw std::runtime_error(
+                "[QuantizedMatmul::eval_gpu] NVFP4 dense dispatch grid exceeds Vulkan limits.");
+          }
+
+          auto command_buffer = vulkan::begin_command_recording(s.index);
+          vulkan::dispatch_nvfp4_dense_matmul_op(
+              w,
+              scales_nv,
+              x_work,
+              out_work,
+              shader_id,
+              command_buffer,
+              s,
+              push_constants,
+              grid);
+          vulkan::end_command_recording(s.index);
+        }
+
+        if (out_compute_dtype == bfloat16) {
+          finalize_bf16_output(out_work);
+        } else if (vector_lhs || flatten_lhs_batches) {
+          array::Flags flags = out.flags();
+          flags.contiguous = true;
+          flags.row_contiguous = true;
+          if (vector_lhs) {
+            flags.col_contiguous = true;
+          } else {
+            auto max_dim =
+                std::max_element(out.shape().begin(), out.shape().end());
+            flags.col_contiguous =
+                out.size() <= 1 || out.size() == *max_dim;
+          }
+          if (out.dtype() == out_work.dtype()) {
+            out.copy_shared_buffer(
+                out_work,
+                make_contiguous_strides(out.shape()),
+                flags,
+                out.size());
+            if (!detail::in_tracing() && !detail::retain_graph()) {
+              out.detach();
+            }
+            out.set_status(array::Status::evaluated);
+          } else {
+            array out_view(out.shape(), out_work.dtype(), nullptr, {});
+            out_view.copy_shared_buffer(
+                out_work,
+                make_contiguous_strides(out.shape()),
+                flags,
+                out.size());
+            out.set_data(allocator::malloc(out.nbytes()));
+            copy_gpu(out_view, out, CopyType::GeneralGeneral, s);
+            if (!detail::in_tracing() && !detail::retain_graph()) {
+              out.detach();
+            }
+            out.set_status(array::Status::evaluated);
+          }
+        } else if (out.dtype() == out_work.dtype()) {
+          out.copy_shared_buffer(out_work);
+          out.set_status(array::Status::evaluated);
+        } else {
+          out.set_data(allocator::malloc(out.nbytes()));
+          copy_gpu(out_work, out, CopyType::General, s);
+          out.set_status(array::Status::evaluated);
+        }
+        trace_qmm(
+            use_matvec ? "fused_nvfp4_matvec" : "fused_nvfp4_matmul",
+            compute_dtype == bfloat16 ? "bf16=1" : "f32=1");
+        return;
+      }
+    }
+  }
+
   array scales = mode_ == QuantizationMode::Affine
       ? ensure_float32_row_contiguous(inputs[2], s)
       : inputs[2];
@@ -2466,7 +2659,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   const bool native_bf16 = affine_mode && x.dtype() == bfloat16 &&
       out.dtype() == bfloat16 && inputs[2].dtype() == bfloat16 &&
       inputs[3].dtype() == bfloat16;
-  if (x.dtype() == bfloat16 && !native_bf16) {
+  const bool native_nvfp4_bf16 = mode_ == QuantizationMode::Nvfp4 &&
+      x.dtype() == bfloat16 && out.dtype() == bfloat16;
+  if (x.dtype() == bfloat16 && !native_bf16 && !native_nvfp4_bf16) {
     x = ensure_float32_row_contiguous(x, s);
   }
   array w = ensure_row_contiguous_zero_offset(inputs[1], s);
@@ -2539,14 +2734,24 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   if (mode_ == QuantizationMode::Nvfp4 && transpose_) {
-    array x_work = ensure_float32_row_contiguous(x, s);
+    const bool use_bf16 = x.dtype() == bfloat16 && out.dtype() == bfloat16;
+    const Dtype compute_dtype = use_bf16 ? bfloat16 : float32;
+    array x_work = use_bf16 ? ensure_row_contiguous_zero_offset(x, s)
+                            : ensure_float32_row_contiguous(x, s);
+    const Dtype out_compute_dtype =
+        (compute_dtype == bfloat16) ? bfloat16 : float32;
+    auto matvec_id =
+        gather_nvfp4_matvec_shader_id(compute_dtype, out_compute_dtype);
+    auto matmul_id =
+        gather_nvfp4_matmul_shader_id(compute_dtype, out_compute_dtype);
     const uint32_t batches = static_cast<uint32_t>(lhs_indices.size());
     const uint32_t rows = static_cast<uint32_t>(out.shape(-2));
     const uint32_t cols = static_cast<uint32_t>(out.shape(-1));
     const uint32_t k = static_cast<uint32_t>(x_work.shape(-1));
     const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
-    const bool shapes_ok = group_size_ == 16 && bits_ == 4 &&
-        w.dtype() == uint32 && scales.dtype() == uint8 &&
+    const bool shapes_ok = matvec_id.has_value() && matmul_id.has_value() &&
+        group_size_ == 16 && bits_ == 4 && w.dtype() == uint32 &&
+        scales.dtype() == uint8 &&
         rows == static_cast<uint32_t>(x_work.shape(-2)) &&
         cols == static_cast<uint32_t>(w.shape(-2)) &&
         static_cast<uint32_t>(w.shape(-1) * 8) == k &&
@@ -2558,7 +2763,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         is_row_contiguous_zero_offset(lhs_indices) &&
         is_row_contiguous_zero_offset(rhs_indices);
     if (shapes_ok) {
-      array out_work(out.shape(), float32, nullptr, {});
+      array out_work(out.shape(), out_compute_dtype, nullptr, {});
       out_work.set_data(allocator::malloc(out_work.nbytes()));
       if (out_work.size() != 0) {
         vulkan::GatherNvfp4MatmulPushConstants push_constants{};
@@ -2584,11 +2789,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         push_constants.num_groups = num_groups;
 
         // Decode (rows<=8): one workgroup per output element with K-reduce.
-        // Prefill/larger rows: tiled gather_mm.
+        // Prefill/larger rows: tiled gather_mm with shared X.
         const bool use_matvec = rows <= 8;
-        const auto shader_id = use_matvec
-            ? vulkan::StaticShaderId::gather_mv_nvfp4_f32
-            : vulkan::StaticShaderId::gather_mm_nvfp4_f32;
+        const auto shader_id = use_matvec ? *matvec_id : *matmul_id;
         const std::array<uint32_t, 3> grid = use_matvec
             ? std::array<uint32_t, 3>{cols, rows, batches}
             : std::array<uint32_t, 3>{

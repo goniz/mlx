@@ -22,7 +22,7 @@
 #define FROM_FLOAT_TYPE
 #endif
 
-// NVFP4 gather matvec for MoE decode: one workgroup per (batch, row, col).
+// Dense NVFP4 matvec (transpose weights): one workgroup per (row, col).
 #define BLOCK_SIZE 64
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
@@ -36,13 +36,7 @@ layout(binding = 1) readonly buffer SCALES {
 layout(binding = 2) readonly buffer X {
   B_TYPE data_x[];
 };
-layout(binding = 3) readonly buffer LHS_INDICES {
-  uint data_lhs_indices[];
-};
-layout(binding = 4) readonly buffer RHS_INDICES {
-  uint data_rhs_indices[];
-};
-layout(binding = 5) writeonly buffer OUT {
+layout(binding = 3) writeonly buffer OUT {
   D_TYPE data_out[];
 };
 
@@ -51,13 +45,9 @@ layout(push_constant) uniform parameter {
   uint cols;
   uint K;
   uint packed_row_words;
-  uint x_batch_stride;
   uint x_row_stride;
-  uint out_batch_stride;
   uint out_row_stride;
-  uint scale_matrix_stride;
   uint scale_row_stride;
-  uint w_matrix_stride_words;
   uint group_size;
   uint num_groups;
 } p;
@@ -67,20 +57,15 @@ shared float partial[BLOCK_SIZE];
 void main() {
   const uint col = gl_WorkGroupID.x;
   const uint row = gl_WorkGroupID.y;
-  const uint batch = gl_WorkGroupID.z;
   const uint tid = gl_LocalInvocationID.x;
 
   if (row >= p.rows || col >= p.cols) {
     return;
   }
 
-  const uint lhs_batch = data_lhs_indices[batch];
-  const uint rhs_batch = data_rhs_indices[batch];
-  const uint w_row_base =
-      rhs_batch * p.w_matrix_stride_words + col * p.packed_row_words;
-  const uint scale_row_base =
-      rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
-  const uint x_row_base = lhs_batch * p.x_batch_stride + row * p.x_row_stride;
+  const uint w_row_base = col * p.packed_row_words;
+  const uint scale_row_base = col * p.scale_row_stride;
+  const uint x_row_base = row * p.x_row_stride;
 
   float acc = 0.0f;
   if ((p.K & 7u) == 0u && p.group_size == 16u) {
@@ -137,8 +122,7 @@ void main() {
   if (gl_SubgroupSize == BLOCK_SIZE && gl_NumSubgroups == 1u) {
     acc = subgroupAdd(acc);
     if (tid == 0u) {
-      data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
-          D_TYPE(FROM_FLOAT_TYPE(acc));
+      data_out[row * p.out_row_stride + col] = D_TYPE(FROM_FLOAT_TYPE(acc));
     }
     return;
   }
@@ -152,7 +136,7 @@ void main() {
     barrier();
   }
   if (tid == 0u) {
-    data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
+    data_out[row * p.out_row_stride + col] =
         D_TYPE(FROM_FLOAT_TYPE(partial[0]));
   }
 }

@@ -20,7 +20,7 @@
 #define FROM_FLOAT_TYPE
 #endif
 
-// Fused NVFP4 gather matmul (transpose weights) with shared X tiles.
+// Dense NVFP4 matmul (transpose weights) with shared X tiles for prefill.
 #define BM 16
 #define BN 16
 #define BK 32
@@ -36,13 +36,7 @@ layout(binding = 1) readonly buffer SCALES {
 layout(binding = 2) readonly buffer X {
   B_TYPE data_x[];
 };
-layout(binding = 3) readonly buffer LHS_INDICES {
-  uint data_lhs_indices[];
-};
-layout(binding = 4) readonly buffer RHS_INDICES {
-  uint data_rhs_indices[];
-};
-layout(binding = 5) writeonly buffer OUT {
+layout(binding = 3) writeonly buffer OUT {
   D_TYPE data_out[];
 };
 
@@ -51,13 +45,9 @@ layout(push_constant) uniform parameter {
   uint cols;
   uint K;
   uint packed_row_words;
-  uint x_batch_stride;
   uint x_row_stride;
-  uint out_batch_stride;
   uint out_row_stride;
-  uint scale_matrix_stride;
   uint scale_row_stride;
-  uint w_matrix_stride_words;
   uint group_size;
   uint num_groups;
 } p;
@@ -67,7 +57,6 @@ shared float As[BM][BK];
 void main() {
   const uint col0 = gl_WorkGroupID.x * BN;
   const uint row0 = gl_WorkGroupID.y * BM;
-  const uint batch = gl_WorkGroupID.z;
   const uint tx = gl_LocalInvocationID.x;
   const uint ty = gl_LocalInvocationID.y;
   const uint col = col0 + tx;
@@ -75,14 +64,8 @@ void main() {
   const uint tid = ty * BN + tx;
   const uint wg = BM * BN;
 
-  const uint lhs_batch = data_lhs_indices[batch];
-  const uint rhs_batch = data_rhs_indices[batch];
-  const uint x_batch_base = lhs_batch * p.x_batch_stride;
-  const uint w_matrix_base = rhs_batch * p.w_matrix_stride_words;
-  const uint scale_matrix_base = rhs_batch * p.scale_matrix_stride;
-
-  const uint w_row_base = w_matrix_base + col * p.packed_row_words;
-  const uint scale_row_base = scale_matrix_base + col * p.scale_row_stride;
+  const uint w_row_base = col * p.packed_row_words;
+  const uint scale_row_base = col * p.scale_row_stride;
   const bool in_bounds = row < p.rows && col < p.cols;
 
   float acc = 0.0f;
@@ -94,8 +77,7 @@ void main() {
       const uint gk = k0 + kk;
       float v = 0.0f;
       if (gr < p.rows && gk < p.K) {
-        v = TO_FLOAT_TYPE(
-            data_x[x_batch_base + gr * p.x_row_stride + gk]);
+        v = TO_FLOAT_TYPE(data_x[gr * p.x_row_stride + gk]);
       }
       As[r][kk] = v;
     }
@@ -133,7 +115,6 @@ void main() {
   }
 
   if (in_bounds) {
-    data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
-        D_TYPE(FROM_FLOAT_TYPE(acc));
+    data_out[row * p.out_row_stride + col] = D_TYPE(FROM_FLOAT_TYPE(acc));
   }
 }

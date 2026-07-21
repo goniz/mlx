@@ -449,6 +449,7 @@ enum class KernelSpecId {
   GatherAffineCoopMatmul,
   Nvfp4QMatmul,
   GatherNvfp4Matmul,
+  Nvfp4DenseMatmul,
   LayerNormAffine,
   RMSNormBack,
   Argsort,
@@ -479,7 +480,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 45> kKernelSpecs = {
+const std::array<KernelSpec, 46> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -639,6 +640,10 @@ const std::array<KernelSpec, 45> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4, 5},
         sizeof(GatherNvfp4MatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(Nvfp4DenseMatmulPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1, 2, 3},
@@ -4462,6 +4467,36 @@ void dispatch_gather_nvfp4_matmul_op(
               "gather nvfp4 qmm matrix"),
           grid[2],
           "gather nvfp4 qmm elements"),
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_nvfp4_dense_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& x,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const Nvfp4DenseMatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 4> bound_arrays = {{
+      {&w, "W"},
+      {&scales, "SCALES"},
+      {&x, "X"},
+      {&out, "OUT"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Nvfp4DenseMatmul,
+      bound_arrays,
+      push_constants,
+      checked_mul_u32(
+          push_constants.rows,
+          push_constants.cols,
+          "nvfp4 dense matmul elements"),
       cmd_buffer,
       s,
       grid);

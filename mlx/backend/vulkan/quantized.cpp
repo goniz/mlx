@@ -206,17 +206,38 @@ bool fused_nvfp4_dense_qmm_enabled() {
   return enabled;
 }
 
+// Matvec column tile: 1 for decode (keep enough workgroups), 8/16 for
+// large-batch MoE prefill where X reuse dominates.
+uint32_t nvfp4_matvec_bn(uint32_t cols, uint32_t work_items) {
+  // work_items = rows * batches (gather) or rows (dense).
+  constexpr uint32_t kMultiColMinWorkItems = 256u;
+  if (work_items < kMultiColMinWorkItems) {
+    return 1u;
+  }
+  return cols >= 1024u ? 16u : 8u;
+}
+
 std::optional<vulkan::StaticShaderId> nvfp4_dense_matvec_shader_id(
     Dtype x_dtype,
     Dtype out_dtype,
-    bool wide_n) {
+    uint32_t bn) {
   if (x_dtype == bfloat16 && out_dtype == bfloat16) {
-    return wide_n ? vulkan::StaticShaderId::mul_mv_nvfp4_bf16_bf16_n16
-                  : vulkan::StaticShaderId::mul_mv_nvfp4_bf16_bf16;
+    if (bn >= 16u) {
+      return vulkan::StaticShaderId::mul_mv_nvfp4_bf16_bf16_n16;
+    }
+    if (bn >= 8u) {
+      return vulkan::StaticShaderId::mul_mv_nvfp4_bf16_bf16_n8;
+    }
+    return vulkan::StaticShaderId::mul_mv_nvfp4_bf16_bf16;
   }
   if (x_dtype == float32 && out_dtype == float32) {
-    return wide_n ? vulkan::StaticShaderId::mul_mv_nvfp4_f32_n16
-                  : vulkan::StaticShaderId::mul_mv_nvfp4_f32;
+    if (bn >= 16u) {
+      return vulkan::StaticShaderId::mul_mv_nvfp4_f32_n16;
+    }
+    if (bn >= 8u) {
+      return vulkan::StaticShaderId::mul_mv_nvfp4_f32_n8;
+    }
+    return vulkan::StaticShaderId::mul_mv_nvfp4_f32;
   }
   return std::nullopt;
 }
@@ -255,14 +276,24 @@ std::optional<vulkan::StaticShaderId> gather_nvfp4_matmul_shader_id(
 std::optional<vulkan::StaticShaderId> gather_nvfp4_matvec_shader_id(
     Dtype x_dtype,
     Dtype out_dtype,
-    bool wide_n) {
+    uint32_t bn) {
   if (x_dtype == bfloat16 && out_dtype == bfloat16) {
-    return wide_n ? vulkan::StaticShaderId::gather_mv_nvfp4_bf16_bf16_n16
-                  : vulkan::StaticShaderId::gather_mv_nvfp4_bf16_bf16;
+    if (bn >= 16u) {
+      return vulkan::StaticShaderId::gather_mv_nvfp4_bf16_bf16_n16;
+    }
+    if (bn >= 8u) {
+      return vulkan::StaticShaderId::gather_mv_nvfp4_bf16_bf16_n8;
+    }
+    return vulkan::StaticShaderId::gather_mv_nvfp4_bf16_bf16;
   }
   if (x_dtype == float32 && out_dtype == float32) {
-    return wide_n ? vulkan::StaticShaderId::gather_mv_nvfp4_f32_n16
-                  : vulkan::StaticShaderId::gather_mv_nvfp4_f32;
+    if (bn >= 16u) {
+      return vulkan::StaticShaderId::gather_mv_nvfp4_f32_n16;
+    }
+    if (bn >= 8u) {
+      return vulkan::StaticShaderId::gather_mv_nvfp4_f32_n8;
+    }
+    return vulkan::StaticShaderId::gather_mv_nvfp4_f32;
   }
   return std::nullopt;
 }
@@ -2173,10 +2204,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const uint32_t k = static_cast<uint32_t>(x_work.shape(-1));
       const uint32_t num_groups = static_cast<uint32_t>(scales_nv.shape(-1));
       const bool use_matvec = rows <= 8 || decode_lhs || rows == 1;
-      const bool wide_n = cols >= 1024u;
-      const bool large_n = !use_matvec && wide_n;
-      auto matvec_id = nvfp4_dense_matvec_shader_id(
-          compute_dtype, out_compute_dtype, wide_n);
+      const bool large_n = !use_matvec && cols >= 1024u;
+      const uint32_t mv_bn = nvfp4_matvec_bn(cols, rows);
+      auto matvec_id =
+          nvfp4_dense_matvec_shader_id(compute_dtype, out_compute_dtype, mv_bn);
       auto matmul_id = nvfp4_dense_matmul_shader_id(
           compute_dtype, out_compute_dtype, large_n);
       if (matvec_id.has_value() && matmul_id.has_value() &&
@@ -2209,7 +2240,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           push_constants.num_groups = num_groups;
 
           const auto shader_id = use_matvec ? *matvec_id : *matmul_id;
-          const uint32_t mv_bn = wide_n ? 16u : 8u;
           const uint32_t mm_bn = large_n ? 32u : 16u;
           const std::array<uint32_t, 3> grid = use_matvec
               ? std::array<uint32_t, 3>{
@@ -2764,10 +2794,14 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     const uint32_t k = static_cast<uint32_t>(x_work.shape(-1));
     const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
     const bool use_matvec = rows <= 8;
-    const bool wide_n = cols >= 1024u;
-    const bool large_n = !use_matvec && wide_n;
-    auto matvec_id = gather_nvfp4_matvec_shader_id(
-        compute_dtype, out_compute_dtype, wide_n);
+    const bool large_n = !use_matvec && cols >= 1024u;
+    const uint32_t mv_work_items =
+        static_cast<uint32_t>(std::min<uint64_t>(
+            uint64_t{rows} * uint64_t{batches},
+            uint64_t{std::numeric_limits<uint32_t>::max()}));
+    const uint32_t mv_bn = nvfp4_matvec_bn(cols, mv_work_items);
+    auto matvec_id =
+        gather_nvfp4_matvec_shader_id(compute_dtype, out_compute_dtype, mv_bn);
     auto matmul_id = gather_nvfp4_matmul_shader_id(
         compute_dtype, out_compute_dtype, large_n);
     const bool shapes_ok = matvec_id.has_value() && matmul_id.has_value() &&
@@ -2809,9 +2843,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         push_constants.group_size = static_cast<uint32_t>(group_size_);
         push_constants.num_groups = num_groups;
 
-        // Decode/prefill MoE: multi-col matvec (rows<=8). Prefill mm: BM=32.
+        // Decode: BN=1 keeps enough workgroups. Prefill MoE: multi-col.
+        // Prefill mm: BM=32 tiled gather.
         const auto shader_id = use_matvec ? *matvec_id : *matmul_id;
-        const uint32_t mv_bn = wide_n ? 16u : 8u;
         const uint32_t mm_bn = large_n ? 32u : 16u;
         const std::array<uint32_t, 3> grid = use_matvec
             ? std::array<uint32_t, 3>{

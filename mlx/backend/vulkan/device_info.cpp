@@ -27,7 +27,9 @@ device_info(int device_index) {
     // Get memory properties
     vk::PhysicalDeviceMemoryProperties mem_props = physical_device.getMemoryProperties();
 
-    // Calculate total device memory (device-local heaps)
+    // Sum Vulkan heaps. On discrete GPUs DEVICE_LOCAL is VRAM and the rest is
+    // host. On unified-memory iGPUs both heaps are views into system RAM and the
+    // usable working set is their sum (drivers still budget them separately).
     size_t device_memory = 0;
     size_t host_memory = 0;
     for (uint32_t i = 0; i < mem_props.memoryHeapCount; i++) {
@@ -37,9 +39,6 @@ device_info(int device_index) {
         host_memory += mem_props.memoryHeaps[i].size;
       }
     }
-
-    // For integrated GPUs with unified memory, device_memory + host_memory
-    // should roughly equal total system memory available to GPU
 
     // Get device name
     std::string device_name(device_props.deviceName);
@@ -101,10 +100,16 @@ device_info(int device_index) {
 
     // Get unified memory status
     bool is_unified = ctx.is_unified_memory();
+    const size_t total_memory = device_memory + host_memory;
+    // Soft allocator limits / recommended working set: on UMA include the host
+    // heap so large models can spill past the DEVICE_LOCAL carve-out.
+    const size_t memory_size = is_unified ? total_memory : device_memory;
+    const size_t max_recommended_working_set_size =
+        is_unified ? total_memory : device_memory;
 
     // Vulkan doesn't have a direct free memory query like CUDA,
-    // so free_memory reports the total (we could track this in allocator later)
-    size_t free_memory = device_memory;
+    // so free_memory reports the allocator's world size.
+    size_t free_memory = memory_size;
 
     return {
         {"device_name", device_name},
@@ -113,14 +118,15 @@ device_info(int device_index) {
         {"architecture", "Vulkan"},
         {"driver_version", driver_version},
         {"api_version", api_version},
-        {"memory_size", device_memory},
+        {"memory_size", memory_size},
+        {"device_local_memory_size", device_memory},
         {"host_memory_size", host_memory},
-        {"total_memory_size", device_memory + host_memory},
-        {"total_memory", device_memory + host_memory},
+        {"total_memory_size", total_memory},
+        {"total_memory", total_memory},
         {"free_memory", free_memory},
         {"max_buffer_length", limits.maxStorageBufferRange},
-        {"max_recommended_working_set_size", device_memory},
-        {"unified_memory", is_unified},
+        {"max_recommended_working_set_size", max_recommended_working_set_size},
+        {"unified_memory", is_unified ? size_t{1} : size_t{0}},
         {"max_work_group_size", max_work_group_size},
         {"max_compute_work_group_count_x", static_cast<size_t>(limits.maxComputeWorkGroupCount[0])},
         {"max_compute_work_group_count_y", static_cast<size_t>(limits.maxComputeWorkGroupCount[1])},

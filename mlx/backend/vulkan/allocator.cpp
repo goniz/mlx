@@ -242,24 +242,64 @@ struct PreferredMemoryType {
   vk::MemoryPropertyFlags forbidden;
 };
 
-uint32_t find_memory_type_index(
+// Preference-ordered, de-duplicated memory type indices that match type_filter.
+std::vector<uint32_t> find_memory_type_indices(
     const VulkanContext& ctx,
     uint32_t type_filter,
     const std::vector<PreferredMemoryType>& preferred_types) {
   const auto mem_props = ctx.memory_properties();
+  std::vector<uint32_t> indices;
+  std::vector<char> seen(mem_props.memoryTypeCount, 0);
   for (const auto& preference : preferred_types) {
     for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
-      if ((type_filter & (1u << i)) == 0) {
+      if (seen[i] || (type_filter & (1u << i)) == 0) {
         continue;
       }
       const auto flags = mem_props.memoryTypes[i].propertyFlags;
       if ((flags & preference.required) == preference.required &&
           (flags & preference.forbidden) == vk::MemoryPropertyFlags{}) {
-        return i;
+        indices.push_back(i);
+        seen[i] = 1;
       }
     }
   }
-  throw std::runtime_error("[vulkan::malloc] No suitable memory type found.");
+  return indices;
+}
+
+std::vector<PreferredMemoryType> memory_type_preferences(
+    bool unified_memory,
+    bool require_host_visible) {
+  using enum vk::MemoryPropertyFlagBits;
+  if (unified_memory) {
+    // UMA: prefer mappable device-local, then pure device-local, then host
+    // heaps so large working sets can spill past the DEVICE_LOCAL carve-out.
+    if (require_host_visible) {
+      return {
+          {eDeviceLocal | eHostVisible | eHostCoherent, {}},
+          {eHostVisible | eHostCoherent, eHostCached},
+          {eHostVisible | eHostCoherent | eHostCached, {}},
+      };
+    }
+    return {
+        {eDeviceLocal | eHostVisible | eHostCoherent, {}},
+        {eDeviceLocal, {}},
+        {eHostVisible | eHostCoherent, eHostCached},
+        {eHostVisible | eHostCoherent | eHostCached, {}},
+    };
+  }
+  if (require_host_visible) {
+    return {
+        {eHostVisible | eHostCoherent | eHostCached, {}},
+        {eHostVisible | eHostCoherent, {}},
+        {eDeviceLocal | eHostVisible | eHostCoherent, {}},
+    };
+  }
+  return {
+      {eDeviceLocal, eHostVisible},
+      {eDeviceLocal | eHostVisible | eHostCoherent, {}},
+      {eHostVisible | eHostCoherent, {}},
+      {eHostVisible | eHostCoherent | eHostCached, {}},
+  };
 }
 
 } // namespace
@@ -469,71 +509,45 @@ Buffer VulkanAllocator::malloc_impl(size_t size, bool require_host_visible) {
     }
   }
 
-  std::vector<PreferredMemoryType> preferred_memory_types;
-  if (require_host_visible && ctx.is_unified_memory()) {
-    preferred_memory_types = {
-        {vk::MemoryPropertyFlagBits::eDeviceLocal |
-             vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent,
-         {}},
-        {vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent,
-         {}}};
-  } else if (require_host_visible) {
-    preferred_memory_types = {
-        {vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent |
-             vk::MemoryPropertyFlagBits::eHostCached,
-         {}},
-        {vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent,
-         {}},
-        {vk::MemoryPropertyFlagBits::eDeviceLocal |
-             vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent,
-         {}}};
-  } else if (ctx.is_unified_memory()) {
-    preferred_memory_types = {
-        {vk::MemoryPropertyFlagBits::eDeviceLocal |
-             vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent,
-         {}},
-        {vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent,
-         {}}};
-  } else {
-    preferred_memory_types = {
-        {vk::MemoryPropertyFlagBits::eDeviceLocal,
-         vk::MemoryPropertyFlagBits::eHostVisible},
-        {vk::MemoryPropertyFlagBits::eDeviceLocal |
-             vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent,
-         {}},
-        {vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent,
-         {}},
-        {vk::MemoryPropertyFlagBits::eHostVisible |
-             vk::MemoryPropertyFlagBits::eHostCoherent |
-             vk::MemoryPropertyFlagBits::eHostCached,
-         {}}};
-  }
-
-  uint32_t memory_type_index = 0;
-  try {
-    memory_type_index = find_memory_type_index(
-        ctx, mem_requirements.memoryTypeBits, preferred_memory_types);
-  } catch (...) {
+  const auto preferred_memory_types =
+      memory_type_preferences(ctx.is_unified_memory(), require_host_visible);
+  const auto memory_type_indices = find_memory_type_indices(
+      ctx, mem_requirements.memoryTypeBits, preferred_memory_types);
+  if (memory_type_indices.empty()) {
     vk_device.destroyBuffer(vk_buffer);
-    throw;
+    throw std::runtime_error("[vulkan::malloc] No suitable memory type found.");
   }
 
   auto mem_props = ctx.memory_properties();
-  const auto memory_flags =
-      mem_props.memoryTypes[memory_type_index].propertyFlags;
+  vk::DeviceMemory vk_memory;
+  vk::MemoryPropertyFlags memory_flags{};
+  bool allocated = false;
+  for (uint32_t memory_type_index : memory_type_indices) {
+    vk::MemoryAllocateInfo alloc_info(mem_requirements.size, memory_type_index);
+    try {
+      vk_memory = vk_device.allocateMemory(alloc_info);
+      memory_flags = mem_props.memoryTypes[memory_type_index].propertyFlags;
+      allocated = true;
+      break;
+    } catch (const vk::OutOfDeviceMemoryError&) {
+      // Try the next preference (e.g. host heap when DEVICE_LOCAL is full).
+      continue;
+    } catch (const vk::OutOfHostMemoryError&) {
+      continue;
+    } catch (...) {
+      vk_device.destroyBuffer(vk_buffer);
+      throw;
+    }
+  }
 
-  // Use C++ Vulkan API for memory allocation
-  vk::MemoryAllocateInfo alloc_info(mem_requirements.size, memory_type_index);
-  vk::DeviceMemory vk_memory = vk_device.allocateMemory(alloc_info);
+  if (!allocated) {
+    vk_device.destroyBuffer(vk_buffer);
+    std::ostringstream msg;
+    msg << "[vulkan::malloc] Out of memory allocating " << allocation_size
+        << " bytes after trying " << memory_type_indices.size()
+        << " memory types.";
+    throw std::runtime_error(msg.str());
+  }
 
   // Bind memory - C++ API doesn't have this method, so use C function
   if (vkBindBufferMemory(vk_device, vk_buffer, vk_memory, 0) != VK_SUCCESS) {

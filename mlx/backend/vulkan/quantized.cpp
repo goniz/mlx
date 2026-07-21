@@ -2538,6 +2538,84 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
+  if (mode_ == QuantizationMode::Nvfp4 && transpose_) {
+    array x_work = ensure_float32_row_contiguous(x, s);
+    const uint32_t batches = static_cast<uint32_t>(lhs_indices.size());
+    const uint32_t rows = static_cast<uint32_t>(out.shape(-2));
+    const uint32_t cols = static_cast<uint32_t>(out.shape(-1));
+    const uint32_t k = static_cast<uint32_t>(x_work.shape(-1));
+    const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
+    const bool shapes_ok = group_size_ == 16 && bits_ == 4 &&
+        w.dtype() == uint32 && scales.dtype() == uint8 &&
+        rows == static_cast<uint32_t>(x_work.shape(-2)) &&
+        cols == static_cast<uint32_t>(w.shape(-2)) &&
+        static_cast<uint32_t>(w.shape(-1) * 8) == k &&
+        num_groups ==
+            static_cast<uint32_t>((k + group_size_ - 1) / group_size_) &&
+        is_row_contiguous_zero_offset(x_work) &&
+        is_row_contiguous_zero_offset(w) &&
+        is_row_contiguous_zero_offset(scales) &&
+        is_row_contiguous_zero_offset(lhs_indices) &&
+        is_row_contiguous_zero_offset(rhs_indices);
+    if (shapes_ok) {
+      array out_work(out.shape(), float32, nullptr, {});
+      out_work.set_data(allocator::malloc(out_work.nbytes()));
+      if (out_work.size() != 0) {
+        vulkan::GatherNvfp4MatmulPushConstants push_constants{};
+        push_constants.rows = rows;
+        push_constants.cols = cols;
+        push_constants.K = k;
+        push_constants.packed_row_words =
+            static_cast<uint32_t>(w.strides(-2));
+        push_constants.x_batch_stride =
+            static_cast<uint32_t>(x_work.shape(-2) * x_work.shape(-1));
+        push_constants.x_row_stride =
+            static_cast<uint32_t>(x_work.strides(-2));
+        push_constants.out_batch_stride = rows * cols;
+        push_constants.out_row_stride =
+            static_cast<uint32_t>(out_work.strides(-2));
+        push_constants.scale_matrix_stride =
+            static_cast<uint32_t>(scales.strides(-3));
+        push_constants.scale_row_stride =
+            static_cast<uint32_t>(scales.strides(-2));
+        push_constants.w_matrix_stride_words =
+            static_cast<uint32_t>(w.strides(-3));
+        push_constants.group_size = static_cast<uint32_t>(group_size_);
+        push_constants.num_groups = num_groups;
+
+        const std::array<uint32_t, 3> grid = {
+            (cols + 15u) / 16u, (rows + 15u) / 16u, batches};
+        if (!dispatch_grid_within_limits(grid[0], grid[1], grid[2])) {
+          throw std::runtime_error(
+              "[GatherQMM::eval_gpu] NVFP4 gather dispatch grid exceeds Vulkan workgroup count limits.");
+        }
+
+        auto command_buffer = vulkan::begin_command_recording(s.index);
+        vulkan::dispatch_gather_nvfp4_matmul_op(
+            w,
+            scales,
+            x_work,
+            lhs_indices,
+            rhs_indices,
+            out_work,
+            vulkan::StaticShaderId::gather_mm_nvfp4_f32,
+            command_buffer,
+            s,
+            push_constants,
+            grid);
+        vulkan::end_command_recording(s.index);
+      }
+
+      if (out.dtype() == out_work.dtype()) {
+        out.copy_shared_buffer(out_work);
+      } else {
+        out.set_data(allocator::malloc(out.nbytes()));
+        copy_gpu(out_work, out, CopyType::General, s);
+      }
+      return;
+    }
+  }
+
   if (!affine_mode || !transpose_) {
     array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
     if (affine_mode &&

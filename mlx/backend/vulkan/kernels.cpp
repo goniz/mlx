@@ -448,6 +448,7 @@ enum class KernelSpecId {
   GatherAffineTileMetadata,
   GatherAffineCoopMatmul,
   Nvfp4QMatmul,
+  GatherNvfp4Matmul,
   LayerNormAffine,
   RMSNormBack,
   Argsort,
@@ -478,7 +479,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 44> kKernelSpecs = {
+const std::array<KernelSpec, 45> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -634,6 +635,10 @@ const std::array<KernelSpec, 44> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4, 5},
         sizeof(Nvfp4QMatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 5},
+        sizeof(GatherNvfp4MatmulPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
         {0, 1, 2, 3},
@@ -4420,6 +4425,43 @@ void dispatch_nvfp4_qmatmul_op(
       push_constants,
       checked_mul_u32(
           push_constants.rows, push_constants.cols, "nvfp4 qmatmul elements"),
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_gather_nvfp4_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& x,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const GatherNvfp4MatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 6> bound_arrays = {{
+      {&w, "W"},
+      {&scales, "SCALES"},
+      {&x, "X"},
+      {&lhs_indices, "LHS_INDICES"},
+      {&rhs_indices, "RHS_INDICES"},
+      {&out, "OUT"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::GatherNvfp4Matmul,
+      bound_arrays,
+      push_constants,
+      checked_mul_u32(
+          checked_mul_u32(
+              push_constants.rows,
+              push_constants.cols,
+              "gather nvfp4 qmm matrix"),
+          grid[2],
+          "gather nvfp4 qmm elements"),
       cmd_buffer,
       s,
       grid);

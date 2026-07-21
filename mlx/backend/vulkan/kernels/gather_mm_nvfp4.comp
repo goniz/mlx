@@ -1,0 +1,93 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// Fused NVFP4 gather matmul (transpose weights): keep packed expert weights on
+// device and dequant-on-load. Intended for MoE decode (small rows).
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W {
+  uint data_w[];
+};
+layout(binding = 1) readonly buffer SCALES {
+  uint8_t data_scales[];
+};
+layout(binding = 2) readonly buffer X {
+  float data_x[];
+};
+layout(binding = 3) readonly buffer LHS_INDICES {
+  uint data_lhs_indices[];
+};
+layout(binding = 4) readonly buffer RHS_INDICES {
+  uint data_rhs_indices[];
+};
+layout(binding = 5) writeonly buffer OUT {
+  float data_out[];
+};
+
+layout(push_constant) uniform parameter {
+  uint rows;
+  uint cols;
+  uint K;
+  uint packed_row_words;
+  uint x_batch_stride;
+  uint x_row_stride;
+  uint out_batch_stride;
+  uint out_row_stride;
+  uint scale_matrix_stride;
+  uint scale_row_stride;
+  uint w_matrix_stride_words;
+  uint group_size;
+  uint num_groups;
+} p;
+
+float fp8_e4m3_to_fp32(uint8_t x) {
+  uint v = (uint(x) & 127u) << 7;
+  float val = unpackHalf2x16(v).x * 256.0;
+  return (x & uint8_t(128u)) != 0u ? -val : val;
+}
+
+float nvfp4_lut(uint q) {
+  const float lut[16] = float[16](
+      +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0, -0.0, -0.5, -1.0, -1.5,
+      -2.0, -3.0, -4.0, -6.0);
+  return lut[q];
+}
+
+float decode_w(uint row_base, uint scale_base, uint k) {
+  const uint packed = data_w[row_base + (k >> 3u)];
+  const uint q = (packed >> ((k & 7u) * 4u)) & 0xFu;
+  const float scale = fp8_e4m3_to_fp32(data_scales[scale_base + (k >> 4u)]);
+  return nvfp4_lut(q) * scale;
+}
+
+void main() {
+  const uint col = gl_GlobalInvocationID.x;
+  const uint row = gl_GlobalInvocationID.y;
+  const uint batch = gl_GlobalInvocationID.z;
+
+  if (row >= p.rows || col >= p.cols) {
+    return;
+  }
+
+  const uint lhs_batch = data_lhs_indices[batch];
+  const uint rhs_batch = data_rhs_indices[batch];
+  const uint w_row_base =
+      rhs_batch * p.w_matrix_stride_words + col * p.packed_row_words;
+  const uint scale_row_base =
+      rhs_batch * p.scale_matrix_stride + col * p.scale_row_stride;
+  const uint x_row_base = lhs_batch * p.x_batch_stride + row * p.x_row_stride;
+
+  float acc = 0.0f;
+  for (uint group = 0u; group < p.num_groups; ++group) {
+    const uint group_start = group * p.group_size;
+    const uint group_end = min(group_start + p.group_size, p.K);
+    for (uint k = group_start; k < group_end; ++k) {
+      acc = fma(
+          data_x[x_row_base + k], decode_w(w_row_base, scale_row_base, k), acc);
+    }
+  }
+
+  data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] = acc;
+}

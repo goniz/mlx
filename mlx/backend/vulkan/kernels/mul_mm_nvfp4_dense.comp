@@ -1,5 +1,6 @@
 #version 450
 
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_16bit_storage : require
@@ -20,12 +21,9 @@
 #define FROM_FLOAT_TYPE
 #endif
 
-// Dense NVFP4 matmul (transpose weights) with shared X tiles for prefill.
-#define BM 16
-#define BN 16
-#define BK 32
-
-layout(local_size_x = BN, local_size_y = BM, local_size_z = 1) in;
+// Dense NVFP4 prefill matmul (transpose weights): shared X+W tiles with
+// register blocking. Mirrors mul_mm_affine_bf16_tiled4.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W {
   uint data_w[];
@@ -52,69 +50,132 @@ layout(push_constant) uniform parameter {
   uint num_groups;
 } p;
 
-shared float As[BM][BK];
+#ifndef MLX_BM
+#define MLX_BM 32
+#endif
+#ifndef MLX_BN
+#define MLX_BN 16
+#endif
+#ifndef MLX_BK
+#define MLX_BK 32
+#endif
+#ifndef MLX_TM
+#define MLX_TM 4
+#endif
+#ifndef MLX_TN
+#define MLX_TN 2
+#endif
+
+const uint BM = MLX_BM;
+const uint BN = MLX_BN;
+const uint BK = MLX_BK;
+const uint TM = MLX_TM;
+const uint TN = MLX_TN;
+
+shared float xs[BM][BK];
+shared float ws[BN][BK];
 
 void main() {
-  const uint col0 = gl_WorkGroupID.x * BN;
-  const uint row0 = gl_WorkGroupID.y * BM;
-  const uint tx = gl_LocalInvocationID.x;
-  const uint ty = gl_LocalInvocationID.y;
-  const uint col = col0 + tx;
-  const uint row = row0 + ty;
-  const uint tid = ty * BN + tx;
-  const uint wg = BM * BN;
+  const uint lx = gl_LocalInvocationID.x;
+  const uint ly = gl_LocalInvocationID.y;
+  const uint row0 = gl_WorkGroupID.y * BM + ly * TM;
+  const uint col0 = gl_WorkGroupID.x * BN + lx * TN;
+  const uint linear = ly * gl_WorkGroupSize.x + lx;
+  const uint thread_count = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
 
-  const uint w_row_base = col * p.packed_row_words;
-  const uint scale_row_base = col * p.scale_row_stride;
-  const bool in_bounds = row < p.rows && col < p.cols;
+  float acc[TM][TN];
+  [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+    [[unroll]] for (uint nc = 0u; nc < TN; ++nc) {
+      acc[mr][nc] = 0.0f;
+    }
+  }
 
-  float acc = 0.0f;
-  for (uint k0 = 0u; k0 < p.K; k0 += BK) {
-    for (uint i = tid; i < BM * BK; i += wg) {
+  for (uint kb = 0u; kb < p.K; kb += BK) {
+    for (uint i = linear; i < BM * BK; i += thread_count) {
       const uint r = i / BK;
       const uint kk = i - r * BK;
-      const uint gr = row0 + r;
-      const uint gk = k0 + kk;
-      float v = 0.0f;
-      if (gr < p.rows && gk < p.K) {
-        v = TO_FLOAT_TYPE(data_x[gr * p.x_row_stride + gk]);
+      const uint src_row = gl_WorkGroupID.y * BM + r;
+      const uint src_k = kb + kk;
+      xs[r][kk] = (src_row < p.rows && src_k < p.K)
+          ? TO_FLOAT_TYPE(data_x[src_row * p.x_row_stride + src_k])
+          : 0.0f;
+    }
+
+    // NVFP4: 8 nibbles / uint32; group_size 16 so each pack uses one scale.
+    for (uint i = linear; i < BN * (BK / 8u); i += thread_count) {
+      const uint c = i / (BK / 8u);
+      const uint packed_k = i - c * (BK / 8u);
+      const uint src_col = gl_WorkGroupID.x * BN + c;
+      const uint src_k = kb + packed_k * 8u;
+      const uint kk = packed_k * 8u;
+      if (src_col < p.cols && src_k + 7u < p.K) {
+        const uint packed = data_w[src_col * p.packed_row_words + (src_k >> 3u)];
+        const float scale = nvfp4_fp8_e4m3_to_fp32(
+            data_scales[src_col * p.scale_row_stride + (src_k >> 4u)]);
+        [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+          ws[c][kk + n] = nvfp4_decode_nibble(packed, n, scale);
+        }
+      } else {
+        [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+          float v = 0.0f;
+          const uint k = src_k + n;
+          if (src_col < p.cols && k < p.K) {
+            const uint packed =
+                data_w[src_col * p.packed_row_words + (k >> 3u)];
+            const float scale = nvfp4_fp8_e4m3_to_fp32(
+                data_scales[src_col * p.scale_row_stride + (k >> 4u)]);
+            v = nvfp4_decode_nibble(packed, k & 7u, scale);
+          }
+          ws[c][kk + n] = v;
+        }
       }
-      As[r][kk] = v;
     }
     barrier();
 
-    if (in_bounds) {
-      const uint k_end = min(k0 + BK, p.K);
-      if ((p.group_size == 16u) && ((k0 & 7u) == 0u)) {
-        for (uint kk = 0u; kk < BK && (k0 + kk) < k_end; kk += 8u) {
-          const uint k = k0 + kk;
-          const uint packed = data_w[w_row_base + (k >> 3u)];
-          const float scale =
-              nvfp4_fp8_e4m3_to_fp32(data_scales[scale_row_base + (k >> 4u)]);
-          acc = fma(As[ty][kk + 0u], nvfp4_decode_nibble(packed, 0u, scale), acc);
-          acc = fma(As[ty][kk + 1u], nvfp4_decode_nibble(packed, 1u, scale), acc);
-          acc = fma(As[ty][kk + 2u], nvfp4_decode_nibble(packed, 2u, scale), acc);
-          acc = fma(As[ty][kk + 3u], nvfp4_decode_nibble(packed, 3u, scale), acc);
-          acc = fma(As[ty][kk + 4u], nvfp4_decode_nibble(packed, 4u, scale), acc);
-          acc = fma(As[ty][kk + 5u], nvfp4_decode_nibble(packed, 5u, scale), acc);
-          acc = fma(As[ty][kk + 6u], nvfp4_decode_nibble(packed, 6u, scale), acc);
-          acc = fma(As[ty][kk + 7u], nvfp4_decode_nibble(packed, 7u, scale), acc);
-        }
-      } else {
-        for (uint kk = 0u; kk < BK && (k0 + kk) < k_end; ++kk) {
-          const uint k = k0 + kk;
-          const uint packed = data_w[w_row_base + (k >> 3u)];
-          const uint q = (packed >> ((k & 7u) * 4u)) & 0xFu;
-          const float scale =
-              nvfp4_fp8_e4m3_to_fp32(data_scales[scale_row_base + (k >> 4u)]);
-          acc = fma(As[ty][kk], nvfp4_lut(q) * scale, acc);
+    for (uint kk = 0u; kk < BK; ++kk) {
+#if MLX_TN == 2
+      const float w0 = ws[lx * TN + 0u][kk];
+      const float w1 = ws[lx * TN + 1u][kk];
+      [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+        const float x = xs[ly * TM + mr][kk];
+        acc[mr][0] = fma(x, w0, acc[mr][0]);
+        acc[mr][1] = fma(x, w1, acc[mr][1]);
+      }
+#elif MLX_TN == 4
+      const float w0 = ws[lx * TN + 0u][kk];
+      const float w1 = ws[lx * TN + 1u][kk];
+      const float w2 = ws[lx * TN + 2u][kk];
+      const float w3 = ws[lx * TN + 3u][kk];
+      [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+        const float x = xs[ly * TM + mr][kk];
+        acc[mr][0] = fma(x, w0, acc[mr][0]);
+        acc[mr][1] = fma(x, w1, acc[mr][1]);
+        acc[mr][2] = fma(x, w2, acc[mr][2]);
+        acc[mr][3] = fma(x, w3, acc[mr][3]);
+      }
+#else
+      [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+        const float x = xs[ly * TM + mr][kk];
+        [[unroll]] for (uint nc = 0u; nc < TN; ++nc) {
+          acc[mr][nc] = fma(x, ws[lx * TN + nc][kk], acc[mr][nc]);
         }
       }
+#endif
     }
     barrier();
   }
 
-  if (in_bounds) {
-    data_out[row * p.out_row_stride + col] = D_TYPE(FROM_FLOAT_TYPE(acc));
+  [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+    const uint row = row0 + mr;
+    if (row >= p.rows) {
+      continue;
+    }
+    [[unroll]] for (uint nc = 0u; nc < TN; ++nc) {
+      const uint col = col0 + nc;
+      if (col < p.cols) {
+        data_out[row * p.out_row_stride + col] =
+            D_TYPE(FROM_FLOAT_TYPE(acc[mr][nc]));
+      }
+    }
   }
 }

@@ -2244,6 +2244,13 @@ void process_shaders() {
       "mul_mm_nvfp4_dense.comp",
       {{"B_TYPE", "float"}, {"D_TYPE", "float"}});
   string_to_spv(
+      "mul_mm_nvfp4_dense_f32_n32",
+      "mul_mm_nvfp4_dense.comp",
+      {{"B_TYPE", "float"},
+       {"D_TYPE", "float"},
+       {"MLX_BN", "32"},
+       {"MLX_TN", "4"}});
+  string_to_spv(
       "mul_mm_nvfp4_dense_bf16_bf16",
       "mul_mm_nvfp4_dense.comp",
       {{"B_TYPE", "uint16_t"},
@@ -2251,9 +2258,25 @@ void process_shaders() {
        {"TO_FLOAT_TYPE", "bf16_to_fp32"},
        {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
   string_to_spv(
+      "mul_mm_nvfp4_dense_bf16_bf16_n32",
+      "mul_mm_nvfp4_dense.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "32"},
+       {"MLX_TN", "4"}});
+  string_to_spv(
       "gather_mm_nvfp4_f32",
       "gather_mm_nvfp4.comp",
       {{"B_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "gather_mm_nvfp4_f32_n32",
+      "gather_mm_nvfp4.comp",
+      {{"B_TYPE", "float"},
+       {"D_TYPE", "float"},
+       {"MLX_BN", "32"},
+       {"MLX_TN", "4"}});
   string_to_spv(
       "gather_mm_nvfp4_bf16_bf16",
       "gather_mm_nvfp4.comp",
@@ -2261,6 +2284,15 @@ void process_shaders() {
        {"D_TYPE", "uint16_t"},
        {"TO_FLOAT_TYPE", "bf16_to_fp32"},
        {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
+  string_to_spv(
+      "gather_mm_nvfp4_bf16_bf16_n32",
+      "gather_mm_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "32"},
+       {"MLX_TN", "4"}});
   string_to_spv(
       "gather_mv_nvfp4_f32",
       "gather_mv_nvfp4.comp",

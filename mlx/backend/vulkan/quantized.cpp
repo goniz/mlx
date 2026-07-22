@@ -298,6 +298,22 @@ std::optional<vulkan::StaticShaderId> gather_nvfp4_matvec_shader_id(
   return std::nullopt;
 }
 
+std::optional<vulkan::StaticShaderId> gather_nvfp4_matvec_rhs_shader_id(
+    Dtype x_dtype,
+    Dtype out_dtype,
+    uint32_t bn) {
+  if (x_dtype == bfloat16 && out_dtype == bfloat16) {
+    return bn >= 16u
+        ? vulkan::StaticShaderId::gather_mv_nvfp4_rhs_bf16_bf16_bm2_n16
+        : vulkan::StaticShaderId::gather_mv_nvfp4_rhs_bf16_bf16_bm2_n8;
+  }
+  if (x_dtype == float32 && out_dtype == float32) {
+    return bn >= 16u ? vulkan::StaticShaderId::gather_mv_nvfp4_rhs_f32_bm2_n16
+                     : vulkan::StaticShaderId::gather_mv_nvfp4_rhs_f32_bm2_n8;
+  }
+  return std::nullopt;
+}
+
 std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
     Dtype x_dtype) {
   switch (x_dtype) {
@@ -2800,13 +2816,27 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             uint64_t{rows} * uint64_t{batches},
             uint64_t{std::numeric_limits<uint32_t>::max()}));
     const uint32_t mv_bn = nvfp4_matvec_bn(cols, mv_work_items);
+    const auto x_batch_count =
+        x_work.size() / (x_work.shape(-2) * x_work.shape(-1));
+    const auto expert_count = w.size() / (w.shape(-2) * w.shape(-1));
+    // Sorted MoE prefill: tile 2 batches so consecutive same-expert tokens
+    // reuse dequantized W (BM=2 keeps register pressure low).
+    constexpr uint32_t kRhsBm = 2u;
+    const bool use_sorted_rhs = use_matvec && rows == 1 && batches >= 16 &&
+        right_sorted_ && x_batch_count == batches && expert_count > 0 &&
+        batches / expert_count >= 4 && mv_bn >= 8u;
     auto matvec_id =
         gather_nvfp4_matvec_shader_id(compute_dtype, out_compute_dtype, mv_bn);
+    auto matvec_rhs_id = use_sorted_rhs
+        ? gather_nvfp4_matvec_rhs_shader_id(
+              compute_dtype, out_compute_dtype, mv_bn)
+        : std::optional<vulkan::StaticShaderId>{};
     auto matmul_id = gather_nvfp4_matmul_shader_id(
         compute_dtype, out_compute_dtype, large_n);
-    const bool shapes_ok = matvec_id.has_value() && matmul_id.has_value() &&
-        group_size_ == 16 && bits_ == 4 && w.dtype() == uint32 &&
-        scales.dtype() == uint8 &&
+    const bool shapes_ok =
+        (matvec_rhs_id.has_value() || matvec_id.has_value()) &&
+        matmul_id.has_value() && group_size_ == 16 && bits_ == 4 &&
+        w.dtype() == uint32 && scales.dtype() == uint8 &&
         rows == static_cast<uint32_t>(x_work.shape(-2)) &&
         cols == static_cast<uint32_t>(w.shape(-2)) &&
         static_cast<uint32_t>(w.shape(-1) * 8) == k &&
@@ -2842,12 +2872,19 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             static_cast<uint32_t>(w.strides(-3));
         push_constants.group_size = static_cast<uint32_t>(group_size_);
         push_constants.num_groups = num_groups;
+        push_constants.batches = batches;
 
-        // Decode: BN=1 keeps enough workgroups. Prefill MoE: multi-col.
-        // Prefill mm: BM=32 tiled gather.
-        const auto shader_id = use_matvec ? *matvec_id : *matmul_id;
+        // Sorted MoE prefill: BM=2 W-reuse matvec. Else multi-col / tiled mm.
+        const bool use_rhs = matvec_rhs_id.has_value();
+        const auto shader_id = use_rhs ? *matvec_rhs_id
+            : (use_matvec ? *matvec_id : *matmul_id);
         const uint32_t mm_bn = large_n ? 32u : 16u;
-        const std::array<uint32_t, 3> grid = use_matvec
+        const std::array<uint32_t, 3> grid = use_rhs
+            ? std::array<uint32_t, 3>{
+                  (cols + mv_bn - 1u) / mv_bn,
+                  rows,
+                  (batches + kRhsBm - 1u) / kRhsBm}
+            : use_matvec
             ? std::array<uint32_t, 3>{
                   (cols + mv_bn - 1u) / mv_bn, rows, batches}
             : std::array<uint32_t, 3>{

@@ -58,6 +58,7 @@ layout(push_constant) uniform parameter {
   uint w_matrix_stride_words;
   uint group_size;
   uint num_groups;
+  uint batches;
 } p;
 
 #ifndef MLX_BM

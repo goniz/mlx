@@ -714,6 +714,7 @@ struct GatherNvfp4MatmulPushConstants {
   uint32_t w_matrix_stride_words;
   uint32_t group_size;
   uint32_t num_groups;
+  uint32_t batches;
 };
 
 struct Nvfp4DenseMatmulPushConstants {

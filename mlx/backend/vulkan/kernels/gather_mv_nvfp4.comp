@@ -90,7 +90,59 @@ void main() {
     acc[c] = 0.0f;
   }
 
-  if ((p.K & 7u) == 0u && p.group_size == 16u) {
+  if ((p.K & 15u) == 0u && p.group_size == 16u) {
+    // One scale covers 16 K elems = two NVFP4 packs. Cut loop trips vs pack-8.
+    const uint pairs = p.K >> 4u;
+    const bool full_n = (col0 + MLX_BN) <= p.cols;
+    for (uint g = tid; g < pairs; g += BLOCK_SIZE) {
+      const uint k = g << 4u;
+      const uint pidx = g << 1u;
+      float xv[16];
+      [[unroll]] for (uint n = 0u; n < 16u; ++n) {
+        xv[n] = TO_FLOAT_TYPE(data_x[x_row_base + k + n]);
+      }
+      if (full_n) {
+        [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+          const uint col = col0 + c;
+          const uint w_row_base = w_matrix_base + col * p.packed_row_words;
+          const uint scale_row_base =
+              scale_matrix_base + col * p.scale_row_stride;
+          const uint packed0 = data_w[w_row_base + pidx];
+          const uint packed1 = data_w[w_row_base + pidx + 1u];
+          const float scale =
+              nvfp4_fp8_e4m3_to_fp32(data_scales[scale_row_base + g]);
+          [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+            acc[c] = fma(xv[n], nvfp4_decode_nibble(packed0, n, scale), acc[c]);
+          }
+          [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+            acc[c] = fma(
+                xv[n + 8u], nvfp4_decode_nibble(packed1, n, scale), acc[c]);
+          }
+        }
+      } else {
+        [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+          const uint col = col0 + c;
+          if (col < p.cols) {
+            const uint w_row_base = w_matrix_base + col * p.packed_row_words;
+            const uint scale_row_base =
+                scale_matrix_base + col * p.scale_row_stride;
+            const uint packed0 = data_w[w_row_base + pidx];
+            const uint packed1 = data_w[w_row_base + pidx + 1u];
+            const float scale =
+                nvfp4_fp8_e4m3_to_fp32(data_scales[scale_row_base + g]);
+            [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+              acc[c] =
+                  fma(xv[n], nvfp4_decode_nibble(packed0, n, scale), acc[c]);
+            }
+            [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+              acc[c] = fma(
+                  xv[n + 8u], nvfp4_decode_nibble(packed1, n, scale), acc[c]);
+            }
+          }
+        }
+      }
+    }
+  } else if ((p.K & 7u) == 0u && p.group_size == 16u) {
     const uint packs = p.K >> 3u;
     for (uint pidx = tid; pidx < packs; pidx += BLOCK_SIZE) {
       const uint k = pidx << 3u;

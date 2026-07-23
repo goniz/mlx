@@ -2816,9 +2816,14 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             uint64_t{rows} * uint64_t{batches},
             uint64_t{std::numeric_limits<uint32_t>::max()}));
     const uint32_t mv_bn = nvfp4_matvec_bn(cols, mv_work_items);
+    // Guard zero matrix dims before batch/expert divides; empty gathers skip
+    // dispatch via out_work.size() != 0 below.
+    const auto x_matrix_elems = x_work.shape(-2) * x_work.shape(-1);
+    const auto w_matrix_elems = w.shape(-2) * w.shape(-1);
     const auto x_batch_count =
-        x_work.size() / (x_work.shape(-2) * x_work.shape(-1));
-    const auto expert_count = w.size() / (w.shape(-2) * w.shape(-1));
+        x_matrix_elems == 0 ? 0 : x_work.size() / x_matrix_elems;
+    const auto expert_count =
+        w_matrix_elems == 0 ? 0 : w.size() / w_matrix_elems;
     // Sorted MoE prefill: tile 2 batches so consecutive same-expert tokens
     // reuse dequantized W (BM=2 keeps register pressure low).
     constexpr uint32_t kRhsBm = 2u;

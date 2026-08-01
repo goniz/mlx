@@ -2228,6 +2228,164 @@ void process_shaders() {
   string_to_spv("dequant_nvfp4_f32", "dequant_nvfp4.comp", {});
   string_to_spv("quantize_nvfp4_f32", "quantize_nvfp4.comp", {});
   string_to_spv("mul_mm_nvfp4_f32", "mul_mm_nvfp4.comp", {});
+  string_to_spv(
+      "mul_mv_nvfp4_f32",
+      "mul_mv_nvfp4.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}, {"MLX_BN", "1"}});
+  string_to_spv(
+      "mul_mv_nvfp4_f32_n8",
+      "mul_mv_nvfp4.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}, {"MLX_BN", "8"}});
+  string_to_spv(
+      "mul_mv_nvfp4_f32_n16",
+      "mul_mv_nvfp4.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}, {"MLX_BN", "16"}});
+  string_to_spv(
+      "mul_mv_nvfp4_bf16_bf16",
+      "mul_mv_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "1"}});
+  string_to_spv(
+      "mul_mv_nvfp4_bf16_bf16_n8",
+      "mul_mv_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "8"}});
+  string_to_spv(
+      "mul_mv_nvfp4_bf16_bf16_n16",
+      "mul_mv_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "16"}});
+  string_to_spv(
+      "mul_mm_nvfp4_dense_f32",
+      "mul_mm_nvfp4_dense.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "mul_mm_nvfp4_dense_f32_n32",
+      "mul_mm_nvfp4_dense.comp",
+      {{"B_TYPE", "float"},
+       {"D_TYPE", "float"},
+       {"MLX_BN", "32"},
+       {"MLX_TN", "4"}});
+  string_to_spv(
+      "mul_mm_nvfp4_dense_bf16_bf16",
+      "mul_mm_nvfp4_dense.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
+  string_to_spv(
+      "mul_mm_nvfp4_dense_bf16_bf16_n32",
+      "mul_mm_nvfp4_dense.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "32"},
+       {"MLX_TN", "4"}});
+  string_to_spv(
+      "gather_mm_nvfp4_f32",
+      "gather_mm_nvfp4.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "gather_mm_nvfp4_f32_n32",
+      "gather_mm_nvfp4.comp",
+      {{"B_TYPE", "float"},
+       {"D_TYPE", "float"},
+       {"MLX_BN", "32"},
+       {"MLX_TN", "4"}});
+  string_to_spv(
+      "gather_mm_nvfp4_bf16_bf16",
+      "gather_mm_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
+  string_to_spv(
+      "gather_mm_nvfp4_bf16_bf16_n32",
+      "gather_mm_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "32"},
+       {"MLX_TN", "4"}});
+  string_to_spv(
+      "gather_mv_nvfp4_f32",
+      "gather_mv_nvfp4.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}, {"MLX_BN", "1"}});
+  string_to_spv(
+      "gather_mv_nvfp4_f32_n8",
+      "gather_mv_nvfp4.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}, {"MLX_BN", "8"}});
+  string_to_spv(
+      "gather_mv_nvfp4_f32_n16",
+      "gather_mv_nvfp4.comp",
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}, {"MLX_BN", "16"}});
+  string_to_spv(
+      "gather_mv_nvfp4_bf16_bf16",
+      "gather_mv_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "1"}});
+  string_to_spv(
+      "gather_mv_nvfp4_bf16_bf16_n8",
+      "gather_mv_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "8"}});
+  string_to_spv(
+      "gather_mv_nvfp4_bf16_bf16_n16",
+      "gather_mv_nvfp4.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BN", "16"}});
+  string_to_spv(
+      "gather_mv_nvfp4_rhs_f32_bm2_n16",
+      "gather_mv_nvfp4_rhs.comp",
+      {{"B_TYPE", "float"},
+       {"D_TYPE", "float"},
+       {"MLX_BM", "2"},
+       {"MLX_BN", "16"}});
+  string_to_spv(
+      "gather_mv_nvfp4_rhs_f32_bm2_n8",
+      "gather_mv_nvfp4_rhs.comp",
+      {{"B_TYPE", "float"},
+       {"D_TYPE", "float"},
+       {"MLX_BM", "2"},
+       {"MLX_BN", "8"}});
+  string_to_spv(
+      "gather_mv_nvfp4_rhs_bf16_bf16_bm2_n16",
+      "gather_mv_nvfp4_rhs.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BM", "2"},
+       {"MLX_BN", "16"}});
+  string_to_spv(
+      "gather_mv_nvfp4_rhs_bf16_bf16_bm2_n8",
+      "gather_mv_nvfp4_rhs.comp",
+      {{"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"},
+       {"MLX_BM", "2"},
+       {"MLX_BN", "8"}});
 
   string_to_spv(
       "fused_affine_matmul_f32_f32",

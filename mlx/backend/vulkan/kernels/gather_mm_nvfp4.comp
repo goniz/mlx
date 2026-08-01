@@ -1,0 +1,201 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.glsl"
+#include "nvfp4_common.glsl"
+
+#if !defined(B_TYPE)
+#define B_TYPE float
+#endif
+#if !defined(D_TYPE)
+#define D_TYPE float
+#endif
+#if !defined(TO_FLOAT_TYPE)
+#define TO_FLOAT_TYPE float
+#endif
+#if !defined(FROM_FLOAT_TYPE)
+#define FROM_FLOAT_TYPE
+#endif
+
+// Gather NVFP4 prefill matmul (transpose weights): one batch per workgroup Z,
+// shared X+W tiles with register blocking.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W {
+  uint data_w[];
+};
+layout(binding = 1) readonly buffer SCALES {
+  uint8_t data_scales[];
+};
+layout(binding = 2) readonly buffer X {
+  B_TYPE data_x[];
+};
+layout(binding = 3) readonly buffer LHS_INDICES {
+  uint data_lhs_indices[];
+};
+layout(binding = 4) readonly buffer RHS_INDICES {
+  uint data_rhs_indices[];
+};
+layout(binding = 5) writeonly buffer OUT {
+  D_TYPE data_out[];
+};
+
+layout(push_constant) uniform parameter {
+  uint rows;
+  uint cols;
+  uint K;
+  uint packed_row_words;
+  uint x_batch_stride;
+  uint x_row_stride;
+  uint out_batch_stride;
+  uint out_row_stride;
+  uint scale_matrix_stride;
+  uint scale_row_stride;
+  uint w_matrix_stride_words;
+  uint group_size;
+  uint num_groups;
+  uint batches;
+} p;
+
+#ifndef MLX_BM
+#define MLX_BM 32
+#endif
+#ifndef MLX_BN
+#define MLX_BN 16
+#endif
+#ifndef MLX_BK
+#define MLX_BK 32
+#endif
+#ifndef MLX_TM
+#define MLX_TM 4
+#endif
+#ifndef MLX_TN
+#define MLX_TN 2
+#endif
+
+const uint BM = MLX_BM;
+const uint BN = MLX_BN;
+const uint BK = MLX_BK;
+const uint TM = MLX_TM;
+const uint TN = MLX_TN;
+
+shared float xs[BM][BK];
+shared float ws[BN][BK];
+
+void main() {
+  const uint lx = gl_LocalInvocationID.x;
+  const uint ly = gl_LocalInvocationID.y;
+  const uint batch = gl_WorkGroupID.z;
+  const uint row0 = gl_WorkGroupID.y * BM + ly * TM;
+  const uint col0 = gl_WorkGroupID.x * BN + lx * TN;
+  const uint linear = ly * gl_WorkGroupSize.x + lx;
+  const uint thread_count = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+
+  const uint lhs_batch = data_lhs_indices[batch];
+  const uint rhs_batch = data_rhs_indices[batch];
+  const uint x_batch_base = lhs_batch * p.x_batch_stride;
+  const uint w_matrix_base = rhs_batch * p.w_matrix_stride_words;
+  const uint scale_matrix_base = rhs_batch * p.scale_matrix_stride;
+
+  float acc[TM][TN];
+  [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+    [[unroll]] for (uint nc = 0u; nc < TN; ++nc) {
+      acc[mr][nc] = 0.0f;
+    }
+  }
+
+  for (uint kb = 0u; kb < p.K; kb += BK) {
+    for (uint i = linear; i < BM * BK; i += thread_count) {
+      const uint r = i / BK;
+      const uint kk = i - r * BK;
+      const uint src_row = gl_WorkGroupID.y * BM + r;
+      const uint src_k = kb + kk;
+      xs[r][kk] = (src_row < p.rows && src_k < p.K)
+          ? TO_FLOAT_TYPE(
+                data_x[x_batch_base + src_row * p.x_row_stride + src_k])
+          : 0.0f;
+    }
+
+    for (uint i = linear; i < BN * (BK / 8u); i += thread_count) {
+      const uint c = i / (BK / 8u);
+      const uint packed_k = i - c * (BK / 8u);
+      const uint src_col = gl_WorkGroupID.x * BN + c;
+      const uint src_k = kb + packed_k * 8u;
+      const uint kk = packed_k * 8u;
+      if (src_col < p.cols && src_k + 7u < p.K) {
+        const uint packed =
+            data_w[w_matrix_base + src_col * p.packed_row_words + (src_k >> 3u)];
+        const float scale = nvfp4_fp8_e4m3_to_fp32(data_scales
+            [scale_matrix_base + src_col * p.scale_row_stride + (src_k >> 4u)]);
+        [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+          ws[c][kk + n] = nvfp4_decode_nibble(packed, n, scale);
+        }
+      } else {
+        [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+          float v = 0.0f;
+          const uint k = src_k + n;
+          if (src_col < p.cols && k < p.K) {
+            const uint packed = data_w
+                [w_matrix_base + src_col * p.packed_row_words + (k >> 3u)];
+            const float scale = nvfp4_fp8_e4m3_to_fp32(data_scales
+                [scale_matrix_base + src_col * p.scale_row_stride +
+                 (k >> 4u)]);
+            v = nvfp4_decode_nibble(packed, k & 7u, scale);
+          }
+          ws[c][kk + n] = v;
+        }
+      }
+    }
+    barrier();
+
+    for (uint kk = 0u; kk < BK; ++kk) {
+#if MLX_TN == 2
+      const float w0 = ws[lx * TN + 0u][kk];
+      const float w1 = ws[lx * TN + 1u][kk];
+      [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+        const float x = xs[ly * TM + mr][kk];
+        acc[mr][0] = fma(x, w0, acc[mr][0]);
+        acc[mr][1] = fma(x, w1, acc[mr][1]);
+      }
+#elif MLX_TN == 4
+      const float w0 = ws[lx * TN + 0u][kk];
+      const float w1 = ws[lx * TN + 1u][kk];
+      const float w2 = ws[lx * TN + 2u][kk];
+      const float w3 = ws[lx * TN + 3u][kk];
+      [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+        const float x = xs[ly * TM + mr][kk];
+        acc[mr][0] = fma(x, w0, acc[mr][0]);
+        acc[mr][1] = fma(x, w1, acc[mr][1]);
+        acc[mr][2] = fma(x, w2, acc[mr][2]);
+        acc[mr][3] = fma(x, w3, acc[mr][3]);
+      }
+#else
+      [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+        const float x = xs[ly * TM + mr][kk];
+        [[unroll]] for (uint nc = 0u; nc < TN; ++nc) {
+          acc[mr][nc] = fma(x, ws[lx * TN + nc][kk], acc[mr][nc]);
+        }
+      }
+#endif
+    }
+    barrier();
+  }
+
+  [[unroll]] for (uint mr = 0u; mr < TM; ++mr) {
+    const uint row = row0 + mr;
+    if (row >= p.rows) {
+      continue;
+    }
+    [[unroll]] for (uint nc = 0u; nc < TN; ++nc) {
+      const uint col = col0 + nc;
+      if (col < p.cols) {
+        data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
+            D_TYPE(FROM_FLOAT_TYPE(acc[mr][nc]));
+      }
+    }
+  }
+}

@@ -1,0 +1,261 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "types.glsl"
+#include "nvfp4_common.glsl"
+
+#if !defined(B_TYPE)
+#define B_TYPE float
+#endif
+#if !defined(D_TYPE)
+#define D_TYPE float
+#endif
+#if !defined(TO_FLOAT_TYPE)
+#define TO_FLOAT_TYPE float
+#endif
+#if !defined(FROM_FLOAT_TYPE)
+#define FROM_FLOAT_TYPE
+#endif
+
+// Sorted-RHS NVFP4 gather matvec (BM=2): pair consecutive MoE assignments so
+// same-expert tokens share one W dequant. Explicit pair path avoids dynamic
+// BM indexing / large shared scratch that kills occupancy.
+#define BLOCK_SIZE 64
+#ifndef MLX_BN
+#define MLX_BN 16
+#endif
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W {
+  uint data_w[];
+};
+layout(binding = 1) readonly buffer SCALES {
+  uint8_t data_scales[];
+};
+layout(binding = 2) readonly buffer X {
+  B_TYPE data_x[];
+};
+layout(binding = 3) readonly buffer LHS_INDICES {
+  uint data_lhs_indices[];
+};
+layout(binding = 4) readonly buffer RHS_INDICES {
+  uint data_rhs_indices[];
+};
+layout(binding = 5) writeonly buffer OUT {
+  D_TYPE data_out[];
+};
+
+layout(push_constant) uniform parameter {
+  uint rows;
+  uint cols;
+  uint K;
+  uint packed_row_words;
+  uint x_batch_stride;
+  uint x_row_stride;
+  uint out_batch_stride;
+  uint out_row_stride;
+  uint scale_matrix_stride;
+  uint scale_row_stride;
+  uint w_matrix_stride_words;
+  uint group_size;
+  uint num_groups;
+  uint batches;
+} p;
+
+shared float partial[BLOCK_SIZE];
+
+void main() {
+  const uint col0 = gl_WorkGroupID.x * MLX_BN;
+  const uint row = gl_WorkGroupID.y;
+  const uint batch0 = gl_WorkGroupID.z * 2u;
+  const uint tid = gl_LocalInvocationID.x;
+
+  if (row >= p.rows || col0 >= p.cols || batch0 >= p.batches) {
+    return;
+  }
+
+  const bool has1 = (batch0 + 1u) < p.batches;
+  const uint batch1 = batch0 + 1u;
+  const uint expert0 = data_rhs_indices[batch0];
+  const uint expert1 = has1 ? data_rhs_indices[batch1] : 0xffffffffu;
+  const uint x0 = data_lhs_indices[batch0] * p.x_batch_stride +
+      row * p.x_row_stride;
+  const uint x1 = has1 ? (data_lhs_indices[batch1] * p.x_batch_stride +
+                               row * p.x_row_stride)
+                       : 0u;
+  const bool share = has1 && (expert0 == expert1);
+  const bool full_n = (col0 + MLX_BN) <= p.cols;
+
+  float acc0[MLX_BN];
+  float acc1[MLX_BN];
+  [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+    acc0[c] = 0.0f;
+    acc1[c] = 0.0f;
+  }
+
+  if ((p.K & 15u) == 0u && p.group_size == 16u) {
+    const uint pairs = p.K >> 4u;
+    if (share) {
+      const uint w_matrix_base = expert0 * p.w_matrix_stride_words;
+      const uint scale_matrix_base = expert0 * p.scale_matrix_stride;
+      for (uint g = tid; g < pairs; g += BLOCK_SIZE) {
+        const uint k = g << 4u;
+        const uint pidx = g << 1u;
+        float xv0[16];
+        float xv1[16];
+        [[unroll]] for (uint n = 0u; n < 16u; ++n) {
+          xv0[n] = TO_FLOAT_TYPE(data_x[x0 + k + n]);
+          xv1[n] = TO_FLOAT_TYPE(data_x[x1 + k + n]);
+        }
+        [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+          const uint col = col0 + c;
+          if (full_n || col < p.cols) {
+            const uint w_row_base = w_matrix_base + col * p.packed_row_words;
+            const uint scale_row_base =
+                scale_matrix_base + col * p.scale_row_stride;
+            const uint packed0 = data_w[w_row_base + pidx];
+            const uint packed1 = data_w[w_row_base + pidx + 1u];
+            const float scale =
+                nvfp4_fp8_e4m3_to_fp32(data_scales[scale_row_base + g]);
+            [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+              const float w0 = nvfp4_decode_nibble(packed0, n, scale);
+              const float w1 = nvfp4_decode_nibble(packed1, n, scale);
+              acc0[c] = fma(xv0[n], w0, acc0[c]);
+              acc1[c] = fma(xv1[n], w0, acc1[c]);
+              acc0[c] = fma(xv0[n + 8u], w1, acc0[c]);
+              acc1[c] = fma(xv1[n + 8u], w1, acc1[c]);
+            }
+          }
+        }
+      }
+    } else {
+      // Divergent experts (or trailing singleton): two independent matvecs.
+      for (uint pass = 0u; pass < 2u; ++pass) {
+        if (pass == 1u && !has1) {
+          break;
+        }
+        const uint expert = (pass == 0u) ? expert0 : expert1;
+        const uint x_base = (pass == 0u) ? x0 : x1;
+        const uint w_matrix_base = expert * p.w_matrix_stride_words;
+        const uint scale_matrix_base = expert * p.scale_matrix_stride;
+        for (uint g = tid; g < pairs; g += BLOCK_SIZE) {
+          const uint k = g << 4u;
+          const uint pidx = g << 1u;
+          float xv[16];
+          [[unroll]] for (uint n = 0u; n < 16u; ++n) {
+            xv[n] = TO_FLOAT_TYPE(data_x[x_base + k + n]);
+          }
+          [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+            const uint col = col0 + c;
+            if (full_n || col < p.cols) {
+              const uint w_row_base = w_matrix_base + col * p.packed_row_words;
+              const uint scale_row_base =
+                  scale_matrix_base + col * p.scale_row_stride;
+              const uint packed0 = data_w[w_row_base + pidx];
+              const uint packed1 = data_w[w_row_base + pidx + 1u];
+              const float scale =
+                  nvfp4_fp8_e4m3_to_fp32(data_scales[scale_row_base + g]);
+              float a = (pass == 0u) ? acc0[c] : acc1[c];
+              [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+                a = fma(xv[n], nvfp4_decode_nibble(packed0, n, scale), a);
+              }
+              [[unroll]] for (uint n = 0u; n < 8u; ++n) {
+                a = fma(xv[n + 8u], nvfp4_decode_nibble(packed1, n, scale), a);
+              }
+              if (pass == 0u) {
+                acc0[c] = a;
+              } else {
+                acc1[c] = a;
+              }
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // Generic fallback (non pack-16): one batch at a time.
+    for (uint pass = 0u; pass < 2u; ++pass) {
+      if (pass == 1u && !has1) {
+        break;
+      }
+      const uint expert = (pass == 0u) ? expert0 : expert1;
+      const uint x_base = (pass == 0u) ? x0 : x1;
+      const uint w_matrix_base = expert * p.w_matrix_stride_words;
+      const uint scale_matrix_base = expert * p.scale_matrix_stride;
+      for (uint k = tid; k < p.K; k += BLOCK_SIZE) {
+        const float xv = TO_FLOAT_TYPE(data_x[x_base + k]);
+        [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+          const uint col = col0 + c;
+          if (col < p.cols) {
+            const uint packed = data_w
+                [w_matrix_base + col * p.packed_row_words + (k >> 3u)];
+            const uint q = (packed >> ((k & 7u) * 4u)) & 0xFu;
+            const float scale = nvfp4_fp8_e4m3_to_fp32(data_scales
+                [scale_matrix_base + col * p.scale_row_stride + (k >> 4u)]);
+            const float wv = nvfp4_lut(q) * scale;
+            if (pass == 0u) {
+              acc0[c] = fma(xv, wv, acc0[c]);
+            } else {
+              acc1[c] = fma(xv, wv, acc1[c]);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (gl_SubgroupSize == BLOCK_SIZE && gl_NumSubgroups == 1u) {
+    [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+      acc0[c] = subgroupAdd(acc0[c]);
+      if (has1) {
+        acc1[c] = subgroupAdd(acc1[c]);
+      }
+    }
+    if (tid == 0u) {
+      [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+        const uint col = col0 + c;
+        if (col < p.cols) {
+          data_out[batch0 * p.out_batch_stride + row * p.out_row_stride + col] =
+              D_TYPE(FROM_FLOAT_TYPE(acc0[c]));
+          if (has1) {
+            data_out
+                [batch1 * p.out_batch_stride + row * p.out_row_stride + col] =
+                    D_TYPE(FROM_FLOAT_TYPE(acc1[c]));
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // Slow fallback: reduce one accumulator at a time.
+  for (uint pass = 0u; pass < 2u; ++pass) {
+    if (pass == 1u && !has1) {
+      break;
+    }
+    const uint batch = (pass == 0u) ? batch0 : batch1;
+    [[unroll]] for (uint c = 0u; c < MLX_BN; ++c) {
+      const uint col = col0 + c;
+      partial[tid] = (pass == 0u) ? acc0[c] : acc1[c];
+      barrier();
+      for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+          partial[tid] += partial[tid + stride];
+        }
+        barrier();
+      }
+      if (tid == 0u && col < p.cols) {
+        data_out[batch * p.out_batch_stride + row * p.out_row_stride + col] =
+            D_TYPE(FROM_FLOAT_TYPE(partial[0]));
+      }
+      barrier();
+    }
+  }
+}

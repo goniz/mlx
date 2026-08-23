@@ -1105,6 +1105,19 @@ void VulkanContext::init() {
     this->device_id_ = device_id;
     this->architecture_ = architecture;
     this->shader_core_count_ = shader_core_count;
+    // Mesa honeykrisp has high per-submit cost: prefer long decode recordings
+    // on Apple GPUs (byte budget bounded in decode_max_total_bytes()).
+    set_decode_batch_default(architecture == vulkan::GpuArchitecture::Apple);
+    if (bf16_capability_debug_enabled()) {
+      std::cerr << "[vulkan::caps] ext_coopmat=" << has_cooperative_matrix_ext
+                << " feat_coopmat="
+                << supported_cooperative_matrix.cooperativeMatrix
+                << " coopmat=" << cooperative_matrix_supported_
+                << " f16acc=" << this->coopmat_f16acc_supported_
+                << " fa_f32acc="
+                << this->coopmat_flash_attention_f32acc_supported_
+                << " subgroup_full=" << subgroup_require_full_support << "\n";
+    }
     initialized_ = true;
   } catch (...) {
     // Clean up partially initialized resources on failure

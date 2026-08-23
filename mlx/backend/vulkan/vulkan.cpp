@@ -218,6 +218,10 @@ GpuArchitecture classify_gpu_architecture(
     case 0x5143u:
       return GpuArchitecture::Qualcomm;
     default:
+      if (device_name_contains(device_name, "Apple")) {
+        // Mesa honeykrisp reports a non-PCI vendorID on Apple Silicon.
+        return GpuArchitecture::Apple;
+      }
       return GpuArchitecture::Unknown;
   }
 }

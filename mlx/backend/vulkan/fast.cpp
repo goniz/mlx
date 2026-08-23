@@ -804,21 +804,51 @@ FlashAttentionTuningParams get_flash_attention_tuning_params_scalar(
       result.block_rows = 12u;
     }
   }
-  if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_PARAMS")) {
+  static const std::optional<std::array<uint32_t, 5>> fa_env_params = []()
+      -> std::optional<std::array<uint32_t, 5>> {
+    const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_PARAMS");
+    if (env == nullptr) {
+      return std::nullopt;
+    }
     std::istringstream iss(env);
     std::string item;
-    uint32_t vals[5];
+    std::array<uint32_t, 5> vals{};
     int idx = 0;
     while (idx < 5 && std::getline(iss, item, ',')) {
       vals[idx++] = static_cast<uint32_t>(std::stoul(item));
     }
-    if (idx == 5) {
-      result.block_rows = vals[0];
-      result.block_cols = vals[1];
-      result.row_split = vals[2];
-      result.workgroup_size = vals[3];
-      result.d_split = vals[4];
+
+    // The scalar kernel silently corrupts output outside its validated
+    // envelope (goniz/mlx-vulkan#70): block_rows must be a multiple of 4,
+    // workgroup_size must equal subgroup_size * 4, and non-power-of-two
+    // d_split values are both wrong-shaped and slow. Reject anything else.
+    const uint32_t subgroup_x4 =
+        std::max(vulkan::VulkanContext::get().subgroup_size(), 32u) * 4u;
+    const bool power_of_two_ds = vals[4] != 0u &&
+        (vals[4] & (vals[4] - 1u)) == 0u;
+    const bool in_validated_envelope = idx == 5 && vals[0] % 4u == 0u &&
+        vals[0] >= 4u && (vals[1] == 16u || vals[1] == 32u ||
+                          vals[1] == 64u) &&
+        (vals[2] == 1u || vals[2] == 2u || vals[2] == 4u) &&
+        vals[3] == subgroup_x4 && power_of_two_ds && vals[4] <= 8u;
+    if (!in_validated_envelope) {
+      std::cerr << "[vulkan::fast] MLX_VULKAN_FLASH_ATTN_PARAMS rejected: '"
+                << env << "' is outside the numerically validated envelope "
+                           "(block_rows%4==0 and >=4; block_cols in "
+                           "{16,32,64}; row_split in {1,2,4}; "
+                           "workgroup_size==" << subgroup_x4 <<
+                    "; d_split a power of two <= 8). See "
+                    "goniz/mlx-vulkan#70.\n";
+      return std::nullopt;
     }
+    return vals;
+  }();
+  if (fa_env_params.has_value()) {
+    result.block_rows = (*fa_env_params)[0];
+    result.block_cols = (*fa_env_params)[1];
+    result.row_split = (*fa_env_params)[2];
+    result.workgroup_size = (*fa_env_params)[3];
+    result.d_split = (*fa_env_params)[4];
   }
 
   return result;

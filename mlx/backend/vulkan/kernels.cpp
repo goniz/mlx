@@ -124,6 +124,29 @@ std::vector<uint32_t> matmul_specialization_constants(
     if (parsed.size() != kDefaultSpec.size()) {
       return std::vector<uint32_t>{};
     }
+
+    // The scalar kernel produces silently wrong results outside its
+    // validated tiling envelope (see goniz/mlx-vulkan#70): BK < 4 breaks
+    // load-address divisors, and warp/workgroup/tile ratios outside the
+    // measured set corrupt output (e.g. BM=64 under-covered by one warp,
+    // WM/WN > subgroup size). Restrict the env override to shapes that
+    // were numerically verified; extend the list only with fresh numerics
+    // gate results.
+    const bool in_validated_envelope =
+        parsed[10] == 32u && parsed[0] == 32u && parsed[1] == 32u &&
+        parsed[2] == 32u && parsed[3] >= 4u && parsed[3] <= 32u &&
+        parsed[3] % 4u == 0u && parsed[4] == 32u && parsed[5] == 32u &&
+        parsed[6] == 2u && (parsed[7] == 2u || parsed[7] == 4u) &&
+        (parsed[8] == 2u || parsed[8] == 4u) && parsed[9] == 1u;
+    if (!in_validated_envelope) {
+      std::cerr
+          << "[vulkan::kernels] MLX_VULKAN_MATMUL_SPEC rejected: shape "
+             "outside the numerically validated envelope "
+             "(BLOCK,BM,BN must be 32; WM,WN must be 32; WMITER must be 2; "
+             "TK must be 1; WARP must be 32; BK in {4,8,16,32}; "
+             "TM,TN in {2,4}). See goniz/mlx-vulkan#70.\n";
+      return std::vector<uint32_t>{};
+    }
     return parsed;
   }();
   if (!kEnvSpec.empty()) {

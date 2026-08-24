@@ -346,6 +346,13 @@ constexpr std::array<uint32_t, 11> kSafeMatmulSpec =
 constexpr std::array<uint32_t, 11> kLane64MatmulSpec =
     {64, 32, 32, 16, 32, 32, 2, 2, 2, 1, 64};
 
+// Apple AGX (M-series via Mesa honeykrisp): scalar mul_mm prefers a shallow
+// K slab (BK=4) with a 4-row thread tile for occupancy. Measured on M1 Pro
+// Qwen3-0.6B prefill shapes: 1117 GFLOPS avg vs 627 for kSafeMatmulSpec
+// (+78%). BK<=2 is numerically broken in the scalar shader (rel err ~400).
+constexpr std::array<uint32_t, 11> kAppleMatmulSpec =
+    {32, 32, 32, 4, 32, 32, 2, 4, 2, 1, 32};
+
 // Cooperative-matrix warptiles (TM/TN/TK must match 16x16x16 subgroup mats).
 // On Strix Halo / RDNA3.5 the llama.cpp "large" 128x128/256-thread tile is
 // ~10x slower than this medium tile for dense F16 GEMMs; keep one known-good
@@ -626,7 +633,6 @@ MatmulProfile matmul_profile_for_device() {
             {kSafeMatmulSpec, 4096}}},
       };
     case vulkan::GpuArchitecture::Intel:
-    case vulkan::GpuArchitecture::Apple:
     case vulkan::GpuArchitecture::Qualcomm:
       return {
           32,
@@ -636,6 +642,16 @@ MatmulProfile matmul_profile_for_device() {
           {{{kSafeMatmulSpec, 512},
             {kSafeMatmulSpec, 1024},
             {kSafeMatmulSpec, 2048}}},
+      };
+    case vulkan::GpuArchitecture::Apple:
+      return {
+          32,
+          {{{kAppleMatmulSpec, 768},
+            {kAppleMatmulSpec, 1536},
+            {kAppleMatmulSpec, 3072}}},
+          {{{kAppleMatmulSpec, 512},
+            {kAppleMatmulSpec, 1024},
+            {kAppleMatmulSpec, 2048}}},
       };
     case vulkan::GpuArchitecture::AmdCdna:
     case vulkan::GpuArchitecture::Unknown:

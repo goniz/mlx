@@ -788,6 +788,39 @@ FlashAttentionTuningParams get_flash_attention_tuning_params_scalar(
     result.block_rows = std::max(result.block_rows / 2u, 1u);
   }
 
+
+  if (architecture == vulkan::GpuArchitecture::Apple) {
+    // M1 Pro / honeykrisp measurements (Qwen3-0.6B FA shape Hq=16, Hkv=8,
+    // D in {64,128}, S <= 4096): d_split 4 beats 8 by ~65-70% TFLOPS, and
+    // block_rows 12 beats 8 by ~10% when there are enough query rows.
+    // The scalar kernel is numerically correct only for block_rows that
+    // are multiples of 4 (6/10/14 produce garbage); d_split values other
+    // than powers of two are also slow.
+    if (result.d_split > 4u) {
+      result.d_split = 4u;
+    }
+    if (result.row_split != 1u && n_rows >= 12u &&
+        result.block_rows == 8u) {
+      result.block_rows = 12u;
+    }
+  }
+  if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_PARAMS")) {
+    std::istringstream iss(env);
+    std::string item;
+    uint32_t vals[5];
+    int idx = 0;
+    while (idx < 5 && std::getline(iss, item, ',')) {
+      vals[idx++] = static_cast<uint32_t>(std::stoul(item));
+    }
+    if (idx == 5) {
+      result.block_rows = vals[0];
+      result.block_cols = vals[1];
+      result.row_split = vals[2];
+      result.workgroup_size = vals[3];
+      result.d_split = vals[4];
+    }
+  }
+
   return result;
 }
 

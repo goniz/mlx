@@ -1108,6 +1108,7 @@ void VulkanContext::init() {
     // Mesa honeykrisp has high per-submit cost: prefer long decode recordings
     // on Apple GPUs (byte budget bounded in decode_max_total_bytes()).
     set_decode_batch_default(architecture == vulkan::GpuArchitecture::Apple);
+    // Second MLX_VULKAN_DEBUG_CAPS line (bf16 probe may print earlier).
     if (bf16_capability_debug_enabled()) {
       std::cerr << "[vulkan::caps] ext_coopmat=" << has_cooperative_matrix_ext
                 << " feat_coopmat="

@@ -217,21 +217,25 @@ bool trace_sync_enabled() {
   return enabled;
 }
 
-namespace {
 // Decode-batching default for devices where long recordings measurably win
 // (Mesa honeykrisp: high per-submit cost). Set once from VulkanContext init.
 std::atomic<bool> s_decode_batch_default{false};
-} // namespace
 
-bool decode_batch_enabled() {
-  // Env tri-state: unset -> device default; "0" -> force off; other -> on.
-  static const int env_mode = []() {
+// MLX_VULKAN_DECODE_BATCH tri-state: unset=0 (device default), "0"=-1 (force
+// off), any other value=1 (force on).
+int decode_batch_env_mode() {
+  static const int mode = []() {
     if (const char* env = std::getenv("MLX_VULKAN_DECODE_BATCH");
         env != nullptr) {
       return std::string(env) != "0" ? 1 : -1;
     }
     return 0;
   }();
+  return mode;
+}
+
+bool decode_batch_enabled() {
+  const int env_mode = decode_batch_env_mode();
   if (env_mode != 0) {
     return env_mode == 1;
   }
@@ -251,16 +255,24 @@ uint32_t decode_max_recorded_ops() {
 }
 
 uint64_t decode_max_total_bytes() {
-  if (const char* env = std::getenv("MLX_VULKAN_DECODE_MAX_TOTAL_BYTES");
-      env != nullptr) {
-    return std::max<uint64_t>(
-        1ull, static_cast<uint64_t>(std::strtoull(env, nullptr, 10)));
+  static const std::optional<uint64_t> env_override = []() -> std::optional<uint64_t> {
+    if (const char* env = std::getenv("MLX_VULKAN_DECODE_MAX_TOTAL_BYTES");
+        env != nullptr) {
+      return std::max<uint64_t>(
+          1ull, static_cast<uint64_t>(std::strtoull(env, nullptr, 10)));
+    }
+    return std::nullopt;
+  }();
+  if (env_override.has_value()) {
+    return *env_override;
   }
-  // Bounded budget when batching is enabled by default: keeps the submit
-  // reduction without the deferred-buffer memory growth measured on M1 Pro
-  // (+0.6-1.2 GB peak at the 128 MB budget).
-  return s_decode_batch_default.load(std::memory_order_relaxed) ? (32ull << 20)
-                                                                : (128ull << 20);
+  // 32 MB only for Apple device-default batching (env unset). Env force-on
+  // keeps the historical 128 MB opt-in budget.
+  if (decode_batch_env_mode() == 0 &&
+      s_decode_batch_default.load(std::memory_order_relaxed)) {
+    return 32ull << 20;
+  }
+  return 128ull << 20;
 }
 
 bool trace_batch_enabled() {
@@ -506,10 +518,10 @@ void ensure_host_readback_mirror(VulkanBuffer* buffer) {
 }
 
 } // namespace
+
 void set_decode_batch_default(bool enabled) {
   s_decode_batch_default.store(enabled, std::memory_order_relaxed);
 }
-
 
 // Stream data structure for Vulkan
 struct BufferAccessRange {

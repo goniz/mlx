@@ -131,11 +131,13 @@ std::vector<uint32_t> matmul_specialization_constants(
     // measured set corrupt output (e.g. BM=64 under-covered by one warp,
     // WM/WN > subgroup size). Restrict the env override to shapes that
     // were numerically verified; extend the list only with fresh numerics
-    // gate results.
+    // gate results. BK must be an explicit measured member — not just
+    // any multiple of 4 in [4, 32].
+    const bool bk_ok = parsed[3] == 4u || parsed[3] == 8u ||
+        parsed[3] == 16u || parsed[3] == 32u;
     const bool in_validated_envelope =
         parsed[10] == 32u && parsed[0] == 32u && parsed[1] == 32u &&
-        parsed[2] == 32u && parsed[3] >= 4u && parsed[3] <= 32u &&
-        parsed[3] % 4u == 0u && parsed[4] == 32u && parsed[5] == 32u &&
+        parsed[2] == 32u && bk_ok && parsed[4] == 32u && parsed[5] == 32u &&
         parsed[6] == 2u && (parsed[7] == 2u || parsed[7] == 4u) &&
         (parsed[8] == 2u || parsed[8] == 4u) && parsed[9] == 1u;
     if (!in_validated_envelope) {

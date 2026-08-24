@@ -821,23 +821,33 @@ FlashAttentionTuningParams get_flash_attention_tuning_params_scalar(
     // The scalar kernel silently corrupts output outside its validated
     // envelope (goniz/mlx-vulkan#70): block_rows must be a multiple of 4,
     // workgroup_size must equal subgroup_size * 4, and non-power-of-two
-    // d_split values are both wrong-shaped and slow. Reject anything else.
+    // d_split values are both wrong-shaped and slow. Also require the
+    // same block_cols % (wg/ds/rs) divisibility the host dispatch gate
+    // uses, so a bad override rejects loudly instead of quietly skipping
+    // the Vulkan FA path.
     const uint32_t subgroup_x4 =
         std::max(vulkan::VulkanContext::get().subgroup_size(), 32u) * 4u;
     const bool power_of_two_ds = vals[4] != 0u &&
         (vals[4] & (vals[4] - 1u)) == 0u;
+    const uint32_t cols_per_iter =
+        (idx == 5 && vals[2] != 0u && vals[4] != 0u) ? (vals[3] / vals[4] / vals[2])
+                                                     : 0u;
+    const bool tile_ok =
+        cols_per_iter != 0u && (vals[1] % cols_per_iter) == 0u;
     const bool in_validated_envelope = idx == 5 && vals[0] % 4u == 0u &&
         vals[0] >= 4u && (vals[1] == 16u || vals[1] == 32u ||
                           vals[1] == 64u) &&
         (vals[2] == 1u || vals[2] == 2u || vals[2] == 4u) &&
-        vals[3] == subgroup_x4 && power_of_two_ds && vals[4] <= 8u;
+        vals[3] == subgroup_x4 && power_of_two_ds && vals[4] <= 8u &&
+        tile_ok;
     if (!in_validated_envelope) {
       std::cerr << "[vulkan::fast] MLX_VULKAN_FLASH_ATTN_PARAMS rejected: '"
                 << env << "' is outside the numerically validated envelope "
                            "(block_rows%4==0 and >=4; block_cols in "
                            "{16,32,64}; row_split in {1,2,4}; "
                            "workgroup_size==" << subgroup_x4 <<
-                    "; d_split a power of two <= 8). See "
+                    "; d_split a power of two <= 8; "
+                    "block_cols % (wg/d_split/row_split) == 0). See "
                     "goniz/mlx-vulkan#70.\n";
       return std::nullopt;
     }

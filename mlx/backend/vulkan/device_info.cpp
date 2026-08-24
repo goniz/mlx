@@ -82,8 +82,12 @@ device_info(int device_index) {
         vendor_name = "Qualcomm";
         break;
       default:
-        vendor_name =
-            "Unknown (0x" + std::to_string(device_props.vendorID) + ")";
+        if (device_name.find("Apple") != std::string::npos) {
+          vendor_name = "Apple";
+        } else {
+          vendor_name =
+              "Unknown (0x" + std::to_string(device_props.vendorID) + ")";
+        }
         break;
     }
 

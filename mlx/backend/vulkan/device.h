@@ -91,6 +91,7 @@ void end_primitive_tracking(
 void finalize_stream(Stream s);
 void synchronize_stream(Stream s);
 void set_force_immediate_submit(Stream s);
+void set_decode_batch_default(bool enabled);
 void synchronize_all();
 void synchronize_buffer_for_host_access(VulkanBuffer* buffer);
 
